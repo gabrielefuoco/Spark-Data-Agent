@@ -30,8 +30,12 @@ dependencies = [
     "scipy>=1.13",
     "streamlit>=1.38",
     "plotly>=5.22",
-    "langgraph>=0.2",
+    "langgraph>=1.0",
+    "langgraph-checkpoint-sqlite>=2.0",
     "langchain-core>=0.3",
+    # Works against both backends: Ollama's /v1 endpoint and OpenRouter are both
+    # OpenAI-compatible, so one client covers local and remote.
+    "langchain-openai>=0.3",
 ]
 
 [project.optional-dependencies]

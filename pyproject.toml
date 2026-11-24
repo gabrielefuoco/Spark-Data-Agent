@@ -12,6 +12,17 @@ license = { text = "Proprietary" }
 
 dependencies = [
     "pyspark>=3.5.0,<4",
+    # PySpark 3.5 predates pandas 3: its pandas API still imports
+    # DateOffset from pandas.tseries.frequencies, removed in pandas 3. Pandera's
+    # pyspark backend imports that API unconditionally, so without this cap the
+    # whole validation layer fails to import.
+    "pandas>=2.0,<3",
+    # PyArrow is what pyspark.pandas (imported by pandera) needs to exist at all.
+    # NumPy stays below 2 because PySpark 3.5 still references np.NaN, removed in
+    # NumPy 2, and PyArrow is capped below 17 because those builds refuse to
+    # load under NumPy 1.x. Together these three form the only consistent set.
+    "numpy>=1.26,<2",
+    "pyarrow>=14,<17",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "sqlglot>=25.0",

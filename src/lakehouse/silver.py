@@ -16,6 +16,7 @@ from pyspark.storagelevel import StorageLevel
 
 from src.config import Settings
 from src.lakehouse.paths import LakehousePaths
+from src.lakehouse.validation import find_post_contract_violations
 from src.spark import write_parquet_zstd
 
 REASON_MISSING_SUBJECT_ID = "missing_subject_id"
@@ -23,6 +24,7 @@ REASON_MALFORMED_DATE = "malformed_date"
 REASON_NULL_OR_BLANK_TEXT = "null_or_blank_text"
 REASON_ORPHAN_SUBJECT_ID = "orphan_subject_id"
 REASON_DUPLICATE_POST = "duplicate_post"
+REASON_CONTRACT_VIOLATION = "contract_violation"
 
 
 def _clean_text_expr(column_name: str) -> F.Column:
@@ -111,35 +113,63 @@ def build_silver(
 
     # Reused across two diverging writes (silver posts vs dead-letter quarantine).
     classified.persist(StorageLevel.MEMORY_AND_DISK)
+    silver_columns = (
+        "subject_id",
+        "title",
+        "text",
+        "info",
+        "date",
+        "year",
+        "label",
+        "_source_file",
+        "_ingested_at",
+        "_row_hash",
+    )
+    quarantine_columns = (
+        "subject_id",
+        "title",
+        "raw_date",
+        "info",
+        "text",
+        "label",
+        "_source_file",
+        "_ingested_at",
+        "_row_hash",
+        "_rejection_reason",
+    )
+
+    # Persist candidates so monotonically_increasing_id stays stable across validation and anti-join.
+    silver_candidates = (
+        classified.filter(F.col("_rejection_reason").isNull())
+        .withColumn("_validation_row_id", F.monotonically_increasing_id())
+        .withColumn("year", F.year("date").cast(IntegerType()))
+        .withColumn("label", F.col("label").cast(IntegerType()))
+    )
+    silver_candidates.persist(StorageLevel.MEMORY_AND_DISK)
     try:
-        silver_df = (
-            classified.filter(F.col("_rejection_reason").isNull())
-            .select(
-                "subject_id",
-                "title",
-                "text",
-                "info",
-                "date",
-                F.year("date").cast(IntegerType()).alias("year"),
-                F.col("label").cast(IntegerType()).alias("label"),
-                "_source_file",
-                "_ingested_at",
-                "_row_hash",
-            )
+        violations_df = find_post_contract_violations(
+            silver_candidates,
+            key_col="_validation_row_id",
         )
 
-        quarantine_df = classified.filter(F.col("_rejection_reason").isNotNull()).select(
-            "subject_id",
-            "title",
-            "raw_date",
-            "info",
-            "text",
-            "label",
-            "_source_file",
-            "_ingested_at",
-            "_row_hash",
-            "_rejection_reason",
+        silver_df = silver_candidates.join(
+            violations_df,
+            on="_validation_row_id",
+            how="left_anti",
+        ).select(*silver_columns)
+
+        pre_quarantine_df = classified.filter(F.col("_rejection_reason").isNotNull()).select(
+            *quarantine_columns
         )
+        contract_quarantine_df = (
+            silver_candidates.join(violations_df, on="_validation_row_id", how="inner")
+            .withColumn(
+                "_rejection_reason",
+                F.concat(F.lit(f"{REASON_CONTRACT_VIOLATION}:"), F.col("violation_reason")),
+            )
+            .select(*quarantine_columns)
+        )
+        quarantine_df = pre_quarantine_df.unionByName(contract_quarantine_df)
 
         write_parquet_zstd(
             silver_df,
@@ -149,6 +179,7 @@ def build_silver(
         )
         write_parquet_zstd(quarantine_df, quarantine_out, mode="overwrite")
     finally:
+        silver_candidates.unpersist()
         classified.unpersist()
 
     return spark.read.parquet(posts_out), spark.read.parquet(quarantine_out)

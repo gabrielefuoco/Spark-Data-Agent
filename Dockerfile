@@ -13,6 +13,8 @@ ENV PYTHONUNBUFFERED=1 \
     JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 \
     # Bind the driver to loopback: in a container the hostname rarely resolves.
     SPARK_LOCAL_IP=127.0.0.1 \
+    # pandas-on-Spark warns unless this is set before any SparkContext exists.
+    PYARROW_IGNORE_TIMEZONE=1 \
     PYTHONPATH=/workspace
 
 RUN apt-get update \

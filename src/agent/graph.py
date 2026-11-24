@@ -6,7 +6,7 @@ import json
 import math
 import re
 import sqlite3
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import date, datetime
 from decimal import Decimal
@@ -133,7 +133,7 @@ def _message_text(message: BaseMessage) -> str:
     return str(content)
 
 
-def _latest_user_question(messages: list[BaseMessage]) -> str:
+def _latest_user_question(messages: Sequence[BaseMessage]) -> str:
     for msg in reversed(messages):
         if isinstance(msg, HumanMessage):
             return _message_text(msg)
@@ -189,8 +189,12 @@ def _normalize_query_result(raw: dict[str, Any] | list[dict[str, Any]]) -> dict[
     raise TypeError(f"Unexpected SQL executor return type: {type(raw).__name__}")
 
 
-def _is_finite_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+def _as_finite_float(value: object) -> float | None:
+    """Return ``value`` as a float when it is a finite real number, else ``None``."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
 
 
 def _extract_group_metrics(
@@ -213,13 +217,13 @@ def _extract_group_metrics(
                 candidate_cols.append(key)
 
     metric_col: str | None = None
-    if preferred_metric and any(_is_finite_number(r.get(preferred_metric)) for r in rows):
+    if preferred_metric and any(_as_finite_float(r.get(preferred_metric)) is not None for r in rows):
         metric_col = preferred_metric
     else:
         for col in candidate_cols:
             if col.lower() in _EXCLUDED_METRIC_COLUMNS:
                 continue
-            if any(_is_finite_number(r.get(col)) for r in rows):
+            if any(_as_finite_float(r.get(col)) is not None for r in rows):
                 metric_col = col
                 break
 
@@ -230,17 +234,17 @@ def _extract_group_metrics(
     control: list[float] = []
     for row in rows:
         raw_label = row.get("label")
-        val = row.get(metric_col)
-        if raw_label is None or not _is_finite_number(val):
+        val = _as_finite_float(row.get(metric_col))
+        if raw_label is None or val is None:
             continue
         try:
             label_int = int(raw_label)
         except (TypeError, ValueError):
             continue
         if label_int == 1:
-            depressed.append(float(val))
+            depressed.append(val)
         elif label_int == 0:
-            control.append(float(val))
+            control.append(val)
 
     return depressed, control, metric_col
 

@@ -94,7 +94,11 @@ def estimate_ast_cost(query: str) -> tuple[float, list[str]]:
         score += 0.3
         reasons.append("aggregation_or_window (+0.30)")
 
-    if any(tree.find_all((exp.Like, exp.ILike, exp.RegexpLike))):
+    # sqlglot accepts a tuple of node types at runtime but types `find_all` for a
+    # single type, so the three text-pattern scans are asked for separately.
+    if any(
+        any(tree.find_all(node_type)) for node_type in (exp.Like, exp.ILike, exp.RegexpLike)
+    ):
         score += 0.25
         reasons.append("text_pattern_scan (+0.25)")
 

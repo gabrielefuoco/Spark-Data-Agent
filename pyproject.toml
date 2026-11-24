@@ -43,6 +43,7 @@ dev = [
     "ruff>=0.6",
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
+    "mypy>=1.11",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -68,3 +69,21 @@ asyncio_default_fixture_loop_scope = "function"
 markers = [
     "spark: tests requiring a local SparkSession",
 ]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src"]
+# Not `strict = true`: the PySpark, Pandera, sqlglot and LangChain stubs are
+# partial, so strict mode would mostly report their gaps instead of our bugs.
+# The flags below are the strictness this codebase (24 modules, all annotated)
+# actually holds.
+strict = false
+check_untyped_defs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_calls = true
+warn_return_any = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+# PySpark, Pandera and LangChain ship partial or untyped metadata.
+ignore_missing_imports = true

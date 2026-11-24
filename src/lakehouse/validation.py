@@ -7,11 +7,12 @@ violation extraction so ``build_silver`` can route contract-failing rows to
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 # pandera.pyspark imports pyspark.pandas, which needs pandas<3, numpy<2, and pyarrow<17
 # pinned in pyproject.toml for PySpark 3.5 compatibility.
 import pandera.pyspark as pap
+from pandera.typing.pyspark import DataFrame as PanderaSparkDataFrame
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.types import IntegerType, StringType, StructField, StructType, TimestampType
@@ -68,7 +69,9 @@ def find_post_contract_violations(
     if key_col not in posts_df.columns:
         raise ValueError(f"Key column {key_col!r} not found in DataFrame columns: {posts_df.columns}")
 
-    validated = PostSilverSchema.validate(posts_df, lazy=True)
+    # Pandera's PySpark typing only admits its own DataFrame wrapper, while the
+    # backend duck-types a plain pyspark DataFrame at runtime.
+    validated = PostSilverSchema.validate(cast("PanderaSparkDataFrame[Any]", posts_df), lazy=True)
     pandera_attr = getattr(validated, "pandera", None)
     errors: dict[str, Any] = dict(getattr(pandera_attr, "errors", {}) or {})
 

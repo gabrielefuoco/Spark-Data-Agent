@@ -159,11 +159,14 @@ def evaluate_statistical_guard(
         metric_name=metric_name,
     )
 
-    threshold = (
-        validated.min_subjects_per_class
-        if validated.min_subjects_per_class is not None
-        else (settings.min_subjects_per_class if settings is not None else Settings(_env_file=None).min_subjects_per_class)
-    )
+    if validated.min_subjects_per_class is not None:
+        threshold = validated.min_subjects_per_class
+    elif settings is not None:
+        threshold = settings.min_subjects_per_class
+    else:
+        # pydantic-settings honours `_env_file` at runtime, but the `__init__`
+        # signature Pydantic generates only exposes the model fields.
+        threshold = Settings(_env_file=None).min_subjects_per_class  # type: ignore[call-arg]
 
     dep = np.asarray(validated.depressed_values, dtype=np.float64)
     ctrl = np.asarray(validated.control_values, dtype=np.float64)

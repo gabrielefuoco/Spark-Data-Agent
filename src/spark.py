@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import functions as F
 
 from src.config import Settings, get_settings
 
@@ -20,13 +21,16 @@ def build_spark_session(
     *,
     shuffle_partitions: int | None = None,
 ) -> SparkSession:
-    """Create or return a configured SparkSession from ``Settings``."""
+    """Create or return a configured SparkSession from ``Settings`` with AQE enabled."""
     cfg = settings or get_settings()
     builder = (
         SparkSession.builder.appName(cfg.spark_app_name)
         .master(cfg.spark_master)
         .config("spark.driver.bindAddress", "127.0.0.1")
         .config("spark.driver.host", "127.0.0.1")
+        .config("spark.sql.adaptive.enabled", "true")
+        .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+        .config("spark.sql.adaptive.skewJoin.enabled", "true")
     )
     if shuffle_partitions is not None:
         builder = builder.config("spark.sql.shuffle.partitions", str(shuffle_partitions))
@@ -34,6 +38,22 @@ def build_spark_session(
     spark = builder.getOrCreate()
     spark.sparkContext.setLogLevel("ERROR")
     return spark
+
+
+def broadcast_join(
+    posts_df: DataFrame,
+    subjects_df: DataFrame,
+    *,
+    on: str | Sequence[str] = "subject_id",
+    how: str = "inner",
+) -> DataFrame:
+    """Join a large posts DataFrame with a small subjects/labels DataFrame via broadcast.
+
+    Broadcasting the small dimension table avoids shuffling the full posts
+    partition set across executors when attaching subject-level labels or metadata.
+    """
+    join_on: str | list[str] = on if isinstance(on, str) else list(on)
+    return posts_df.join(F.broadcast(subjects_df), on=join_on, how=how)
 
 
 def stop(spark: SparkSession | None) -> None:

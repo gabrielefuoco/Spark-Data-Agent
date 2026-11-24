@@ -1,3 +1,30 @@
-./ignora/
-./processed_data/
-./chunk/
+# Data and generated artefacts — never commit these.
+# The eRISK dataset contains real posts from real people: it stays out of git.
+processed_data/
+chunk/
+ignora/
+data/
+lakehouse/
+*.parquet
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+src/api.env
+secrets.env
+
+# Notebook / OS noise
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,11 @@
+# Normalize to LF in the working tree. A shell script checked out with CRLF on
+# Windows dies inside a Linux container with "bad interpreter: /bin/bash^M".
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+
+*.parquet binary
+*.png binary
+*.jpg binary

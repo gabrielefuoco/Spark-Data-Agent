@@ -18,7 +18,7 @@ Il ticket 01 chiedeva di rinominare i moduli esistenti nella struttura nuova. Sc
 ## Prima di attaccare il ticket 02
 
 1. **Il fixture del ticket 02 non può essere testo reale.** Il ticket prevede un campione di ~5.000 post dal dataset eRISK: sono post veri di persone con depressione. Se finiscono in un repo pubblico, il repo pubblica dati sanitari pseudonimizzati di terzi. Va deciso: fixture sintetico, oppure aggregati senza testo, oppure campione reale ma repository privato. La policy in `CONTEXT.md` dice già "sintetico o aggregato".
-2. **Docker + Java 17**: il piano richiede un devcontainer Linux con PySpark, MinIO e bridge verso Ollama su `host.docker.internal`. Da verificare che Docker sia disponibile sulla macchina.
+2. **Docker + Java 17**: risolto dal ticket 00 — `Dockerfile`, `docker-compose.yml`, `.devcontainer/` esistono e sono stati verificati a runtime (Spark 3.5.1 su JDK 17 dentro il container, MinIO con bucket `lakehouse`, bridge verso Ollama sull'host). Docker Desktop va avviato a mano: non parte da solo. I test girano nel container.
 3. **`python` in questa shell non funziona** (alias Microsoft Store): il binario reale è `C:\Users\gabri\AppData\Local\Programs\Python\Python313\python.exe`. I test del ticket 01 sono stati eseguiti lì.
 4. **Il ticket 06 va ridiscusso su un punto**: S3/MinIO serve a poter scrivere "AWS" nel CV, ma chi legge chiede cosa è girato davvero su AWS. La risposta onesta è "MinIO locale con API S3", e va scritta così nel README.
 

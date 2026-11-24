@@ -18,13 +18,16 @@ Un repository completamente refattorizzato in lingua inglese (`spark-data-agent`
 ## Decisions so far
 
 - **Ambiente di Sviluppo Linux/Docker**: Esecuzione Spark isolata in container Docker / Devcontainer Linux (con Java JDK 17, PySpark 3.5+, MinIO e bridge per Ollama su `host.docker.internal`), azzerando le problematiche di `winutils.exe` su Windows.
+  - Raffinamento (ticket 00): **un solo container di sviluppo** con `local[*]`, non un cluster master/worker — la scala è 5.000 post e `Settings.spark_master` è già `local[*]`. I test girano dentro il container, mai sull'host Windows.
+  - I JAR S3 (`hadoop-aws`, `aws-java-sdk-bundle`) non entrano nell'immagine finché il ticket 06 non scrive `storage.py`; solo `spark-xml` viene precaricato, per non dipendere da Maven all'avvio.
 - **Provider Duale**: Ollama locale per iterazioni veloci a costo zero; OpenRouter DeepSeek per esecuzione remota/produzione.
 - **Fixture Dataset**: Script per generare un sample compatto (~5.000 post / 100 soggetti) per test agili offline.
 
 ## Child tickets
 
-- [01 — Scaffolding del Progetto in Inglese e Code Hygiene (pyproject.toml, Settings e Fix Shadowing)](issues/01-project-scaffolding-hygiene-and-settings.md) — Frontier (Unblocked)
-- [02 — Architettura Medallion Lakehouse (Bronze, Silver Atomico con Quarantena e Gold Tables)](issues/02-medallion-lakehouse-pipeline.md) — Blocked by 01
+- [00 — Ambiente di Sviluppo Dockerizzato (Linux, JDK 17, Spark locale, MinIO)](issues/00-dockerized-dev-environment.md) — Frontier (Unblocked)
+- [01 — Scaffolding del Progetto in Inglese e Code Hygiene (pyproject.toml, Settings e Fix Shadowing)](issues/01-project-scaffolding-hygiene-and-settings.md) — Done
+- [02 — Architettura Medallion Lakehouse (Bronze, Silver Atomico con Quarantena e Gold Tables)](issues/02-medallion-lakehouse-pipeline.md) — Blocked by 00, 01
 - [03 — Operazioni PySpark Avanzate (Window Functions Circadiane, Spark ML LDA, Broadcast Join e AST Guard)](issues/03-advanced-pyspark-operations.md) — Blocked by 02
 - [04 — Data Quality con Pandera e Guardia di Significatività Statistica a Runtime](issues/04-data-quality-and-statistical-guard.md) — Blocked by 02
 - [05 — Orchestrazione Ciclica con LangGraph, OpenRouter Multi-Modello e Human-in-the-Loop (HITL)](issues/05-langgraph-cyclic-orchestration-openrouter-hitl.md) — Blocked by 03, 04

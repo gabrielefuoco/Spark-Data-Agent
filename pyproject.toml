@@ -37,6 +37,9 @@ packages = ["src"]
 line-length = 100
 target-version = "py311"
 src = ["src", "tests"]
+# `legacy/` is the pre-rewrite implementation, kept verbatim as the evidence of
+# the defects the tickets remove: linting it would be linting the crime scene.
+extend-exclude = ["legacy"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
@@ -46,3 +49,4 @@ ignore = ["E501"]
 testpaths = ["tests"]
 addopts = "-q"
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

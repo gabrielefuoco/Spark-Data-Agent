@@ -1,0 +1,34 @@
+# Build context must stay small and must never contain the eRISK corpus:
+# real posts from real people (24.6k files, ~330 MB across these folders).
+.git
+.gitignore
+.scratch
+legacy
+
+processed_data
+chunk
+ignora
+data
+lakehouse
+
+# Python and tooling noise
+__pycache__
+**/__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.venv
+venv
+*.egg-info
+
+# Secrets: never in a layer
+.env
+.env.*
+!/.env.example
+secrets.env
+src/api.env
+
+# OS noise
+.DS_Store
+Thumbs.db

@@ -12,7 +12,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LLMBackend = Literal["ollama", "openrouter"]
@@ -54,8 +54,7 @@ class Settings(BaseSettings):
     aws_secret_access_key: SecretStr | None = None
     s3_endpoint_url: str | None = None
 
-    # ---- Agent behaviour ---------------------------------------------------
-    # Below this many subjects per class the guard marks the sample underpowered.
+    # ---- Agent behaviour ---------------------------------------------------    # Below this many subjects per class the guard marks the sample underpowered.
     min_subjects_per_class: int = 30
     # Hard ceiling on rows an ad-hoc SQL query may return.
     sql_row_limit: int = 500
@@ -67,6 +66,25 @@ class Settings(BaseSettings):
     def lakehouse_root(self) -> Path | str:
         """`spark_storage_uri` as a path when it is local, as a URI otherwise."""
         return self.spark_storage_uri
+
+    @field_validator(
+        "openrouter_api_key",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "s3_endpoint_url",
+        mode="before",
+    )
+    @classmethod
+    def blank_means_unset(cls, value: object) -> object:
+        """Treat an empty variable as absent.
+
+        `.env.example` ships every credential as `KEY=`, and a compose file can
+        pass one through as an empty string. Without this, `Optional` fields
+        become `SecretStr('')` and "is the key configured?" answers yes.
+        """
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
 
 @lru_cache

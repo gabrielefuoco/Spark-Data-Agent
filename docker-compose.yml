@@ -1,0 +1,82 @@
+# Development environment for the Spark Data Agent revamp.
+#
+#   docker compose up -d          # start dev container + MinIO
+#   docker compose run --rm dev python -m pytest
+#   docker compose exec dev bash
+#
+# One `dev` container running Spark in local[*], not a master/worker cluster:
+# the dataset is ~5k posts, and Settings.spark_master is already local[*].
+name: spark-data-agent
+
+services:
+  dev:
+    build:
+      context: .
+    image: spark-data-agent-dev:local
+    working_dir: /workspace
+    init: true
+    command: sleep infinity
+    volumes:
+      # Source edited on the host, executed in the container.
+      - .:/workspace
+      # Lakehouse output stays inspectable from Windows.
+      - ./data:/workspace/data
+      # The eRISK corpus is mounted read-only, never baked into an image:
+      # real posts by real people (24.6k files) must not enter a layer.
+      - ./processed_data:/workspace/processed_data:ro
+      - ./chunk:/workspace/chunk:ro
+      - ./ignora:/workspace/ignora:ro
+    environment:
+      LLM_BACKEND: ${LLM_BACKEND:-ollama}
+      # Hardcoded on purpose: inside the container `localhost` is the container,
+      # so the host Ollama daemon is only reachable through the bridge. A host
+      # `.env` holding localhost:11434 is right for host runs and wrong here —
+      # deriving this value from it would fail silently on the first LLM call.
+      OLLAMA_BASE_URL: http://host.docker.internal:11434/v1
+      SPARK_STORAGE_URI: ${SPARK_STORAGE_URI:-/workspace/data}
+      # MinIO is addressed by service name. The PySpark S3 connector that uses
+      # these credentials arrives in ticket 06; until then nothing reads them.
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      S3_ENDPOINT_URL: http://minio:9000
+    extra_hosts:
+      # Docker Desktop and Linux both honour this; it is what makes
+      # host.docker.internal resolve inside the container.
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8501:8501" # Streamlit, bound to 0.0.0.0 by the UI module
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+
+  minio:
+    # The official minio/minio images are no longer published on Docker Hub,
+    # and quay.io now demands a login. This is the community fork (Pigsty)
+    # tracking upstream releases. Ticket 06 depends on it for s3a:// writes.
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # Web console
+    volumes:
+      - minio-data:/data
+
+  minio-init:
+    # Creates the `lakehouse` bucket once MinIO answers, then exits 0. The image
+    # has no shell, so retries come from `restart: on-failure` rather than a
+    # hand-rolled wait loop; MC_HOST_lakehouse supplies the alias without a
+    # config file.
+    image: pgsty/mc:RELEASE.2026-11-12T00-00-00Z
+    depends_on:
+      - minio
+    environment:
+      MC_HOST_lakehouse: http://${MINIO_ROOT_USER:-minioadmin}:${MINIO_ROOT_PASSWORD:-minioadmin}@minio:9000
+    entrypoint: ["/usr/bin/mc"]
+    command: ["mb", "--ignore-existing", "lakehouse/lakehouse"]
+    restart: on-failure
+
+volumes:
+  minio-data:

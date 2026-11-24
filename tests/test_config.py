@@ -9,12 +9,16 @@ from __future__ import annotations
 from src.config import Settings, get_settings
 
 
-def test_defaults_are_local_and_free() -> None:
+def test_defaults_are_local_and_free(monkeypatch) -> None:
+    # The container sets OLLAMA_BASE_URL to the host bridge; the default under
+    # test is the one that applies when nothing overrides it.
+    monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
+
     settings = Settings(_env_file=None)
 
     assert settings.llm_backend == "ollama"
     assert settings.openrouter_api_key is None
-    assert "localhost" in settings.ollama_base_url
+    assert settings.ollama_base_url == "http://localhost:11434/v1"
     assert settings.spark_master == "local[*]"
 
 

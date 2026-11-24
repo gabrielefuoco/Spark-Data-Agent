@@ -6,7 +6,7 @@ Spark Data Agent is an interactive platform for the analysis of large-scale long
 
 ## Current state (what the code does today)
 
-The repository holds the original academic implementation: seven Python modules, about 1,300 lines, in Italian, under `src/`.
+The repository holds the original academic implementation: seven Python modules, about 1,300 lines, in Italian, now under `legacy/` — preserved intact as the reference for the rewrite, never imported by `src/`.
 
 - **Pipeline**: a preprocessing script turns the raw XML/TSV into flat Parquet files in `processed_data/`; there is no layered lakehouse and no lineage.
 - **Analytics**: a set of PySpark functions wrapped as agent tools in `spark_utils.py` and `tools.py`, executed through a `SparkDataManager` that owns the session.

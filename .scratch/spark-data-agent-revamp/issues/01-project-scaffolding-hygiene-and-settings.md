@@ -1,7 +1,7 @@
 # Ticket: 01 — Scaffolding del Progetto in Inglese e Code Hygiene (pyproject.toml, Settings e Fix Shadowing)
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Assignee: 
 
 Blocked by: none
@@ -54,3 +54,22 @@ L'attuale repository `Progetto Big Data` presenta diversi difetti di igiene del 
 4. **Risoluzione Shadowing Funzioni Native**:
    - Rimuovere tassativamente `from pyspark.sql.functions import *`.
    - Adottare rigorosamente la convenzione industriale `from pyspark.sql import functions as F` e `from pyspark.sql.types import ...` in tutti i moduli.
+
+## Answer
+
+**24 nov 2026** — Fatto, con un'interpretazione dichiarata del punto 1.
+
+**Interpretazione**: il ticket chiede di riorganizzare il repository nel layout `src/lakehouse|analytics|agent|ui`. Ma i ticket da 02 a 05 riscrivono quei moduli da zero, quindi rinominare `spark_utils.py` in `analytics/engineering.py` sarebbe lavoro buttato. Scelta: **lo scheletro nuovo nasce vuoto** e l'implementazione attuale va in `legacy/`, intatta e ancora eseguibile, con un README che dichiara che è il «prima» e che sparisce a fine ticket 06. La mappa resta la fonte del piano, il codice vecchio resta la prova dei difetti che il piano vuole eliminare.
+
+**Fatto**:
+
+- `pyproject.toml` con hatchling, dipendenze del nuovo stack (`pyspark>=3.5`, `langgraph`, `pydantic-settings`, `sqlglot`, `pandera[pyspark]`, `scipy`, `streamlit`, `plotly`), extra `dev` con ruff e pytest, configurazione ruff (`E,F,I,UP,B,SIM`) e pytest (`testpaths=tests`).
+- `requirements.txt` vecchio spostato in `legacy/requirements.txt`: conteneva `psycopg2`, `psycopg2-binary`, `schedule`, `openpyxl` — nessuno usato nel codice — e fissava `streamlit==1.22.0` con `llama-index` scaricato senza versione.
+- `src/config.py`: `Settings(BaseSettings)` con backend duale (`LLM_BACKEND` ollama/openrouter), endpoint e modelli per entrambi, `SecretStr` per le chiavi, root dello storage, e le soglie del futuro agente (`min_subjects_per_class=30`, `sql_row_limit=500`, `hitl_cost_threshold`, `max_query_retries=2`). `get_settings()` con `lru_cache`.
+- `.env.example` allineato ai campi reali.
+- Sottopacchetti `src/lakehouse`, `src/analytics`, `src/agent`, `src/ui` con `__init__.py`, più `tests/` e `docs/adr/`.
+- `tests/test_config.py`: 4 test, **tutti verdi** (default locali e gratuiti, override da ambiente, soglie esplicite, cache di `get_settings`).
+
+**Shadowing**: il fix non si applica al codice nuovo, che nasce senza wildcard import; il vecchio resta com'è in `legacy/` perché è l'evidenza del difetto. La convenzione `import pyspark.sql.functions as F` è quella che i ticket 02-05 useranno.
+
+**Nota operativa**: in questa shell `python` è l'alias di Microsoft Store; il test è stato eseguito con `C:\Users\gabri\AppData\Local\Programs\Python\Python313\python.exe`.

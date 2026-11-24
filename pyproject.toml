@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "spark-data-agent"
+version = "0.1.0"
+description = "Conversational analytics over the eRISK corpus: a PySpark Medallion lakehouse behind a LangGraph agent with deterministic statistical guards."
+readme = "CONTEXT.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+
+dependencies = [
+    "pyspark>=3.5.0,<4",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "sqlglot>=25.0",
+    "pandera[pyspark]>=0.20",
+    "scipy>=1.13",
+    "streamlit>=1.38",
+    "plotly>=5.22",
+    "langgraph>=0.2",
+    "langchain-core>=0.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6",
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+asyncio_mode = "auto"

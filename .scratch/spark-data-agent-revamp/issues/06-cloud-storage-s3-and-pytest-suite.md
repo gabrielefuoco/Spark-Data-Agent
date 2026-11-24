@@ -6,6 +6,13 @@ Assignee:
 
 Blocked by: 05
 
+## Nota dal ticket 00
+
+- Il compose esiste già (`docker-compose.yml`): servizio `dev` (Spark `local[*]`, Python 3.11, JDK 17) e `minio` con bucket `lakehouse` creato dal job `minio-init`. Non riscriverlo: estendilo.
+- **Le immagini ufficiali MinIO non sono più distribuibili**: `minio/minio` dà *pull access denied* su Docker Hub e `quay.io/minio/*` risponde 401. Il compose usa il fork community `pgsty/minio` + `pgsty/mc` con release pinnate. Qualsiasi ricetta trovata in rete che usi `minio/minio` non funziona.
+- L'immagine ha già `spark-xml` in `pyspark/jars`; i JAR S3 (`hadoop-aws` 3.3.4 + `aws-java-sdk-bundle` 1.12.262, ~300 MB) vanno aggiunti allo stesso modo dentro il Dockerfile in questo ticket, non con `spark.jars.packages` (in container il download da Maven è lento e fragile).
+- Verificato in ticket 00: Spark 3.5.1, Hadoop 3.3.4, JVM 17, scrittura Parquet ZSTD, bridge `host.docker.internal` verso Ollama.
+
 ## Context
 
 Per completare la trasformazione di `spark-data-agent` in un flagship project di livello Enterprise, è necessario dotarlo di tre elementi che differenziano nettamente un progetto amatoriale da uno professionale:

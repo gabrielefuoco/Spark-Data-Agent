@@ -38,14 +38,16 @@ deps = project["dependencies"] + project["optional-dependencies"]["dev"]
 subprocess.check_call([sys.executable, "-m", "pip", "install", *deps])
 PY
 
-# spark-xml, dropped straight into the PySpark jars directory so it is on the
-# classpath without `spark.jars.packages`, which would hit Maven at every cold
-# start. The S3 jars (hadoop-aws + aws-java-sdk-bundle, ~280 MB) arrive in
-# ticket 06, together with storage.py: no point shipping them before the code
-# that uses them exists.
+# Preload spark-xml and Hadoop S3A jars straight into the PySpark jars directory
+# so the classpath is complete offline without `spark.jars.packages` (which would
+# hit Maven at every cold start).
 ARG SPARK_XML_VERSION=0.18.0
 RUN cd "$(python -c 'import os, pyspark; print(os.path.dirname(pyspark.__file__))')/jars" \
     && curl -fsSLO "https://repo1.maven.org/maven2/com/databricks/spark-xml_2.12/${SPARK_XML_VERSION}/spark-xml_2.12-${SPARK_XML_VERSION}.jar"
+
+RUN cd "$(python -c 'import os, pyspark; print(os.path.dirname(pyspark.__file__))')/jars" \
+    && curl -fsSLO "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar" \
+    && curl -fsSLO "https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar"
 
 # The repository is bind-mounted here at runtime (see docker-compose.yml), so
 # the source is edited on the host and executed in the container.

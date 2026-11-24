@@ -1,8 +1,8 @@
 # Ticket: 06 — Connettore Cloud S3 / MinIO, Suite di Test Pytest e Formalizzazione ADR
 
 Type: task
-Status: ready-for-agent
-Assignee: 
+Status: resolved
+Assignee:
 
 Blocked by: 05
 
@@ -44,3 +44,35 @@ Per completare la trasformazione di `spark-data-agent` in un flagship project di
      - `docs/adr/0001-medallion-lakehouse-vs-flat-parquet.md`: Motiva l'architettura a tre livelli Bronze/Silver/Gold e la quarantena Dead-Letter rispetto a tabelle aggregate piatte con `collect_list`.
      - `docs/adr/0002-langgraph-cyclical-stategraph-vs-llamaindex.md`: Motiva la migrazione a LangGraph per controllo del flusso deterministico, self-correction e gate HITL.
      - `docs/adr/0003-openrouter-multi-model-routing.md`: Documenta la strategia di disaccoppiamento tra modelli di routing veloci a basso costo (Qwen 2.5 72B / GPT-4o-mini) e modelli di ragionamento profondo per la critica scientifica (DeepSeek-R1 / Claude 3.5 Sonnet).
+
+## Answer
+
+### Cosa è stato implementato
+1. **Connettore S3A / MinIO (`src/lakehouse/storage.py`)**:
+   - `is_s3a_uri` e `resolve_storage_target`: risolvono percorsi locali e URI `s3a://<bucket>[/prefix]` a partire da `Settings.spark_storage_uri` senza diramazioni lato chiamante.
+   - `build_s3a_hadoop_options`: funzione pura e unit-testabile che restituisce `{}` per storage locale e configura per `s3a://` `fs.s3a.impl`, `fs.s3a.endpoint`, `fs.s3a.path.style.access=true`, `fs.s3a.access.key` / `fs.s3a.secret.key` (da `SecretStr`), `fs.s3a.connection.ssl.enabled` (`false` su `http://`, `true` su `https://`) e `fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider` (evita richieste al servizio metadata EC2). Solleva `StorageConfigurationError` con elenco esplicito delle variabili mancanti (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `S3_ENDPOINT_URL`) senza mai esporre i valori delle credenziali.
+   - `apply_s3a_config`: applica le opzioni a `SparkSession.Builder`, `SparkConf` o `SparkSession` esistente.
+2. **JAR S3 nell'immagine Docker (`Dockerfile`)**:
+   - Aggiunti in `pyspark/jars` (via `curl -fsSLO` senza nuovi `ARG`, senza `spark.jars.packages` a runtime):
+     - `hadoop-aws` **3.3.4** (allineato a `hadoop-client-runtime-3.3.4` / `hadoop-client-api-3.3.4` di PySpark 3.5.10).
+     - `aws-java-sdk-bundle` **1.12.262** (bundle SDK richiesto da `hadoop-aws` 3.3.4 per `S3AFileSystem`).
+   - Immagine `spark-data-agent-dev:local` ricostruita con `docker compose build dev`.
+3. **Suite di test S3/MinIO (`tests/test_storage.py`)**:
+   - 4 unit test sempre eseguibili (risoluzione URI locali/`s3a://`, generazione opzioni MinIO vs HTTPS, fallimento esplicito senza leak di segreti, configurazione su `SparkSession.builder` senza JVM).
+   - 1 test di integrazione (`test_s3a_parquet_roundtrip_and_safe_sql_on_minio`) con verifica TCP reale su `S3_ENDPOINT_URL` (`socket.create_connection` con timeout 1s): scrive/rilegge Parquet ZSTD su `s3a://lakehouse/...`, registra la vista Spark SQL e la interroga tramite `execute_safe_spark_sql`; salta in modo pulito (`skipif`) se MinIO non è raggiungibile.
+4. **ADR (`docs/adr/`)**:
+   - `docs/adr/README.md` (indice delle tre decisioni).
+   - `0001-medallion-lakehouse-vs-flat-parquet.md`: layer Bronze/Silver/Gold atomici (1 riga = 1 post) con quarantena dead-letter e manifest JSON al posto di tabelle piatte e `collect_list`.
+   - `0002-langgraph-cyclical-stategraph-vs-llamaindex.md`: `StateGraph` deterministico con AST guard (`sqlglot`), retry controllato, guardia statistica non-LLM e gate HITL via `langgraph.types.interrupt()` + `SqliteSaver` (che sostituisce `interrupt_before` statico di LangGraph 0.x).
+   - `0003-openrouter-multi-model-routing.md`: client unico OpenAI-compatible (`ChatOpenAI`) con default Ollama locale gratuito (`qwen2.5:7b`) e routing remoto OpenRouter separato per ruolo (`deepseek/deepseek-chat` vs `deepseek/deepseek-r1`).
+
+### Output del smoke test `s3a://lakehouse/smoke/`
+Comando eseguito nel container `dev` contro il servizio `minio` (`http://minio:9000`):
+```text
+docker compose run --rm --no-deps dev python -c "... write_parquet_zstd(df, 's3a://lakehouse/smoke', mode='overwrite') ..."
+TARGET: s3a://lakehouse/smoke
+ROWS: [('smoke-1', 1, 0.75), ('smoke-2', 0, 0.25)]
+```
+
+### MinIO locale vs AWS S3 reale
+Tutta l'integrazione `s3a://` è stata progettata e verificata contro **MinIO locale in Docker (`pgsty/minio`)** tramite API S3-compatibile (`path.style.access=true`, HTTP locale senza TLS). Il supporto a endpoint AWS S3 reali è previsto dalla configurazione (`Settings` / `build_s3a_hadoop_options`), ma non è stato eseguito né verificato su infrastruttura AWS reale.

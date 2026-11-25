@@ -14,6 +14,7 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
 from src.config import Settings, get_settings
+from src.lakehouse.storage import apply_s3a_config
 
 
 def build_spark_session(
@@ -35,7 +36,9 @@ def build_spark_session(
     if shuffle_partitions is not None:
         builder = builder.config("spark.sql.shuffle.partitions", str(shuffle_partitions))
 
+    builder = apply_s3a_config(builder, cfg)
     spark = builder.getOrCreate()
+    apply_s3a_config(spark, cfg)
     spark.sparkContext.setLogLevel("ERROR")
     return spark
 

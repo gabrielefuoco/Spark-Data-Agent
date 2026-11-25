@@ -1,25 +1,8 @@
-"""PySpark Medallion lakehouse package (Bronze, Silver, Gold, Manifest)."""
+"""PySpark Medallion lakehouse package (Bronze, Silver, Gold, Manifest).
 
-from src.lakehouse.bronze import ingest_bronze_posts, ingest_bronze_subjects, run_bronze_ingestion
-from src.lakehouse.gold import (
-    build_cohort_lexical_matrix,
-    build_gold,
-    build_user_longitudinal_features,
-)
-from src.lakehouse.manifest import DatasetManifest, build_dataset_manifest, load_manifest
-from src.lakehouse.paths import LakehousePaths
-from src.lakehouse.silver import build_silver
-
-__all__ = [
-    "DatasetManifest",
-    "LakehousePaths",
-    "build_cohort_lexical_matrix",
-    "build_dataset_manifest",
-    "build_gold",
-    "build_silver",
-    "build_user_longitudinal_features",
-    "ingest_bronze_posts",
-    "ingest_bronze_subjects",
-    "load_manifest",
-    "run_bronze_ingestion",
-]
+Nothing is re-exported here on purpose. Eager re-exports made `import
+src.spark` fail whenever it ran first (`src.spark` -> `src.lakehouse.storage`
+-> package `__init__` -> `bronze` -> `src.spark`, still half-initialised), a
+cycle the test suite never hit because it happens to import the lakehouse
+before Spark. Import from the concrete modules instead.
+"""

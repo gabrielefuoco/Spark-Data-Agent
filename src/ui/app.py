@@ -19,7 +19,7 @@ from langgraph.types import Command
 
 from src.agent.graph import build_agent_graph, create_sqlite_checkpointer
 from src.agent.state import make_initial_state
-from src.config import Settings, get_settings
+from src.config import PROJECT_ROOT, Settings, get_settings
 from src.lakehouse.manifest import DatasetManifest, load_manifest
 from src.spark import build_spark_session
 
@@ -113,13 +113,25 @@ def _get_cached_runtime(
     )
 
 
+def resolve_checkpoint_path(settings: Settings | None = None) -> Path:
+    """Return the local filesystem path for the LangGraph SQLite checkpointer.
+
+    SQLite requires a local filesystem for file locking and random writes and
+    cannot reside on ``s3a://`` object storage. Checkpoint persistence is
+    therefore explicitly pinned to ``PROJECT_ROOT / "data"`` rather than
+    derived from ``Settings.spark_storage_uri``.
+    """
+    _ = settings
+    return PROJECT_ROOT / "data" / "agent_checkpoints.sqlite"
+
+
 def _get_graph(settings: Settings) -> Any:
     """Return an injected test graph from session_state or build the live runtime graph."""
     injected = st.session_state.get("agent_graph")
     if injected is not None:
         return injected
 
-    checkpoint_path = str(Path(settings.spark_storage_uri) / "agent_checkpoints.sqlite")
+    checkpoint_path = str(resolve_checkpoint_path(settings))
     return _get_cached_runtime(
         settings.spark_storage_uri,
         settings.llm_backend,

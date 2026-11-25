@@ -8,13 +8,20 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
+import pyarrow.fs as pafs
 from pydantic import BaseModel
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
-from src.config import Settings
+from src.config import Settings, get_settings
 from src.lakehouse.paths import LakehousePaths
+from src.lakehouse.storage import (
+    StorageConfigurationError,
+    is_s3a_uri,
+    resolve_s3_connection,
+)
 
 
 class DatasetManifest(BaseModel):
@@ -31,10 +38,43 @@ class DatasetManifest(BaseModel):
     generated_at: str
 
 
+def resolve_manifest_filesystem(
+    manifest_path: str | Path,
+    settings: Settings | None = None,
+) -> tuple[pafs.FileSystem, str]:
+    """Return the PyArrow filesystem and normalized path for a manifest path or ``s3a://`` URI."""
+    raw = str(manifest_path).strip()
+    if not is_s3a_uri(raw):
+        return pafs.LocalFileSystem(), str(manifest_path)
+
+    parsed = urlparse(raw)
+    bucket = parsed.netloc
+    key = parsed.path.lstrip("/")
+    if not bucket or not key:
+        raise StorageConfigurationError(
+            f"Invalid S3A manifest URI {raw!r}: expected 's3a://<bucket>/<key>'."
+        )
+
+    cfg = settings or get_settings()
+    access_key, secret_key, endpoint = resolve_s3_connection(cfg, target_uri=raw)
+    ep = urlparse(endpoint if "://" in endpoint else f"http://{endpoint}")
+    scheme = ep.scheme or "http"
+    endpoint_override = ep.netloc or ep.path
+    fs = pafs.S3FileSystem(
+        access_key=access_key,
+        secret_key=secret_key,
+        endpoint_override=endpoint_override,
+        scheme=scheme,
+    )
+    return fs, f"{bucket}/{key}"
+
+
 def build_dataset_manifest(
     silver_posts_df: DataFrame,
     quarantine_df: DataFrame,
     output_path: str | Path,
+    *,
+    settings: Settings | None = None,
 ) -> DatasetManifest:
     """Compute manifest statistics via Spark aggregations and write JSON."""
     class_rows = (
@@ -91,9 +131,14 @@ def build_dataset_manifest(
         generated_at=datetime.now(UTC).isoformat(),
     )
 
-    target = Path(output_path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(manifest.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    fs, fs_path = resolve_manifest_filesystem(output_path, settings=settings)
+    if isinstance(fs, pafs.LocalFileSystem):
+        parent = str(Path(fs_path).parent)
+        if parent not in {"", "."}:
+            fs.create_dir(parent, recursive=True)
+    payload = (manifest.model_dump_json(indent=2) + "\n").encode("utf-8")
+    with fs.open_output_stream(fs_path) as stream:
+        stream.write(payload)
     return manifest
 
 
@@ -103,5 +148,8 @@ def load_manifest(
     settings: Settings | None = None,
 ) -> DatasetManifest:
     """Load the precomputed manifest JSON without starting or touching Spark."""
-    path = Path(manifest_path or LakehousePaths.from_settings(settings).gold_dataset_manifest)
-    return DatasetManifest.model_validate_json(path.read_text(encoding="utf-8"))
+    target = manifest_path or LakehousePaths.from_settings(settings).gold_dataset_manifest
+    fs, fs_path = resolve_manifest_filesystem(target, settings=settings)
+    with fs.open_input_stream(fs_path) as stream:
+        raw_json = stream.readall().decode("utf-8")
+    return DatasetManifest.model_validate_json(raw_json)

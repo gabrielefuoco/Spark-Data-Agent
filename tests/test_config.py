@@ -10,9 +10,17 @@ from src.config import Settings, get_settings
 
 
 def test_defaults_are_local_and_free(monkeypatch) -> None:
-    # The container sets OLLAMA_BASE_URL to the host bridge; the default under
-    # test is the one that applies when nothing overrides it.
-    monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
+    # A real `.env` and a container environment both override these, and a
+    # developer who configured a paid backend is the normal case: the default
+    # under test is what applies when nothing overrides it.
+    for variable in (
+        "LLM_BACKEND",
+        "OLLAMA_BASE_URL",
+        "OPENROUTER_API_KEY",
+        "REMOTE_ROUTER_MODEL",
+        "REMOTE_REASONING_MODEL",
+    ):
+        monkeypatch.delenv(variable, raising=False)
 
     settings = Settings(_env_file=None)
 

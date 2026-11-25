@@ -62,3 +62,43 @@ def test_bronze_row_hash_is_stable_across_runs(
         r["_row_hash"] for r in subj_2.select("_row_hash").collect()
     )
     assert Path(paths_1.bronze_posts).exists()
+
+
+@pytest.mark.spark
+def test_bronze_reads_corpus_split_across_several_chunk_directories(
+    spark: SparkSession,
+    lakehouse_env: tuple,
+    tmp_path: Path,
+) -> None:
+    """A real eRISK corpus is chunk1..chunkN; spark-xml takes one path, not a list.
+
+    Feeding the reader a list of globs raises
+    "IllegalArgumentException: 'path' must be specified for XML data", and
+    recursiveFileLookup is not usable because spark-xml needs block locations.
+    The synthetic fixture writes a single chunk directory, so only a nested
+    layout catches this.
+    """
+    settings, paths, sample_dir = lakehouse_env
+    nested_root = tmp_path / "nested_corpus"
+    second_chunk = nested_root / "chunk2"
+    second_chunk.mkdir(parents=True)
+
+    source_files = sorted((sample_dir / "chunk").rglob("*.xml"))
+    for index, source in enumerate(source_files):
+        target_dir = nested_root / f"chunk{index % 2 + 1}"
+        target_dir.mkdir(exist_ok=True)
+        (target_dir / source.name).write_text(source.read_text(encoding="utf-8"))
+
+    posts_df = ingest_bronze_posts(spark, nested_root, paths.bronze_posts)
+
+    assert posts_df.count() == 84
+    # Bronze keeps raw values: a file whose name carries no id yields a null
+    # subject_id here, and the Silver layer is what rejects it.
+    named = {
+        row["subject_id"]
+        for row in posts_df.select("subject_id").distinct().collect()
+        if row["subject_id"] is not None
+    }
+    # The generator ships ten labelled subjects plus one orphan id on purpose.
+    assert {f"subject{index:03d}" for index in range(1, 11)} <= named
+    assert len(named) == 11

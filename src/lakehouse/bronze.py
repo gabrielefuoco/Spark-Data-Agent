@@ -52,6 +52,35 @@ def _resolve_xml_inputs(posts_input_path: str | Path) -> str | list[str]:
     return raw
 
 
+def _read_xml_paths(spark: SparkSession, xml_inputs: str | list[str]) -> DataFrame:
+    """Read XML inputs, one read per glob, then union.
+
+    ``spark-xml`` accepts a single path and silently ignores the ``paths`` option
+    that Spark sets when ``load()`` receives several: feeding it a list raises
+    ``IllegalArgumentException: 'path' must be specified for XML data``.
+    ``recursiveFileLookup`` is not an escape either — spark-xml needs block
+    locations and dies with a NullPointerException. So a corpus spread over
+    ``chunk1..chunkN`` is read per directory and unioned, which is also what the
+    previous implementation did.
+    """
+    paths = [xml_inputs] if isinstance(xml_inputs, str) else list(xml_inputs)
+
+    def read_one(path: str) -> DataFrame:
+        return (
+            spark.read.format("xml")
+            .option("rootTag", "INDIVIDUAL")
+            .option("rowTag", "WRITING")
+            .schema(RAW_POST_XML_SCHEMA)
+            .load(path)
+        )
+
+    frames = [read_one(path) for path in paths]
+    merged = frames[0]
+    for frame in frames[1:]:
+        merged = merged.unionByName(frame)
+    return merged
+
+
 def _row_hash_expr(columns: tuple[str, ...]) -> F.Column:
     # Coalesce nulls before concat_ws so missing fields cannot shift delimiters.
     normalized = [F.coalesce(F.col(name).cast(StringType()), F.lit("")) for name in columns]
@@ -65,13 +94,7 @@ def ingest_bronze_posts(
 ) -> DataFrame:
     """Ingest raw eRISK XML posts into Bronze Parquet ZSTD with lineage."""
     xml_inputs = _resolve_xml_inputs(posts_input_path)
-    raw_df = (
-        spark.read.format("xml")
-        .option("rootTag", "INDIVIDUAL")
-        .option("rowTag", "WRITING")
-        .schema(RAW_POST_XML_SCHEMA)
-        .load(xml_inputs)
-    )
+    raw_df = _read_xml_paths(spark, xml_inputs)
 
     with_source = raw_df.withColumn("_source_file", F.input_file_name())
     extracted_id = F.regexp_extract(F.col("_source_file"), _SUBJECT_ID_REGEX, 1)

@@ -9,14 +9,25 @@ from typing import Any
 
 import pytest
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langgraph.types import Command
 from pyspark.sql import SparkSession
 from src.agent.cost import estimate_sql_cost
 from src.agent.critic_check import validate_critic_output
 from src.agent.graph import build_agent_graph, open_sqlite_checkpointer
-from src.agent.guards import CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS, StatisticalGuardResult
+from src.agent.guards import (
+    CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS,
+    StatisticalGuardResult,
+    evaluate_query_result_guard,
+)
 from src.agent.nodes import make_spark_sql_executor
+from src.agent.prompts import (
+    MAX_PLANNER_HISTORY_ANSWER_CHARS,
+    MAX_PLANNER_HISTORY_EXCHANGES,
+    MAX_PLANNER_HISTORY_QUERY_CHARS,
+    MAX_PLANNER_HISTORY_QUESTION_CHARS,
+    build_planner_user_prompt,
+)
 from src.agent.state import make_initial_state
 from src.analytics.safe_sql import SafeSQLError
 from src.config import Settings
@@ -1368,3 +1379,127 @@ def test_hitl_cost_scale_separates_a_pruned_partition_from_a_full_scan() -> None
 
     assert pruned["triggers_hitl"] is False
     assert full["triggers_hitl"] is True
+
+
+def test_planner_prompt_first_turn_byte_identical_and_long_history_capped() -> None:
+    first_turn = build_planner_user_prompt("Quanti post ci sono nel 2014?")
+    assert first_turn == "User request:\nQuanti post ci sono nel 2014?"
+    assert build_planner_user_prompt("Quanti post ci sono nel 2014?", history=[]) == first_turn
+
+    long_q = "Q_LONG " + ("x" * 300)
+    long_sql = "SELECT " + (", ".join(f"col_{i}" for i in range(40))) + " FROM silver_posts"
+    long_a = "Headline " + ("y" * 300) + "\nSecond line that must not be included."
+
+    history: list[BaseMessage] = []
+    for idx in range(MAX_PLANNER_HISTORY_EXCHANGES + 2):
+        q_text = long_q if idx == MAX_PLANNER_HISTORY_EXCHANGES + 1 else f"Domanda turno {idx}"
+        sql_text = long_sql if idx == MAX_PLANNER_HISTORY_EXCHANGES + 1 else f"SELECT {idx}"
+        a_text = long_a if idx == MAX_PLANNER_HISTORY_EXCHANGES + 1 else f"Risposta turno {idx}"
+        history.append(HumanMessage(content=q_text))
+        history.append(AIMessage(content=a_text, additional_kwargs={"generated_query": sql_text}))
+
+    prompt = build_planner_user_prompt("e per il 2015?", history=history)
+    # Earlier exchanges beyond the cap are dropped.
+    assert "Domanda turno 0" not in prompt
+    assert "Domanda turno 1" not in prompt
+    # Most recent exchanges up to the cap are retained.
+    assert "Domanda turno 2" in prompt
+    assert "Domanda turno 3" in prompt
+    assert "Q_LONG" in prompt
+    assert "Second line that must not be included." not in prompt
+    # Each component of the oversized exchange is bounded by its named constant.
+    last_history_line = [line for line in prompt.splitlines() if "Q_LONG" in line][0]
+    user_part, query_part, answer_part = last_history_line.split(" | ")
+    assert len(user_part.removeprefix(f"{MAX_PLANNER_HISTORY_EXCHANGES}. User: ")) <= (
+        MAX_PLANNER_HISTORY_QUESTION_CHARS
+    )
+    assert len(query_part.removeprefix("Query: ")) <= MAX_PLANNER_HISTORY_QUERY_CHARS
+    assert len(answer_part.removeprefix("Answer: ")) <= MAX_PLANNER_HISTORY_ANSWER_CHARS
+    assert prompt.endswith("User request:\ne per il 2015?")
+
+
+def test_followup_turn_planner_receives_prior_question_query_and_headline(tmp_path: Path) -> None:
+    db_path = tmp_path / "multi_turn.sqlite"
+    settings = Settings(_env_file=None, hitl_cost_threshold=1.0)
+    router = _router(
+        {
+            "user_intent": "ad_hoc_sql",
+            "answer_from_manifest": False,
+            "sql_query": "SELECT COUNT(*) AS post_count FROM silver_posts WHERE year = 2014",
+        },
+        {
+            "user_intent": "ad_hoc_sql",
+            "answer_from_manifest": False,
+            "sql_query": "SELECT COUNT(*) AS post_count FROM silver_posts WHERE year = 2015",
+        },
+    )
+    critic = _critic(
+        "Nel 2014 sono presenti 1250 post.\nDettaglio tecnico non necessario nel riassunto.",
+        "Nel 2015 sono presenti 980 post.",
+    )
+    config = {"configurable": {"thread_id": "followup-thread"}}
+
+    with open_sqlite_checkpointer(db_path) as saver:
+        graph = build_agent_graph(
+            settings=settings,
+            router_model=router,
+            critic_model=critic,
+            sql_executor=lambda q, _cfg: [{"post_count": 1250 if "2014" in q else 980}],
+            checkpointer=saver,
+        )
+        first_res = graph.invoke(
+            make_initial_state("Quanti post ci sono nel 2014?"), config=config
+        )
+        second_res = graph.invoke(make_initial_state("e per il 2015?"), config=config)
+
+    assert first_res["status"] == "completed"
+    assert second_res["status"] == "completed"
+    # First turn prompt stayed byte-identical (no history header).
+    assert (
+        str(router.recorded_invocations[0][1].content)
+        == "User request:\nQuanti post ci sono nel 2014?"
+    )
+    # Follow-up turn prompt contains the prior question, executed query, and answer headline.
+    followup_prompt = str(router.recorded_invocations[1][1].content)
+    assert "Quanti post ci sono nel 2014?" in followup_prompt
+    assert "WHERE year = 2014" in followup_prompt
+    assert "Nel 2014 sono presenti 1250 post." in followup_prompt
+    assert "Dettaglio tecnico" not in followup_prompt
+    assert followup_prompt.endswith("User request:\ne per il 2015?")
+
+
+def test_imbalanced_cohort_surfaces_in_payload_and_prompt_without_blocking_valid_prose() -> None:
+    settings = Settings(_env_file=None, min_subjects_per_class=30, sql_fetch_limit=2000)
+    rows = [
+        {"subject_id": f"dep_{i}", "label": 1, "night_post_ratio": 0.45 + (i % 5) * 0.02}
+        for i in range(79)
+    ] + [
+        {"subject_id": f"ctrl_{i}", "label": 0, "night_post_ratio": 0.15 + (i % 5) * 0.02}
+        for i in range(740)
+    ]
+    expected_guard = evaluate_query_result_guard(rows, settings=settings)
+    assert expected_guard.p_value is not None
+    assert expected_guard.effect_size_cohens_d is not None
+    # Critic omits any rigid balance-ratio string, proving no prose regex rejects valid answers.
+    compliant_it = (
+        "Differenza statisticamente significativa su 79 soggetti depressi e 740 di controllo "
+        f"(p = {expected_guard.p_value:.6g}, Cohen's d = {expected_guard.effect_size_cohens_d:.6g})."
+    )
+    critic = _critic(compliant_it)
+
+    graph = build_agent_graph(
+        settings=settings,
+        router_model=_cohort_router_model(),
+        critic_model=critic,
+        sql_executor=lambda _q, _cfg: rows,
+    )
+    result = graph.invoke(make_initial_state("Confronta i post notturni tra coorti."))
+
+    assert result["status"] == "completed"
+    assert result["critic_call_count"] == 1
+    assert result["critic_output_check_failed"] is None
+    assert result["statistical_validation"]["is_imbalanced"] is True
+    assert result["statistical_validation"]["balance_ratio"] == pytest.approx(740 / 79)
+    assert "MANDATORY COHORT IMBALANCE DISCLOSURE" in result["critic_system_prompt"]
+    assert "9.37" in result["critic_system_prompt"]
+    assert result["final_response"] == compliant_it

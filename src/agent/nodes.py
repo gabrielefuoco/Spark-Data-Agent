@@ -34,6 +34,7 @@ from src.agent.prompts import (
     build_critic_system_prompt,
     build_critic_user_prompt,
     build_planner_user_prompt,
+    extract_message_text,
     format_manifest_answer,
 )
 from src.agent.state import DataAgentState
@@ -271,26 +272,14 @@ class AgentRuntimeDeps:
         return load_manifest(settings=self.settings)
 
 
-def _message_text(message: BaseMessage) -> str:
-    content = message.content
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict) and "text" in item:
-                parts.append(str(item["text"]))
-        return "\n".join(parts)
-    return str(content)
-
-
-def _latest_user_question(messages: Sequence[BaseMessage]) -> str:
-    for msg in reversed(messages):
-        if isinstance(msg, HumanMessage):
-            return _message_text(msg)
-    return _message_text(messages[-1]) if messages else ""
+def _split_conversation_messages(
+    messages: Sequence[BaseMessage],
+) -> tuple[str, list[BaseMessage]]:
+    """Return ``(latest_user_question, prior_messages)`` from ``state['messages']``."""
+    for idx in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[idx], HumanMessage):
+            return extract_message_text(messages[idx]), list(messages[:idx])
+    return (extract_message_text(messages[-1]) if messages else ""), []
 
 
 def _parse_router_output(raw_text: str) -> dict[str, Any]:
@@ -443,11 +432,12 @@ def _run_execution(
 
 def intent_router_planner(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str, Any]:
     """Classify user intent and generate a SQL query, Spark job, or direct reply."""
-    question = _latest_user_question(state.get("messages", []))
+    question, prior_messages = _split_conversation_messages(state.get("messages", []))
     last_error = state.get("last_error")
     retry_count = state.get("retry_count", 0)
     planner_prompt = build_planner_user_prompt(
         question,
+        history=prior_messages,
         last_error=last_error,
         planner_notes=state.get("planner_notes"),
         retry_count=retry_count,
@@ -459,7 +449,7 @@ def intent_router_planner(state: DataAgentState, deps: AgentRuntimeDeps) -> dict
             HumanMessage(content=planner_prompt),
         ]
     )
-    raw_text = _message_text(llm_response)
+    raw_text = extract_message_text(llm_response)
 
     try:
         plan = _parse_router_output(raw_text)
@@ -734,7 +724,7 @@ def statistical_guard(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str
 
 def scientific_critic(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str, Any]:
     """Synthesize the final analytical narrative constrained by the statistical guard."""
-    question = _latest_user_question(state.get("messages", []))
+    question, _ = _split_conversation_messages(state.get("messages", []))
     raw_guard = state.get("statistical_validation")
     guard_result = (
         StatisticalGuardResult.model_validate(raw_guard)
@@ -770,7 +760,7 @@ def scientific_critic(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str
         HumanMessage(content=user_prompt),
     ]
     response = critic_model.invoke(base_messages)
-    critique_text = _message_text(response)
+    critique_text = extract_message_text(response)
     critic_calls = 1
     critic_retries = 0
     check = validate_critic_output(critique_text, guard_result)
@@ -787,7 +777,7 @@ def scientific_critic(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str
         )
         critic_calls += 1
         critic_retries = 1
-        critique_text = _message_text(retry_response)
+        critique_text = extract_message_text(retry_response)
         check = validate_critic_output(critique_text, guard_result)
         if not check.passed:
             critique_text = format_inconclusive_critic_fallback(guard_result, check)
@@ -799,6 +789,8 @@ def scientific_critic(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str
                 "forbidden_claims": list(check.forbidden_claims),
             }
 
+    executed_query = state.get("generated_query")
+    ai_kwargs = {"generated_query": executed_query} if executed_query else {}
     return {
         "critic_system_prompt": system_prompt,
         "critic_critique": critique_text,
@@ -807,7 +799,7 @@ def scientific_critic(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str
         "critic_output_check_failed": check_failed,
         "final_response": critique_text,
         "status": "completed",
-        "messages": [AIMessage(content=critique_text)],
+        "messages": [AIMessage(content=critique_text, additional_kwargs=ai_kwargs)],
     }
 
 

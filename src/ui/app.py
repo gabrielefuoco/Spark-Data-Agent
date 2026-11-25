@@ -176,8 +176,7 @@ def _render_statistical_card(stats_payload: dict[str, Any]) -> None:
 
     if stats_payload.get("assessment_status") == "descriptive":
         st.info("Analisi descrittiva: nessun test di significatività statistica applicato.")
-    elif stats_payload.get("assessment_status") == "cannot_assess":
-        st.warning(
+    elif stats_payload.get("assessment_status") == "cannot_assess":        st.warning(
             stats_payload.get("cannot_assess_reason")
             or "Impossibile valutare la significatività statistica senza dimensione `subject_id`."
         )
@@ -190,6 +189,14 @@ def _render_statistical_card(stats_payload: dict[str, Any]) -> None:
     else:
         st.success(
             f"Test: {stats_payload.get('test_used')} | Confidenza: {stats_payload.get('statistical_confidence')}"
+        )
+
+    balance_ratio = stats_payload.get("balance_ratio")
+    if stats_payload.get("is_imbalanced") and isinstance(balance_ratio, (int, float)):
+        st.warning(
+            f"Coorti sbilanciate {balance_ratio:.1f}:1 ({stats_payload.get('sample_size_depressed')} "
+            f"depressi vs {stats_payload.get('sample_size_control')} controlli): la coorte più "
+            "piccola determina la precisione della stima."
         )
 
 

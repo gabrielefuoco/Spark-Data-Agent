@@ -8,6 +8,7 @@ from collections.abc import Sequence
 import pytest
 from scipy import stats
 from src.agent.guards import (
+    COHORT_IMBALANCE_RATIO_THRESHOLD,
     StatisticalComparisonInput,
     SubjectObservation,
     evaluate_query_result_guard,
@@ -326,3 +327,73 @@ def test_critic_guard_instructions_enforce_verdict_and_citations() -> None:
     assert "ALLOWED" in allowed_prompt
     assert "sample_size_depressed: 30" in allowed_prompt
     assert "sample_size_control: 30" in allowed_prompt
+
+
+def test_cohort_balance_ratio_and_imbalance_threshold_boundary() -> None:
+    balanced = evaluate_statistical_guard(
+        _obs("d", [0.5 + 0.01 * i for i in range(35)]),
+        _obs("c", [0.1 + 0.01 * i for i in range(35)]),
+    )
+    assert balanced.balance_ratio == pytest.approx(1.0)
+    assert balanced.is_imbalanced is False
+
+    below_threshold = evaluate_statistical_guard(
+        _obs("d", [0.5 + 0.01 * i for i in range(30)]),
+        _obs("c", [0.1 + 0.005 * i for i in range(89)]),
+    )
+    assert below_threshold.balance_ratio == pytest.approx(89 / 30)
+    assert below_threshold.balance_ratio < COHORT_IMBALANCE_RATIO_THRESHOLD
+    assert below_threshold.is_imbalanced is False
+
+    at_threshold = evaluate_statistical_guard(
+        _obs("d", [0.5 + 0.01 * i for i in range(30)]),
+        _obs("c", [0.1 + 0.005 * i for i in range(90)]),
+    )
+    assert at_threshold.balance_ratio == pytest.approx(COHORT_IMBALANCE_RATIO_THRESHOLD)
+    assert at_threshold.is_imbalanced is True
+
+    flipped_threshold = evaluate_statistical_guard(
+        _obs("d", [0.5 + 0.005 * i for i in range(90)]),
+        _obs("c", [0.1 + 0.01 * i for i in range(30)]),
+    )
+    assert flipped_threshold.balance_ratio == pytest.approx(COHORT_IMBALANCE_RATIO_THRESHOLD)
+    assert flipped_threshold.is_imbalanced is True
+
+    erisk_like = evaluate_statistical_guard(
+        _obs("d", [0.2 + 0.001 * i for i in range(79)]),
+        _obs("c", [0.1 + 0.001 * i for i in range(740)]),
+    )
+    assert erisk_like.is_underpowered is False
+    assert erisk_like.balance_ratio == pytest.approx(740 / 79)
+    assert erisk_like.is_imbalanced is True
+
+    cannot_assess = evaluate_statistical_guard([], [], has_subject_dimension=False)
+    assert cannot_assess.balance_ratio is None
+    # No cohort comparison happened, so balance was never assessed: None, not
+    # False. False would read as "the cohorts are balanced".
+    assert cannot_assess.is_imbalanced is None
+
+
+def test_critic_prompt_includes_imbalance_disclosure_only_when_imbalanced() -> None:
+    balanced = evaluate_statistical_guard(
+        _obs("d", [0.5 + 0.01 * i for i in range(35)]),
+        _obs("c", [0.1 + 0.01 * i for i in range(35)]),
+        metric_name="night_post_ratio",
+    )
+    balanced_prompt = format_critic_guard_instructions(balanced)
+    assert "is_imbalanced: False" in balanced_prompt
+    assert "balance_ratio: 1.00" in balanced_prompt
+    assert "MANDATORY COHORT IMBALANCE DISCLOSURE" not in balanced_prompt
+    assert "limits the precision of the comparison" not in balanced_prompt
+
+    imbalanced = evaluate_statistical_guard(
+        _obs("d", [0.5 + 0.001 * i for i in range(79)]),
+        _obs("c", [0.1 + 0.001 * i for i in range(740)]),
+        metric_name="night_post_ratio",
+    )
+    imbalanced_prompt = format_critic_guard_instructions(imbalanced)
+    assert "is_imbalanced: True" in imbalanced_prompt
+    assert "balance_ratio: 9.37" in imbalanced_prompt
+    assert "MANDATORY COHORT IMBALANCE DISCLOSURE" in imbalanced_prompt
+    assert "limits the precision of the comparison" in imbalanced_prompt
+    assert "SAME language as the user's question" in imbalanced_prompt

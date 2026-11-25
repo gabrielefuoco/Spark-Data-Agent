@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from typing import Any
+
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from src.agent.guards import StatisticalGuardResult, format_critic_guard_instructions
 from src.lakehouse.manifest import DatasetManifest
+
+MAX_PLANNER_HISTORY_EXCHANGES = 3
+MAX_PLANNER_HISTORY_QUESTION_CHARS = 160
+MAX_PLANNER_HISTORY_QUERY_CHARS = 200
+MAX_PLANNER_HISTORY_ANSWER_CHARS = 160
 
 LAKEHOUSE_SCHEMA_GUIDE = """Available Spark SQL lakehouse views (SELECT/WITH/UNION only, no qualified names):
 1. `gold_user_longitudinal_features` (pre-aggregated per subject — prefer for user/cohort comparisons):
@@ -48,6 +56,7 @@ Classify the user request and respond with a single JSON object (no markdown pro
 Rules:
 - Set `answer_from_manifest: true` and `sql_query: null` ONLY when the question asks for global corpus counts, subjects per class, posts per class, global min/max date range, or ETL quarantine totals available in `gold_dataset_manifest.json`.
 - For cohort statistical comparisons (e.g., circadian night posting, post length, posting rate), query `gold_user_longitudinal_features` selecting per-subject rows including `subject_id`, `label`, and the numeric metric column so the statistical guard can compute sample sizes and hypothesis tests.
+- When recent conversation history is provided, resolve follow-up references (such as ellipsis, pronouns, or year/metric overrides) against the prior question and executed query.
 - Never use DDL/DML, file paths, or qualified table names.
 
 Non-SQL Spark job dispatch:
@@ -57,21 +66,100 @@ Non-SQL Spark job dispatch:
 {LAKEHOUSE_SCHEMA_GUIDE}"""
 
 
+def extract_message_text(message: BaseMessage) -> str:
+    """Extract plain text from a LangChain message across string or block payloads."""
+    content = message.content
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and "text" in item:
+                parts.append(str(item["text"]))
+        return "\n".join(parts)
+    return str(content)
+
+
+def _collapse_and_truncate(text: str, max_chars: int) -> str:
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= max_chars:
+        return collapsed
+    return collapsed[: max_chars - 3].rstrip() + "..."
+
+
+def _answer_headline(text: str) -> str:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return _collapse_and_truncate(stripped, MAX_PLANNER_HISTORY_ANSWER_CHARS)
+    return ""
+
+
+def _format_planner_history(history: Sequence[BaseMessage] | None) -> str:
+    """Format the most recent exchanges as compact one-line summaries."""
+    if not history:
+        return ""
+
+    exchanges: list[tuple[str, str | None, str | None]] = []
+    pending_question: str | None = None
+    for msg in history:
+        if isinstance(msg, HumanMessage):
+            if pending_question is not None:
+                exchanges.append((pending_question, None, None))
+            q_text = _collapse_and_truncate(
+                extract_message_text(msg), MAX_PLANNER_HISTORY_QUESTION_CHARS
+            )
+            pending_question = q_text if q_text else None
+        elif isinstance(msg, AIMessage) and pending_question is not None:
+            raw_query = msg.additional_kwargs.get("generated_query")
+            query_summary = (
+                _collapse_and_truncate(raw_query, MAX_PLANNER_HISTORY_QUERY_CHARS)
+                if isinstance(raw_query, str) and raw_query.strip()
+                else None
+            )
+            answer_summary = _answer_headline(extract_message_text(msg)) or None
+            exchanges.append((pending_question, query_summary, answer_summary))
+            pending_question = None
+
+    if pending_question is not None:
+        exchanges.append((pending_question, None, None))
+
+    if not exchanges:
+        return ""
+
+    recent = exchanges[-MAX_PLANNER_HISTORY_EXCHANGES:]
+    lines = ["Recent conversation history (oldest to newest):"]
+    for idx, (user_q, query_text, answer_text) in enumerate(recent, start=1):
+        parts = [f"{idx}. User: {user_q}"]
+        if query_text:
+            parts.append(f"Query: {query_text}")
+        if answer_text:
+            parts.append(f"Answer: {answer_text}")
+        lines.append(" | ".join(parts))
+    return "\n".join(lines)
+
+
 def build_planner_user_prompt(
     question: str,
     *,
+    history: Sequence[BaseMessage] | None = None,
     last_error: dict[str, Any] | None = None,
     planner_notes: str | None = None,
     retry_count: int = 0,
 ) -> str:
-    """Build the planner prompt, attaching structured error context on retries."""
+    """Build the planner prompt, optionally prepending bounded conversation history."""
+    history_block = _format_planner_history(history)
+    request_block = f"{history_block}\n\nUser request:\n{question}" if history_block else f"User request:\n{question}"
+
     if last_error is None:
-        return f"User request:\n{question}"
+        return request_block
 
     error_json = json.dumps(last_error, ensure_ascii=False, indent=2)
     notes_block = f"\nCorrection guidance:\n{planner_notes}\n" if planner_notes else ""
     return (
-        f"User request:\n{question}\n\n"
+        f"{request_block}\n\n"
         f"PREVIOUS QUERY FAILED (retry {retry_count}). Fix the SQL query and do not repeat the mistake.\n"
         f"Structured error:\n{error_json}"
         f"{notes_block}\n"

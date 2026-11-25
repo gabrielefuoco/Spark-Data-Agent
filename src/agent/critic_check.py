@@ -312,6 +312,9 @@ def validate_critic_output(
             missing_items.append("cohens_d")
         if not has_sample_sizes:
             missing_items.append("sample_sizes")
+        # Cohort imbalance (`balance_ratio` / `is_imbalanced`) is intentionally kept
+        # in the guard payload and critic prompt without a regex output check:
+        # prose validators over-reject valid paraphrases across languages.
     else:
         has_p_value = True
         has_cohens_d = True

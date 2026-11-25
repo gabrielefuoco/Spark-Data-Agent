@@ -59,8 +59,14 @@ CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS = (
     "meaning in the user's language) and explain that statistical significance cannot be "
     "evaluated without a `subject_id` dimension; do NOT fabricate p-values or Cohen's d.\n"
     "6. When the sample is underpowered, state `underpowered_reason` verbatim "
-    "and frame any observed numeric difference as inconclusive."
+    "and frame any observed numeric difference as inconclusive.\n"
+    "7. When `is_imbalanced` is true, obey the cohort imbalance disclosure below in the "
+    "SAME language as the user's question."
 )
+
+# At >= 3:1 (SE^2 = s^2 * (1/n_min + 1/(3*n_min)) = 4/3 * s^2/n_min), the smaller
+# cohort contributes >= 75% of the standard error variance regardless of total N.
+COHORT_IMBALANCE_RATIO_THRESHOLD = 3.0
 
 _NORMALITY_ALPHA = 0.05
 _SHAPIRO_MAX_N = 5000
@@ -169,6 +175,10 @@ class StatisticalGuardResult(BaseModel):
     statistical_confidence: ConfidenceLevel
     is_underpowered: bool = False
     underpowered_reason: str | None = None
+    balance_ratio: float | None = None
+    # None when no cohort comparison was possible: False would read as "the
+    # cohorts are balanced", which is a different claim from "not assessed".
+    is_imbalanced: bool | None = None
     test_used: TestName = "none"
     normality_passed: bool | None = None
     alpha: float = 0.05
@@ -215,6 +225,8 @@ def _make_non_assessed_result(
         statistical_confidence=status,
         is_underpowered=False,
         underpowered_reason=None,
+        balance_ratio=None,
+        is_imbalanced=None,
         test_used="none",
         normality_passed=None,
         alpha=alpha,
@@ -377,6 +389,12 @@ def evaluate_statistical_guard(
         if is_underpowered
         else None
     )
+    balance_ratio: float | None = None
+    is_imbalanced: bool | None = None
+    if n1 > 0 and n0 > 0:
+        ratio = max(n1, n0) / min(n1, n0)
+        balance_ratio = ratio
+        is_imbalanced = ratio >= COHORT_IMBALANCE_RATIO_THRESHOLD
 
     cohens_d = _compute_cohens_d(dep, ctrl)
 
@@ -423,6 +441,8 @@ def evaluate_statistical_guard(
         statistical_confidence=confidence,
         is_underpowered=is_underpowered,
         underpowered_reason=underpowered_reason,
+        balance_ratio=balance_ratio,
+        is_imbalanced=is_imbalanced,
         test_used=test_used,
         normality_passed=normality_passed,
         alpha=validated.alpha,
@@ -643,6 +663,23 @@ def format_critic_guard_instructions(result: StatisticalGuardResult) -> str:
         if result.underpowered_reason
         else ""
     )
+    balance_display = (
+        f"{result.balance_ratio:.2f}" if result.balance_ratio is not None else "N/A (not assessed)"
+    )
+    imbalance_block = ""
+    if result.is_imbalanced:
+        ratio_detail = (
+            f" (`balance_ratio={result.balance_ratio:.2f}`, "
+            f"depressed={result.sample_size_depressed}, control={result.sample_size_control})"
+            if result.balance_ratio is not None
+            else ""
+        )
+        imbalance_block = (
+            "\n\nMANDATORY COHORT IMBALANCE DISCLOSURE (`is_imbalanced=true`):\n"
+            f"The cohorts are imbalanced{ratio_detail}. "
+            "Your narrative MUST state this balance ratio and explain that the smaller cohort "
+            "limits the precision of the comparison, in the SAME language as the user's question."
+        )
     return (
         f"{CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS}\n\n"
         f"STATISTICAL GUARD VERDICT ({result.metric_name}):\n"
@@ -650,6 +687,8 @@ def format_critic_guard_instructions(result: StatisticalGuardResult) -> str:
         f"- Claim policy: {claim_policy}\n"
         f"- sample_size_depressed: {result.sample_size_depressed}\n"
         f"- sample_size_control: {result.sample_size_control}\n"
+        f"- balance_ratio: {balance_display}\n"
+        f"- is_imbalanced: {result.is_imbalanced}\n"
         f"- observation_count_depressed: {result.observation_count_depressed}\n"
         f"- observation_count_control: {result.observation_count_control}\n"
         f"- aggregation_method: {result.aggregation_method}\n"
@@ -662,4 +701,5 @@ def format_critic_guard_instructions(result: StatisticalGuardResult) -> str:
         f"{descriptive_line}"
         f"{cannot_assess_line}"
         f"{underpowered_line}".rstrip()
+        + imbalance_block
     )

@@ -16,7 +16,7 @@ from src.agent.guards import (
     evaluate_statistical_guard,
     format_critic_guard_instructions,
 )
-from src.agent.models import build_model_factory, create_chat_model, resolve_model_config
+from src.agent.models import create_chat_model, resolve_model_config
 from src.agent.state import CostEstimate, DataAgentState, make_initial_state
 
 __all__ = [
@@ -26,7 +26,6 @@ __all__ = [
     "StatisticalComparisonInput",
     "StatisticalGuardResult",
     "build_agent_graph",
-    "build_model_factory",
     "create_chat_model",
     "create_sqlite_checkpointer",
     "estimate_ast_cost",

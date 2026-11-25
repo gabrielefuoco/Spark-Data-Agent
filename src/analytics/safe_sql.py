@@ -205,6 +205,21 @@ def validate_and_rewrite_sql(
     return tree.sql(dialect="spark")
 
 
+def map_spark_analysis_exception(
+    exc: AnalysisException,
+    *,
+    query: str | None = None,
+) -> SafeSQLError:
+    """Classify a Spark ``AnalysisException`` into a structured ``SafeSQLError``."""
+    msg = str(exc)
+    code = (
+        "TABLE_NOT_FOUND"
+        if "TABLE_OR_VIEW_NOT_FOUND" in msg or "Table or view not found" in msg
+        else "SPARK_ANALYSIS_ERROR"
+    )
+    return SafeSQLError(code, msg, query=query)
+
+
 def execute_safe_spark_sql(
     query: str,
     spark: SparkSession,
@@ -223,12 +238,6 @@ def execute_safe_spark_sql(
     try:
         return spark.sql(safe_sql)
     except AnalysisException as exc:
-        msg = str(exc)
-        code = (
-            "TABLE_NOT_FOUND"
-            if "TABLE_OR_VIEW_NOT_FOUND" in msg or "Table or view not found" in msg
-            else "SPARK_ANALYSIS_ERROR"
-        )
-        raise SafeSQLError(code, msg, query=safe_sql) from exc
+        raise map_spark_analysis_exception(exc, query=safe_sql) from exc
     except ParseException as exc:
         raise SafeSQLError("SQL_SYNTAX_ERROR", str(exc), query=safe_sql) from exc

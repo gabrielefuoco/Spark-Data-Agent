@@ -28,16 +28,14 @@ from src.lakehouse.manifest import (
     build_dataset_manifest,
     resolve_manifest_filesystem,
 )
-from src.lakehouse.paths import LakehousePaths, _join_uri
+from src.lakehouse.paths import LakehousePaths, join_storage_path
 from src.spark import write_parquet_zstd
 
 
 def _sibling_topics_path(lexical_output_path: str | Path) -> str:
     raw = str(lexical_output_path).rstrip("/")
-    if "://" in raw:
-        parent = raw.rsplit("/", 1)[0]
-        return _join_uri(parent, "gold_cohort_topic_matrix")
-    return str(Path(raw).parent / "gold_cohort_topic_matrix")
+    parent: str | Path = raw.rsplit("/", 1)[0] if "://" in raw else Path(raw).parent
+    return join_storage_path(parent, "gold_cohort_topic_matrix")
 
 
 def _measure_uri_bytes(uri: str, *, settings: Settings | None = None) -> int:

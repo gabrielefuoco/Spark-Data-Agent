@@ -59,7 +59,7 @@ The terms below describe the target. Where the current code differs, the current
   - `Bronze`: Raw, immutable data ingestion with lineage columns (`_source_file`, `_ingested_at`, `_row_hash`).
   - `Silver`: Cleaned, validated, deduplicated atomic posts partitioned by `label` and `year`. Malformed records routed to `silver_quarantine.parquet`.
   - `Gold`: Precomputed analytical matrices (`gold_user_longitudinal_features`, `gold_cohort_lexical_matrix`) and static metadata catalog (`gold_dataset_manifest.json`).
-- **Circadian Index**: Percentage of posts published between 00:00 and 05:00, calculated over a 30-day sliding window (`rowsBetween(-30, 0)`).
+- **Circadian Index**: Share (0–1) of posts published between 00:00 and 05:00, calculated over a **time-based** 30-day sliding window (`rangeBetween(-30 * 86400, 0)` on epoch seconds; `rowsBetween(-30, 0)` would count a fixed number of posts instead of calendar days, shrinking to minutes for a high-frequency user posting dozens of times in one night).
 - **Statistical Significance Guard**: Deterministic post-query evaluation node ensuring sample size $N \ge 30$, running Welch's t-test or Mann-Whitney U, and computing Cohen's $d$ effect size before LLM synthesis.
 - **HITL (Human-in-the-Loop)**: `interrupt_before` gate in LangGraph backed by `SqliteSaver` checkpointer that prompts user approval when Spark `EXPLAIN COST` exceeds execution thresholds.
 - **Dual LLM Backend**:

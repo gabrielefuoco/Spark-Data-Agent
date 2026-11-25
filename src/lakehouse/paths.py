@@ -7,14 +7,24 @@ local paths and future ``s3a://`` URIs consistent without hardcoded literals.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from src.config import Settings, get_settings
 
 
-def _join_uri(base: str, *parts: str) -> str:
-    cleaned = base.rstrip("/")
-    suffix = "/".join(part.strip("/") for part in parts if part.strip("/"))
-    return f"{cleaned}/{suffix}" if suffix else cleaned
+def join_storage_path(base: str | Path, *parts: str) -> str:
+    """Join subpaths onto a URI (``scheme://...``) or local filesystem path."""
+    raw = str(base).strip()
+    cleaned_parts = [part.strip("/") for part in parts if part and part.strip("/")]
+
+    if "://" in raw:
+        cleaned = raw.rstrip("/")
+        return f"{cleaned}/{'/'.join(cleaned_parts)}" if cleaned_parts else cleaned
+
+    target = Path(raw)
+    for part in cleaned_parts:
+        target = target.joinpath(*part.split("/"))
+    return str(target)
 
 
 @dataclass(frozen=True)
@@ -30,52 +40,52 @@ class LakehousePaths:
 
     @property
     def bronze_posts(self) -> str:
-        return _join_uri(self.storage_root, "lakehouse", "bronze", "posts")
+        return join_storage_path(self.storage_root, "lakehouse", "bronze", "posts")
 
     @property
     def bronze_subjects(self) -> str:
-        return _join_uri(self.storage_root, "lakehouse", "bronze", "subjects")
+        return join_storage_path(self.storage_root, "lakehouse", "bronze", "subjects")
 
     @property
     def silver_posts(self) -> str:
-        return _join_uri(self.storage_root, "lakehouse", "silver", "posts")
+        return join_storage_path(self.storage_root, "lakehouse", "silver", "posts")
 
     @property
     def silver_quarantine(self) -> str:
-        return _join_uri(self.storage_root, "lakehouse", "silver", "quarantine")
+        return join_storage_path(self.storage_root, "lakehouse", "silver", "quarantine")
 
     @property
     def gold_user_longitudinal_features(self) -> str:
-        return _join_uri(
+        return join_storage_path(
             self.storage_root, "lakehouse", "gold", "gold_user_longitudinal_features"
         )
 
     @property
     def gold_cohort_lexical_matrix(self) -> str:
-        return _join_uri(
+        return join_storage_path(
             self.storage_root, "lakehouse", "gold", "gold_cohort_lexical_matrix"
         )
 
     @property
     def gold_cohort_topic_matrix(self) -> str:
-        return _join_uri(
+        return join_storage_path(
             self.storage_root, "lakehouse", "gold", "gold_cohort_topic_matrix"
         )
 
     @property
     def gold_dataset_manifest(self) -> str:
-        return _join_uri(
+        return join_storage_path(
             self.storage_root, "lakehouse", "gold", "gold_dataset_manifest.json"
         )
 
     @property
     def sample_root(self) -> str:
-        return _join_uri(self.storage_root, "sample")
+        return join_storage_path(self.storage_root, "sample")
 
     @property
     def sample_chunks(self) -> str:
-        return _join_uri(self.sample_root, "chunk")
+        return join_storage_path(self.sample_root, "chunk")
 
     @property
     def sample_truth(self) -> str:
-        return _join_uri(self.sample_root, "risk-golden-truth-test.txt")
+        return join_storage_path(self.sample_root, "risk-golden-truth-test.txt")

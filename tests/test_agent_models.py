@@ -6,7 +6,7 @@ import pytest
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 from src.agent.cost import estimate_ast_cost, estimate_sql_cost
-from src.agent.models import build_model_factory, create_chat_model, resolve_model_config
+from src.agent.models import create_chat_model, resolve_model_config
 from src.config import Settings
 
 
@@ -54,16 +54,6 @@ def test_openrouter_backend_requires_key_and_selects_role_models() -> None:
     assert critic_url == "https://openrouter.ai/api/v1"
     assert router_key.get_secret_value() == "sk-or-test-key"
     assert critic_key.get_secret_value() == "sk-or-test-key"
-
-
-def test_build_model_factory_is_lazy_until_called() -> None:
-    # Even with an invalid OpenRouter config, constructing the factory does not fail
-    # until the factory is actually invoked.
-    bad_settings = Settings(_env_file=None, llm_backend="openrouter", openrouter_api_key=None)
-    factory = build_model_factory("critic", settings=bad_settings)
-    assert callable(factory)
-    with pytest.raises(ValueError, match="OPENROUTER_API_KEY"):
-        factory()
 
 
 def test_ast_cost_heuristic_distinguishes_gold_cube_from_silver_full_scan() -> None:

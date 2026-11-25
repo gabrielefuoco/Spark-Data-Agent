@@ -15,6 +15,7 @@ from pyspark import SparkConf
 from pyspark.sql import SparkSession
 
 from src.config import Settings, get_settings
+from src.lakehouse.paths import join_storage_path
 
 S3A_SCHEME = "s3a://"
 S3A_FILESYSTEM_IMPL = "org.apache.hadoop.fs.s3a.S3AFileSystem"
@@ -41,21 +42,14 @@ def resolve_storage_target(settings: Settings | None = None, *parts: str) -> str
     if not raw:
         raise StorageConfigurationError("SPARK_STORAGE_URI must not be empty.")
 
-    cleaned_parts = [part.strip("/") for part in parts if part and part.strip("/")]
-
     if is_s3a_uri(raw):
         parsed = urlparse(raw)
         if not parsed.netloc:
             raise StorageConfigurationError(
                 f"Invalid S3A URI {raw!r}: expected 's3a://<bucket>[/prefix]'."
             )
-        base = raw.rstrip("/")
-        return f"{base}/{'/'.join(cleaned_parts)}" if cleaned_parts else base
 
-    target = Path(raw)
-    for part in cleaned_parts:
-        target = target.joinpath(*part.split("/"))
-    return str(target)
+    return join_storage_path(raw, *parts)
 
 
 def resolve_s3_connection(

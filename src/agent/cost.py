@@ -17,7 +17,7 @@ from pyspark.errors import AnalysisException, ParseException
 from pyspark.sql import SparkSession
 from sqlglot import exp
 
-from src.analytics.safe_sql import SafeSQLError
+from src.analytics.safe_sql import SafeSQLError, map_spark_analysis_exception
 from src.config import Settings, get_settings
 
 _TABLE_BASE_COSTS: dict[str, float] = {
@@ -162,13 +162,7 @@ def estimate_sql_cost(
         with contextlib.redirect_stdout(buffer):
             df.explain(mode="cost")
     except AnalysisException as exc:
-        msg = str(exc)
-        code = (
-            "TABLE_NOT_FOUND"
-            if "TABLE_OR_VIEW_NOT_FOUND" in msg or "Table or view not found" in msg
-            else "SPARK_ANALYSIS_ERROR"
-        )
-        raise SafeSQLError(code, msg, query=query) from exc
+        raise map_spark_analysis_exception(exc, query=query) from exc
     except ParseException as exc:
         raise SafeSQLError("SQL_SYNTAX_ERROR", str(exc), query=query) from exc
 

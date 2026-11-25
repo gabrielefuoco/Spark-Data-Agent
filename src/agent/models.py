@@ -9,10 +9,8 @@ of network or API-key requirements.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import Literal
 
-from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
@@ -79,17 +77,3 @@ def create_chat_model(
         timeout=timeout,
         default_headers=headers,
     )
-
-
-def build_model_factory(
-    role: ModelRole,
-    *,
-    settings: Settings | None = None,
-    temperature: float | None = None,
-) -> Callable[[], BaseChatModel]:
-    """Return a zero-arg factory that builds the chat model only on first call."""
-
-    def _factory() -> BaseChatModel:
-        return create_chat_model(role, settings=settings, temperature=temperature)
-
-    return _factory

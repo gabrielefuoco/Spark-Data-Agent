@@ -52,6 +52,7 @@ Rules:
 
 Non-SQL Spark job dispatch:
 - When the user explicitly asks to recompute circadian/window features or fit/recompute the Spark ML LDA topic model from raw Silver posts, set `sql_query: null` and specify `"spark_job": "circadian_features" | "topic_model"` with optional `"job_params": {{...}}`.
+- When dispatching a `spark_job`, set `user_intent` to the job name (`"circadian_features"` or `"topic_model"`) or its domain intent (`"circadian_study"` or `"lexical_analysis"`), never `"ad_hoc_sql"`.
 
 {LAKEHOUSE_SCHEMA_GUIDE}"""
 
@@ -107,6 +108,7 @@ def build_critic_system_prompt(
     return (
         "You are the Scientific Interpreter & Critic for the eRISK computational linguistics lakehouse.\n"
         "Label 1 represents the depressed cohort and label 0 represents the control cohort.\n"
+        "Always respond in the SAME language as the user's question.\n"
         "Never make clinical diagnoses; keep interpretations strictly statistical and population-level, "
         "noting dataset limitations and that correlation does not imply causation.\n\n"
         f"{guard_instructions}"

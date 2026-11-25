@@ -79,3 +79,35 @@ def test_ast_cost_heuristic_distinguishes_gold_cube_from_silver_full_scan() -> N
     )
     assert join_score > 1.5
     assert any("join_operation" in reason for reason in join_reasons)
+
+
+def test_hitl_cost_calibration_separates_partition_pruned_and_unfiltered_silver_posts() -> None:
+    settings = Settings(_env_file=None, hitl_cost_threshold=1.0)
+
+    pruned_year_count = estimate_sql_cost(
+        "SELECT COUNT(*) FROM silver_posts WHERE year = 2014",
+        settings=settings,
+    )
+    assert pruned_year_count["estimated_cost"] < 1.0
+    assert pruned_year_count["triggers_hitl"] is False
+
+    pruned_both = estimate_sql_cost(
+        "SELECT subject_id, text FROM silver_posts WHERE label = 1 AND year = 2014",
+        settings=settings,
+    )
+    assert pruned_both["estimated_cost"] < 1.0
+    assert pruned_both["triggers_hitl"] is False
+
+    unfiltered_star = estimate_sql_cost(
+        "SELECT * FROM silver_posts",
+        settings=settings,
+    )
+    assert unfiltered_star["estimated_cost"] > 1.0
+    assert unfiltered_star["triggers_hitl"] is True
+
+    unfiltered_count = estimate_sql_cost(
+        "SELECT COUNT(*) FROM silver_posts",
+        settings=settings,
+    )
+    assert unfiltered_count["estimated_cost"] > 1.0
+    assert unfiltered_count["triggers_hitl"] is True

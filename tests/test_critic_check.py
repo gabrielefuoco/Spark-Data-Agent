@@ -15,33 +15,37 @@ def _make_guard(
     *,
     n_dep: int = 35,
     n_ctrl: int = 40,
-    p_value: float = 0.0312,
-    cohens_d: float = 0.54,
+    p_value: float | None = 0.0312,
+    cohens_d: float | None = 0.54,
     is_significant: bool = True,
     is_underpowered: bool = False,
     assessment_status: str = "assessed",
 ) -> StatisticalGuardResult:
+    is_non_assessed = assessment_status in {"cannot_assess", "descriptive"}
     return StatisticalGuardResult(
-        sample_size_depressed=n_dep,
-        sample_size_control=n_ctrl,
-        observation_count_depressed=n_dep,
-        observation_count_control=n_ctrl,
-        aggregation_method="none" if assessment_status == "cannot_assess" else "subject_mean",
+        sample_size_depressed=0 if is_non_assessed else n_dep,
+        sample_size_control=0 if is_non_assessed else n_ctrl,
+        observation_count_depressed=0 if is_non_assessed else n_dep,
+        observation_count_control=0 if is_non_assessed else n_ctrl,
+        aggregation_method="none" if is_non_assessed else "subject_mean",
         assessment_status=assessment_status,  # type: ignore[arg-type]
         cannot_assess_reason=(
             "cannot assess: no subject dimension" if assessment_status == "cannot_assess" else None
         ),
-        p_value=p_value,
-        is_significant=is_significant,
-        effect_size_cohens_d=cohens_d,
+        descriptive_reason=(
+            "descriptive: lexical_frequency_table" if assessment_status == "descriptive" else None
+        ),
+        p_value=None if is_non_assessed else p_value,
+        is_significant=False if is_non_assessed else is_significant,
+        effect_size_cohens_d=None if is_non_assessed else cohens_d,
         statistical_confidence=(
-            "cannot_assess"
-            if assessment_status == "cannot_assess"
+            assessment_status  # type: ignore[arg-type]
+            if is_non_assessed
             else ("underpowered" if is_underpowered else ("medium" if is_significant else "low"))
         ),
-        is_underpowered=is_underpowered,
-        underpowered_reason="Underpowered sample." if is_underpowered else None,
-        test_used="none" if assessment_status == "cannot_assess" else "welch_t",
+        is_underpowered=False if is_non_assessed else is_underpowered,
+        underpowered_reason="Underpowered sample." if (is_underpowered and not is_non_assessed) else None,
+        test_used="none" if is_non_assessed else "welch_t",
     )
 
 
@@ -287,10 +291,18 @@ def test_correction_prompt_and_deterministic_fallback_always_comply() -> None:
         _make_guard(
             n_dep=0,
             n_ctrl=0,
-            p_value=1.0,
-            cohens_d=0.0,
+            p_value=None,
+            cohens_d=None,
             is_significant=False,
             assessment_status="cannot_assess",
+        ),
+        _make_guard(
+            n_dep=0,
+            n_ctrl=0,
+            p_value=None,
+            cohens_d=None,
+            is_significant=False,
+            assessment_status="descriptive",
         ),
     ):
         failed = validate_critic_output("Depressed users post significantly more.", guard)
@@ -300,8 +312,31 @@ def test_correction_prompt_and_deterministic_fallback_always_comply() -> None:
             assert item in correction
 
         fallback = format_inconclusive_critic_fallback(guard, failed)
-        assert "inconclusive" in fallback.lower()
-        assert "claim threshold was not met" in fallback.lower()
+        assert "non viene affermata alcuna differenza" in fallback.lower()
+        if guard.assessment_status in {"cannot_assess", "descriptive"}:
+            assert "p_value =" not in fallback
+            assert "cohen's d =" not in fallback.lower()
         recheck = validate_critic_output(fallback, guard)
         assert recheck.passed is True
         assert recheck.forbidden_claims == []
+
+
+def test_descriptive_mode_allows_italian_presentation_and_blocks_significance_claims() -> None:
+    guard = _make_guard(assessment_status="descriptive")
+
+    compliant_it = (
+        "I bigrammi più frequenti nella coorte label=1 sono 'feel alone' (tfidf=0.14) e "
+        "'cant sleep' (tfidf=0.11). Trattandosi di statistiche descrittive, non è possibile "
+        "affermare alcuna differenza statisticamente significativa né un segnale clinico."
+    )
+    ok_check = validate_critic_output(compliant_it, guard)
+    assert ok_check.passed is True
+    assert ok_check.forbidden_claims == []
+
+    rogue_it = (
+        "I soggetti depressi usano significativamente più spesso il bigramma 'feel alone', "
+        "con una differenza statisticamente significativa tra le coorti."
+    )
+    bad_check = validate_critic_output(rogue_it, guard)
+    assert bad_check.passed is False
+    assert bad_check.forbidden_claims

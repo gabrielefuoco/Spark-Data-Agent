@@ -54,8 +54,12 @@ _UNIT_TO_MIB: dict[str, float] = {
     "tb": 1024.0 * 1024.0,
 }
 
-# 50 MiB of estimated Spark scan corresponds to cost 1.0 (the default HITL threshold).
-_MIB_PER_COST_UNIT = 50.0
+# One cost unit models "expensive enough that a human should approve it", so the
+# scale follows the dataset: this lakehouse is ~400k posts / ~500 MiB, and at 50 MiB
+# per unit a single year partition (57 MiB) tripped the gate on a query Spark answers
+# in half a second. 500 MiB per unit puts a pruned partition at ~0.1 and a full
+# unfiltered scan at ~1.0, which is where the threshold belongs.
+_MIB_PER_COST_UNIT = 500.0
 
 
 def _extract_spark_size_mib(explain_text: str) -> float | None:
@@ -111,16 +115,25 @@ def estimate_ast_cost(query: str) -> tuple[float, list[str]]:
             for col in where.find_all(exp.Column)
             if col.name
         }
-        has_star = any(isinstance(sel, exp.Star) for sel in tree.find_all(exp.Star))
-        if not where_nodes or has_star:
+        has_select_star = any(
+            isinstance(expr, exp.Star)
+            or (isinstance(expr, exp.Column) and isinstance(expr.this, exp.Star))
+            for select in tree.find_all(exp.Select)
+            for expr in select.expressions
+        )
+        if not where_nodes:
             score += 0.2
-            reasons.append("silver_posts_unfiltered_or_wide_scan (+0.20)")
+            reasons.append("silver_posts_unfiltered_scan (+0.20)")
         elif "label" in where_columns and "year" in where_columns:
-            score -= 0.3
-            reasons.append("silver_posts_partition_pruned_label_year (-0.30)")
+            score -= 0.7
+            reasons.append("silver_posts_partition_pruned_label_year (-0.70)")
         elif "label" in where_columns or "year" in where_columns:
-            score -= 0.15
-            reasons.append("silver_posts_partial_partition_pruned (-0.15)")
+            score -= 0.55
+            reasons.append("silver_posts_partial_partition_pruned (-0.55)")
+
+        if has_select_star:
+            score += 0.1
+            reasons.append("silver_posts_wide_select_star (+0.10)")
 
     return round(max(score, 0.05), 4), reasons
 

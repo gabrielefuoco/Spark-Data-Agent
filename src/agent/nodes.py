@@ -25,7 +25,7 @@ from src.agent.critic_check import (
 )
 from src.agent.guards import (
     StatisticalGuardResult,
-    SubjectObservation,
+    evaluate_query_result_guard,
     evaluate_statistical_guard,
 )
 from src.agent.models import create_chat_model
@@ -56,9 +56,6 @@ SUPPORTED_SPARK_JOBS: frozenset[str] = frozenset({"circadian_features", "topic_m
 _SPARK_JOB_PREFIX = "SPARK_JOB:"
 
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
-_EXCLUDED_METRIC_COLUMNS = frozenset(
-    {"label", "year", "subject_id", "first_post_at", "last_post_at"}
-)
 
 
 def _to_json_value(value: Any) -> Any:
@@ -358,125 +355,12 @@ def _normalize_query_result(raw: dict[str, Any] | list[dict[str, Any]]) -> dict[
     raise TypeError(f"Unexpected SQL executor return type: {type(raw).__name__}")
 
 
-def _as_finite_float(value: object) -> float | None:
-    """Return ``value`` as a float when it is a finite real number, else ``None``."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    number = float(value)
-    return number if math.isfinite(number) else None
-
-
-@dataclass(frozen=True)
-class _ExtractedGroupMetrics:
-    """Subject-attributed cohort observations extracted from SQL result rows."""
-
-    depressed_observations: list[SubjectObservation]
-    control_observations: list[SubjectObservation]
-    metric_name: str
-    has_subject_dimension: bool
-    raw_observation_count_depressed: int
-    raw_observation_count_control: int
-
-
-def _find_column_key(candidate_cols: Sequence[str], target_lower: str) -> str | None:
-    for col in candidate_cols:
-        if col.lower() == target_lower:
-            return col
-    return None
-
-
-def _extract_group_metrics(
-    rows: list[dict[str, Any]],
-    preferred_metric: str | None = None,
-    columns: Sequence[str] | None = None,
-) -> _ExtractedGroupMetrics:
-    """Extract subject-level depressed (label=1) and control (label=0) observations."""
-    metric_label = preferred_metric or "metric"
-    candidate_cols: list[str] = list(columns or [])
-    for row in rows:
-        for key in row:
-            if key not in candidate_cols:
-                candidate_cols.append(key)
-
-    subject_col = _find_column_key(candidate_cols, "subject_id")
-    label_col = _find_column_key(candidate_cols, "label")
-    has_subject_col = subject_col is not None
-
-    metric_col: str | None = None
-    if rows and label_col is not None:
-        if preferred_metric:
-            preferred_key = _find_column_key(candidate_cols, preferred_metric.lower())
-            if preferred_key and any(
-                _as_finite_float(r.get(preferred_key)) is not None for r in rows
-            ):
-                metric_col = preferred_key
-        if metric_col is None:
-            for col in candidate_cols:
-                if col.lower() in _EXCLUDED_METRIC_COLUMNS:
-                    continue
-                if any(_as_finite_float(r.get(col)) is not None for r in rows):
-                    metric_col = col
-                    break
-
-    if metric_col is None or label_col is None:
-        return _ExtractedGroupMetrics(
-            depressed_observations=[],
-            control_observations=[],
-            metric_name=metric_label,
-            has_subject_dimension=has_subject_col,
-            raw_observation_count_depressed=0,
-            raw_observation_count_control=0,
-        )
-
-    depressed: list[SubjectObservation] = []
-    control: list[SubjectObservation] = []
-    raw_dep_count = 0
-    raw_ctrl_count = 0
-
-    for row in rows:
-        raw_label = row.get(label_col)
-        val = _as_finite_float(row.get(metric_col))
-        if raw_label is None or val is None:
-            continue
-        try:
-            label_int = int(raw_label)
-        except (TypeError, ValueError):
-            continue
-        if label_int not in (0, 1):
-            continue
-
-        if label_int == 1:
-            raw_dep_count += 1
-        else:
-            raw_ctrl_count += 1
-
-        if subject_col is None:
-            continue
-        raw_subject = row.get(subject_col)
-        if raw_subject is None:
-            continue
-        subject_id = str(raw_subject).strip()
-        if not subject_id:
-            continue
-
-        obs = SubjectObservation(subject_id=subject_id, value=val)
-        if label_int == 1:
-            depressed.append(obs)
-        else:
-            control.append(obs)
-
-    has_subject_dimension = has_subject_col and (
-        (raw_dep_count + raw_ctrl_count) == 0 or (len(depressed) + len(control)) > 0
-    )
-
-    return _ExtractedGroupMetrics(
-        depressed_observations=depressed,
-        control_observations=control,
-        metric_name=metric_col,
-        has_subject_dimension=has_subject_dimension,
-        raw_observation_count_depressed=raw_dep_count,
-        raw_observation_count_control=raw_ctrl_count,
-    )
+def _resolve_spark_job_intent(raw_intent: str, job_name: str) -> str:
+    """Return a coherent non-SQL intent when dispatching a ``SPARK_JOB:`` plan."""
+    normalized_job = job_name.strip().lower()
+    if raw_intent in {"", "ad_hoc_sql", "general_conversation", "catalog_metadata"}:
+        return normalized_job if normalized_job in SUPPORTED_SPARK_JOBS else "spark_job"
+    return raw_intent
 
 
 def _normalize_hitl_decision(decision: Any) -> bool:
@@ -639,12 +523,13 @@ def intent_router_planner(state: DataAgentState, deps: AgentRuntimeDeps) -> dict
 
     if has_job:
         assert isinstance(raw_job, str)
+        coherent_intent = _resolve_spark_job_intent(intent, raw_job)
         raw_params = plan.get("job_params")
         if raw_params is None:
             raw_params = plan.get("params")
         if raw_params is not None and not isinstance(raw_params, dict):
             return {
-                "user_intent": intent,
+                "user_intent": coherent_intent,
                 "generated_query": None,
                 "last_error": {
                     "code": "INVALID_JOB_PARAMS",
@@ -654,7 +539,7 @@ def intent_router_planner(state: DataAgentState, deps: AgentRuntimeDeps) -> dict
                 "status": "running",
             }
         return {
-            "user_intent": intent,
+            "user_intent": coherent_intent,
             "generated_query": encode_spark_job(raw_job, raw_params),
             "analysis_metric": plan.get("metric_name"),
             "last_error": None,
@@ -662,6 +547,15 @@ def intent_router_planner(state: DataAgentState, deps: AgentRuntimeDeps) -> dict
         }
 
     sql_query = plan.get("sql_query")
+    if isinstance(sql_query, str) and (inline_job := decode_spark_job(sql_query)) is not None:
+        job_name, job_params = inline_job
+        return {
+            "user_intent": _resolve_spark_job_intent(intent, job_name),
+            "generated_query": encode_spark_job(job_name, job_params),
+            "analysis_metric": plan.get("metric_name"),
+            "last_error": None,
+            "status": "running",
+        }
     if not isinstance(sql_query, str) or not sql_query.strip():
         return {
             "user_intent": intent,
@@ -813,24 +707,16 @@ def query_rewriter(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str, A
 
 
 def statistical_guard(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str, Any]:
-    """Run deterministic cohort significance and power checks on all fetched rows."""
+    """Run deterministic cohort significance, descriptive classification, and power checks."""
     query_result = state.get("query_result") or {}
     analysis_rows = state.get("analysis_rows")
     rows = analysis_rows if analysis_rows is not None else query_result.get("rows", [])
     columns = query_result.get("columns", [])
-    extracted = _extract_group_metrics(
+    guard_result = evaluate_query_result_guard(
         rows,
-        preferred_metric=state.get("analysis_metric"),
         columns=columns,
-    )
-    guard_result = evaluate_statistical_guard(
-        extracted.depressed_observations,
-        extracted.control_observations,
+        preferred_metric=state.get("analysis_metric"),
         settings=deps.settings,
-        metric_name=extracted.metric_name,
-        has_subject_dimension=extracted.has_subject_dimension,
-        raw_observation_count_depressed=extracted.raw_observation_count_depressed,
-        raw_observation_count_control=extracted.raw_observation_count_control,
     )
     validation_payload = guard_result.model_dump(mode="json")
     validation_payload["rows_returned"] = int(query_result.get("rows_returned", len(rows)))
@@ -840,7 +726,7 @@ def statistical_guard(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str
     validation_payload["truncated"] = bool(query_result.get("truncated", False))
     return {
         "statistical_validation": validation_payload,
-        "analysis_metric": extracted.metric_name,
+        "analysis_metric": guard_result.metric_name,
         "analysis_rows": None,
         "status": "running",
     }

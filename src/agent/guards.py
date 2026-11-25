@@ -1,12 +1,25 @@
 """Deterministic, non-LLM statistical significance guard and critic constraints.
 
-Evaluates two-group comparisons (depressed vs control) using SciPy before the
-scientific critic LLM is allowed to interpret query results. Collapses multiple
-observations per ``subject_id`` into a per-subject arithmetic mean to prevent
-pseudo-replication, enforces minimum unique-subject sample sizes from
-``Settings.min_subjects_per_class``, chooses between Welch's t-test and
-Mann-Whitney U via normality screening, computes Cohen's d, and guards
-degenerate/missing-subject inputs against NaN/inf or silent passes.
+Evaluates query results before the scientific critic LLM synthesizes an answer.
+Classifies each result purely from its data shape into one of three modes:
+
+1. ``descriptive``: Not a two-group comparison of a continuous per-subject
+   metric — including lexical/n-gram frequency tables, topic distributions,
+   single counts, aggregate cohort counts, single-cohort slices, or results
+   without a numeric metric. No hypothesis test is run and ``p_value`` /
+   ``effect_size_cohens_d`` are ``None``.
+2. ``cannot_assess``: A two-group cohort comparison of a continuous metric was
+   attempted (both ``label=1`` and ``label=0`` rows are present with a numeric
+   metric that is not a descriptive table), but ``subject_id`` is missing or
+   empty. No hypothesis test is run and ``p_value`` / ``effect_size_cohens_d``
+   are ``None``.
+3. ``assessed``: A valid two-group comparison with ``subject_id``, ``label``,
+   and a continuous numeric metric. Collapses multiple observations per
+   ``subject_id`` into a per-subject arithmetic mean to prevent
+   pseudo-replication, enforces minimum unique-subject sample sizes from
+   ``Settings.min_subjects_per_class``, chooses between Welch's t-test and
+   Mann-Whitney U via normality screening, computes Cohen's d, and guards
+   degenerate inputs against NaN/inf or silent passes.
 """
 
 from __future__ import annotations
@@ -14,7 +27,7 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from collections.abc import Sequence
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 from pydantic import BaseModel, Field, field_validator
@@ -22,30 +35,79 @@ from scipy import stats
 
 from src.config import Settings
 
-ConfidenceLevel = Literal["high", "medium", "low", "underpowered", "cannot_assess"]
+ConfidenceLevel = Literal["high", "medium", "low", "underpowered", "cannot_assess", "descriptive"]
 TestName = Literal["welch_t", "mann_whitney_u", "none"]
 AggregationMethod = Literal["subject_mean", "none"]
-AssessmentStatus = Literal["assessed", "cannot_assess"]
+AssessmentStatus = Literal["assessed", "cannot_assess", "descriptive"]
 
-# Ticket 05 wires these rules into the scientific_critic node's system prompt.
 CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS = (
     "MANDATORY SCIENTIFIC CRITIC CONSTRAINTS:\n"
-    "1. If `assessment_status` is 'cannot_assess' OR `is_significant` is false OR "
-    "`is_underpowered` is true, you MUST NOT claim any correlation, difference, or "
-    "clinical signal associated with depression.\n"
-    "2. Every comparative statement MUST explicitly cite the unique-subject sample sizes "
-    "(`sample_size_depressed` and `sample_size_control`), raw observation counts "
-    "(`observation_count_depressed` and `observation_count_control`), "
+    "1. Answer in the SAME language as the user's question (e.g., Italian if the user "
+    "asked in Italian, English if asked in English), even though these instructions are in English.\n"
+    "2. If `assessment_status` is 'cannot_assess' OR `assessment_status` is 'descriptive' OR "
+    "`is_significant` is false OR `is_underpowered` is true, you MUST NOT claim any cohort "
+    "difference, correlation, or clinical signal associated with depression.\n"
+    "3. When `assessment_status` is 'assessed', every comparative statement MUST explicitly cite "
+    "the unique-subject sample sizes (`sample_size_depressed` and `sample_size_control`), raw "
+    "observation counts (`observation_count_depressed` and `observation_count_control`), "
     "`aggregation_method`, `p_value`, and effect size `effect_size_cohens_d`.\n"
-    "3. When `assessment_status` is 'cannot_assess', state `cannot_assess_reason` "
-    "verbatim and explain that statistical significance cannot be evaluated without a "
-    "`subject_id` dimension.\n"
-    "4. When the sample is underpowered, state `underpowered_reason` verbatim "
+    "4. When `assessment_status` is 'descriptive', DO NOT refuse to answer and DO NOT invent "
+    "p-values or Cohen's d: present the descriptive result directly (such as top terms/n-grams "
+    "with their weights or frequencies, LDA topics with their top terms, counts, or summary rows), "
+    "while explicitly noting that these are descriptive statistics without subject-level hypothesis testing.\n"
+    "5. When `assessment_status` is 'cannot_assess', state `cannot_assess_reason` (or its "
+    "meaning in the user's language) and explain that statistical significance cannot be "
+    "evaluated without a `subject_id` dimension; do NOT fabricate p-values or Cohen's d.\n"
+    "6. When the sample is underpowered, state `underpowered_reason` verbatim "
     "and frame any observed numeric difference as inconclusive."
 )
 
 _NORMALITY_ALPHA = 0.05
 _SHAPIRO_MAX_N = 5000
+
+_EXCLUDED_METRIC_COLUMNS = frozenset(
+    {"label", "year", "subject_id", "first_post_at", "last_post_at", "date", "raw_date"}
+)
+_LEXICAL_TABLE_COLUMNS = frozenset(
+    {
+        "ngram",
+        "ngram_type",
+        "unigram",
+        "bigram",
+        "tfidf_weight",
+        "tfidf_rank",
+        "idf_weight",
+        "relative_frequency",
+        "frequency",
+    }
+)
+_TOPIC_TABLE_COLUMNS = frozenset(
+    {
+        "topic",
+        "top_terms",
+        "mean_topic_probability",
+        "term_rank",
+        "topic_prob",
+        "dominant_topic",
+        "dominant_topic_prob",
+    }
+)
+_DESCRIPTIVE_COUNT_COLUMNS = frozenset(
+    {
+        "count",
+        "count(1)",
+        "count(*)",
+        "cnt",
+        "row_count",
+        "document_count",
+        "subject_count",
+        "total_posts",
+        "total_subjects",
+        "n_posts",
+        "num_posts",
+    }
+)
+_AGGREGATE_PREFIXES = ("count(", "sum(", "avg(", "min(", "max(")
 
 
 def _validate_finite_float(value: float) -> float:
@@ -100,16 +162,64 @@ class StatisticalGuardResult(BaseModel):
     aggregation_method: AggregationMethod = "subject_mean"
     assessment_status: AssessmentStatus = "assessed"
     cannot_assess_reason: str | None = None
-    p_value: float
-    is_significant: bool
-    effect_size_cohens_d: float
+    descriptive_reason: str | None = None
+    p_value: float | None = None
+    is_significant: bool = False
+    effect_size_cohens_d: float | None = None
     statistical_confidence: ConfidenceLevel
-    is_underpowered: bool
+    is_underpowered: bool = False
     underpowered_reason: str | None = None
-    test_used: TestName
+    test_used: TestName = "none"
     normality_passed: bool | None = None
     alpha: float = 0.05
     metric_name: str = "metric"
+
+
+def _as_finite_float(value: object) -> float | None:
+    """Return ``value`` as a float when it is a finite real number, else ``None``."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _find_column_key(candidate_cols: Sequence[str], target_lower: str) -> str | None:
+    for col in candidate_cols:
+        if col.lower() == target_lower:
+            return col
+    return None
+
+
+def _make_non_assessed_result(
+    *,
+    status: Literal["cannot_assess", "descriptive"],
+    reason: str,
+    metric_name: str,
+    alpha: float = 0.05,
+    obs_count_dep: int = 0,
+    obs_count_ctrl: int = 0,
+) -> StatisticalGuardResult:
+    """Build a guard verdict with no hypothesis test and ``None`` p-value / Cohen's d."""
+    return StatisticalGuardResult(
+        sample_size_depressed=0,
+        sample_size_control=0,
+        observation_count_depressed=obs_count_dep,
+        observation_count_control=obs_count_ctrl,
+        aggregation_method="none",
+        assessment_status=status,
+        cannot_assess_reason=reason if status == "cannot_assess" else None,
+        descriptive_reason=reason if status == "descriptive" else None,
+        p_value=None,
+        is_significant=False,
+        effect_size_cohens_d=None,
+        statistical_confidence=status,
+        is_underpowered=False,
+        underpowered_reason=None,
+        test_used="none",
+        normality_passed=None,
+        alpha=alpha,
+        metric_name=metric_name,
+    )
 
 
 def _aggregate_by_subject(observations: Sequence[SubjectObservation]) -> np.ndarray:
@@ -233,27 +343,16 @@ def evaluate_statistical_guard(
     )
 
     if not validated.has_subject_dimension:
-        return StatisticalGuardResult(
-            sample_size_depressed=0,
-            sample_size_control=0,
-            observation_count_depressed=obs_count_dep,
-            observation_count_control=obs_count_ctrl,
-            aggregation_method="none",
-            assessment_status="cannot_assess",
-            cannot_assess_reason=(
+        return _make_non_assessed_result(
+            status="cannot_assess",
+            reason=(
                 f"cannot assess: no subject dimension for '{validated.metric_name}' "
                 "(missing `subject_id` column in query results)."
             ),
-            p_value=1.0,
-            is_significant=False,
-            effect_size_cohens_d=0.0,
-            statistical_confidence="cannot_assess",
-            is_underpowered=False,
-            underpowered_reason=None,
-            test_used="none",
-            normality_passed=None,
-            alpha=validated.alpha,
             metric_name=validated.metric_name,
+            alpha=validated.alpha,
+            obs_count_dep=obs_count_dep,
+            obs_count_ctrl=obs_count_ctrl,
         )
 
     if validated.min_subjects_per_class is not None:
@@ -331,17 +430,186 @@ def evaluate_statistical_guard(
     )
 
 
-def format_critic_guard_instructions(result: StatisticalGuardResult) -> str:
-    """Format the guard verdict and mandatory constraints for the scientific critic prompt.
+def _resolve_numeric_metric_column(
+    rows: Sequence[dict[str, Any]],
+    candidate_cols: Sequence[str],
+    preferred_metric: str | None,
+) -> str | None:
+    if preferred_metric:
+        preferred_key = _find_column_key(candidate_cols, preferred_metric.lower())
+        if (
+            preferred_key
+            and preferred_key.lower() not in _EXCLUDED_METRIC_COLUMNS
+            and any(_as_finite_float(r.get(preferred_key)) is not None for r in rows)
+        ):
+            return preferred_key
+    for col in candidate_cols:
+        if col.lower() in _EXCLUDED_METRIC_COLUMNS:
+            continue
+        if any(_as_finite_float(r.get(col)) is not None for r in rows):
+            return col
+    return None
 
-    Ticket 05 wires this helper directly into the ``scientific_critic`` node's
-    system/state prompt so the LLM cannot override or omit statistical bounds.
+
+def evaluate_query_result_guard(
+    rows: Sequence[dict[str, Any]],
+    *,
+    columns: Sequence[str] | None = None,
+    preferred_metric: str | None = None,
+    settings: Settings | None = None,
+) -> StatisticalGuardResult:
+    """Classify a SQL/Spark job result by its data shape and evaluate the guard.
+
+    Decision rule (inspected purely from result columns and rows, never from
+    upstream node or intent names):
+    1. Empty rows -> ``descriptive`` (``descriptive: empty_result``).
+    2. Lexical/n-gram frequency table (any column in ``_LEXICAL_TABLE_COLUMNS``)
+       or topic distribution table (any column in ``_TOPIC_TABLE_COLUMNS``) ->
+       ``descriptive``, even when ``label`` and numeric weights are present,
+       because these are cohort-level descriptive summaries rather than
+       per-subject metrics.
+    3. Missing ``label`` column or missing numeric metric column -> ``descriptive``
+       (covers single counts like ``COUNT(*)``, time-series/year summaries, and
+       text/catalog listings).
+    4. When ``subject_id`` is absent:
+       - If the numeric metric is a cohort-level aggregate/count (column in
+         ``_DESCRIPTIVE_COUNT_COLUMNS`` or SQL aggregate ``count(``/``sum(``/``avg(``)
+         or only one cohort label in ``{0, 1}`` is present -> ``descriptive``.
+       - If both ``label=1`` and ``label=0`` rows are present for a continuous
+         metric without ``subject_id`` -> ``cannot_assess`` (a two-group
+         comparison was attempted without a subject dimension).
+    5. When ``subject_id``, ``label`` (both cohorts), and a continuous metric
+       are present -> ``assessed`` via ``evaluate_statistical_guard``.
     """
-    if result.assessment_status == "cannot_assess":
+    if not rows:
+        return _make_non_assessed_result(
+            status="descriptive",
+            reason="descriptive: empty_result",
+            metric_name=preferred_metric or "descriptive_metric",
+        )
+
+    candidate_cols: list[str] = list(columns or [])
+    for row in rows:
+        for key in row:
+            if key not in candidate_cols:
+                candidate_cols.append(key)
+
+    cols_lower = {col.lower() for col in candidate_cols}
+    if cols_lower & _LEXICAL_TABLE_COLUMNS:
+        return _make_non_assessed_result(
+            status="descriptive",
+            reason="descriptive: lexical_frequency_table",
+            metric_name=preferred_metric or "lexical_ngram",
+        )
+
+    if cols_lower & _TOPIC_TABLE_COLUMNS:
+        return _make_non_assessed_result(
+            status="descriptive",
+            reason="descriptive: topic_distribution_table",
+            metric_name=preferred_metric or "topic_distribution",
+        )
+
+    metric_col = _resolve_numeric_metric_column(rows, candidate_cols, preferred_metric)
+    label_col = _find_column_key(candidate_cols, "label")
+    if label_col is None:
+        return _make_non_assessed_result(
+            status="descriptive",
+            reason="descriptive: no_cohort_label_column",
+            metric_name=metric_col or preferred_metric or "descriptive_metric",
+        )
+
+    if metric_col is None:
+        return _make_non_assessed_result(
+            status="descriptive",
+            reason="descriptive: no_numeric_metric_column",
+            metric_name=preferred_metric or "descriptive_metric",
+        )
+
+    subject_col = _find_column_key(candidate_cols, "subject_id")
+    metric_lower = metric_col.lower()
+    if subject_col is None and (
+        metric_lower in _DESCRIPTIVE_COUNT_COLUMNS or metric_lower.startswith(_AGGREGATE_PREFIXES)
+    ):
+        return _make_non_assessed_result(
+            status="descriptive",
+            reason="descriptive: cohort_aggregate_metric",
+            metric_name=metric_col,
+        )
+
+    depressed: list[SubjectObservation] = []
+    control: list[SubjectObservation] = []
+    raw_dep_count = 0
+    raw_ctrl_count = 0
+
+    for row in rows:
+        raw_label = row.get(label_col)
+        val = _as_finite_float(row.get(metric_col))
+        if raw_label is None or val is None:
+            continue
+        try:
+            label_int = int(raw_label)
+        except (TypeError, ValueError):
+            continue
+        if label_int not in (0, 1):
+            continue
+
+        if label_int == 1:
+            raw_dep_count += 1
+        else:
+            raw_ctrl_count += 1
+
+        if subject_col is None:
+            continue
+        raw_subject = row.get(subject_col)
+        if raw_subject is None:
+            continue
+        subject_id = str(raw_subject).strip()
+        if not subject_id:
+            continue
+
+        obs = SubjectObservation(subject_id=subject_id, value=val)
+        if label_int == 1:
+            depressed.append(obs)
+        else:
+            control.append(obs)
+
+    if raw_dep_count == 0 or raw_ctrl_count == 0:
+        return _make_non_assessed_result(
+            status="descriptive",
+            reason="descriptive: single_cohort_only",
+            metric_name=metric_col,
+            obs_count_dep=raw_dep_count,
+            obs_count_ctrl=raw_ctrl_count,
+        )
+
+    has_subject_dimension = (subject_col is not None) and (len(depressed) + len(control) > 0)
+    return evaluate_statistical_guard(
+        depressed,
+        control,
+        settings=settings,
+        metric_name=metric_col,
+        has_subject_dimension=has_subject_dimension,
+        raw_observation_count_depressed=raw_dep_count,
+        raw_observation_count_control=raw_ctrl_count,
+    )
+
+
+def format_critic_guard_instructions(result: StatisticalGuardResult) -> str:
+    """Format the guard verdict and mandatory constraints for the scientific critic prompt."""
+    if result.assessment_status == "descriptive":
+        claim_policy = (
+            "DESCRIPTIVE_ONLY: Present the descriptive results directly and clearly in the "
+            "user's language (top n-grams with weights/frequencies, LDA topics with top terms, "
+            "counts, or summary rows). Do NOT refuse to answer and do NOT fabricate p-values or "
+            "Cohen's d. FORBIDDEN: Do NOT claim any statistically significant cohort difference, "
+            "correlation, or clinical signal from descriptive results."
+        )
+    elif result.assessment_status == "cannot_assess":
         claim_policy = (
             "FORBIDDEN: Cannot assess statistical significance (no subject dimension). "
-            "Do NOT claim any depression correlation or class difference; state that "
-            "subject-level significance cannot be evaluated without `subject_id`."
+            "Do NOT claim any depression correlation or class difference; state in the "
+            "user's language that subject-level significance cannot be evaluated without "
+            "`subject_id`, and do NOT fabricate p-values or Cohen's d."
         )
     elif result.is_significant and not result.is_underpowered:
         claim_policy = (
@@ -353,6 +621,18 @@ def format_critic_guard_instructions(result: StatisticalGuardResult) -> str:
             "FORBIDDEN: Do NOT claim any depression correlation or class difference "
             "because the result is underpowered or not statistically significant."
         )
+
+    p_display = f"{result.p_value:.6g}" if result.p_value is not None else "N/A (not tested)"
+    d_display = (
+        f"{result.effect_size_cohens_d:.4f}"
+        if result.effect_size_cohens_d is not None
+        else "N/A (not tested)"
+    )
+    descriptive_line = (
+        f"- descriptive_reason: {result.descriptive_reason}\n"
+        if result.descriptive_reason
+        else ""
+    )
     cannot_assess_line = (
         f"- cannot_assess_reason: {result.cannot_assess_reason}\n"
         if result.cannot_assess_reason
@@ -373,12 +653,13 @@ def format_critic_guard_instructions(result: StatisticalGuardResult) -> str:
         f"- observation_count_depressed: {result.observation_count_depressed}\n"
         f"- observation_count_control: {result.observation_count_control}\n"
         f"- aggregation_method: {result.aggregation_method}\n"
-        f"- p_value: {result.p_value:.6g}\n"
-        f"- effect_size_cohens_d: {result.effect_size_cohens_d:.4f}\n"
+        f"- p_value: {p_display}\n"
+        f"- effect_size_cohens_d: {d_display}\n"
         f"- is_significant: {result.is_significant}\n"
         f"- is_underpowered: {result.is_underpowered}\n"
         f"- statistical_confidence: {result.statistical_confidence}\n"
         f"- test_used: {result.test_used}\n"
+        f"{descriptive_line}"
         f"{cannot_assess_line}"
         f"{underpowered_line}".rstrip()
     )

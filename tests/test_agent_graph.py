@@ -473,8 +473,7 @@ def test_missing_subject_id_column_records_cannot_assess_verdict_and_forbids_cla
         }
     )
     critic = _critic(
-        "Cannot assess statistical significance without subject_id "
-        "(depressed=0, control=0, p = 1.0, Cohen's d = 0.0)."
+        "Impossibile valutare la significatività statistica senza dimensione subject_id."
     )
 
     def fake_executor(_query: str, _cfg: Settings) -> list[dict[str, Any]]:
@@ -495,6 +494,8 @@ def test_missing_subject_id_column_records_cannot_assess_verdict_and_forbids_cla
     assert result["status"] == "completed"
     guard = result["statistical_validation"]
     assert guard["assessment_status"] == "cannot_assess"
+    assert guard["p_value"] is None
+    assert guard["effect_size_cohens_d"] is None
     assert guard["cannot_assess_reason"] is not None
     assert "cannot assess: no subject dimension" in guard["cannot_assess_reason"].lower()
     assert guard["statistical_confidence"] == "cannot_assess"
@@ -826,8 +827,8 @@ def test_critic_never_complying_falls_back_to_deterministic_inconclusive_text() 
     assert "cohens_d" in failure["missing_items"]
 
     final_text = result["final_response"]
-    assert "inconclusive" in final_text.lower()
-    assert "claim threshold was not met" in final_text.lower()
+    assert "risultato non conclusivo" in final_text.lower()
+    assert "non viene affermata alcuna differenza" in final_text.lower()
     assert "35" in final_text
     assert "5.04483e-13" in final_text
     assert "15.681" in final_text
@@ -897,10 +898,9 @@ def test_nonsignificant_underpowered_and_cannot_assess_never_ship_significance_c
     assert check_up.passed is True
     assert check_up.forbidden_claims == []
 
-    # 3. cannot_assess: rogue claim on both calls -> deterministic fallback without significance claim.
+    # 3. cannot_assess: rogue claim on both calls -> Italian fallback without fabricated p/d.
     rogue_ca = (
-        "There is a statistically significant difference between depressed and control users "
-        "(depressed=0, control=0, p = 1.0, Cohen's d = 0.0)."
+        "There is a statistically significant difference between depressed and control users."
     )
     critic_ca = _critic(rogue_ca, rogue_ca)
     res_ca = build_agent_graph(
@@ -911,14 +911,269 @@ def test_nonsignificant_underpowered_and_cannot_assess_never_ship_significance_c
             {"label": 1, "night_post_ratio": 0.6},
             {"label": 0, "night_post_ratio": 0.1},
         ],
-    ).invoke(make_initial_state("Compare night post ratio."))
+    ).invoke(make_initial_state("Confronta il rapporto di post notturni per coorte."))
     guard_ca = StatisticalGuardResult.model_validate(res_ca["statistical_validation"])
     assert guard_ca.assessment_status == "cannot_assess"
+    assert guard_ca.p_value is None
+    assert guard_ca.effect_size_cohens_d is None
     assert res_ca["critic_call_count"] == 2
     assert res_ca["critic_output_check_failed"] is not None
+    assert "impossibile valutare" in res_ca["final_response"].lower()
+    assert "non viene affermata alcuna differenza" in res_ca["final_response"].lower()
+    assert "p_value =" not in res_ca["final_response"]
+    assert "cohen's d =" not in res_ca["final_response"].lower()
     check_ca = validate_critic_output(res_ca["final_response"], guard_ca)
     assert check_ca.passed is True
     assert check_ca.forbidden_claims == []
+
+
+def test_descriptive_results_present_findings_and_block_significance_claims() -> None:
+    settings = Settings(_env_file=None, hitl_cost_threshold=1.0)
+
+    # 1. N-gram frequency table (gold_cohort_lexical_matrix)
+    ngram_router = _router(
+        {
+            "user_intent": "lexical_analysis",
+            "answer_from_manifest": False,
+            "sql_query": (
+                "SELECT label, ngram_type, ngram, frequency, tfidf_weight, tfidf_rank "
+                "FROM gold_cohort_lexical_matrix ORDER BY label, tfidf_rank"
+            ),
+            "metric_name": "tfidf_weight",
+        }
+    )
+    ngram_answer = (
+        "I bigrammi con peso TF-IDF maggiore nella coorte label=1 sono "
+        "'feel alone' (tfidf=0.14, freq=42) e 'cant sleep' (tfidf=0.11, freq=31). "
+        "Trattandosi di una tabella descrittiva, non indica differenze statisticamente "
+        "significative o segnali clinici."
+    )
+    ngram_critic = _critic(ngram_answer)
+    ngram_res = build_agent_graph(
+        settings=settings,
+        router_model=ngram_router,
+        critic_model=ngram_critic,
+        sql_executor=lambda _q, _cfg: [
+            {
+                "label": 1,
+                "ngram_type": "bigram",
+                "ngram": "feel alone",
+                "frequency": 42,
+                "tfidf_weight": 0.14,
+                "tfidf_rank": 1,
+            },
+            {
+                "label": 0,
+                "ngram_type": "bigram",
+                "ngram": "weekend hike",
+                "frequency": 35,
+                "tfidf_weight": 0.11,
+                "tfidf_rank": 1,
+            },
+        ],
+    ).invoke(make_initial_state("Quali parole e bigrammi caratterizzano i soggetti depressi?"))
+
+    ngram_guard = StatisticalGuardResult.model_validate(ngram_res["statistical_validation"])
+    assert ngram_guard.assessment_status == "descriptive"
+    assert ngram_guard.p_value is None
+    assert ngram_guard.effect_size_cohens_d is None
+    assert "DESCRIPTIVE_ONLY:" in ngram_res["critic_system_prompt"]
+    assert "DO NOT refuse" in ngram_res["critic_system_prompt"]
+    assert "SAME language" in ngram_res["critic_system_prompt"]
+    assert ngram_res["final_response"] == ngram_answer
+    assert ngram_res["critic_output_check_failed"] is None
+
+    # 2. Topic table (gold_cohort_topic_matrix)
+    topic_router = _router(
+        {
+            "user_intent": "lexical_analysis",
+            "answer_from_manifest": False,
+            "sql_query": (
+                "SELECT label, topic, mean_topic_probability, document_count, top_terms "
+                "FROM gold_cohort_topic_matrix"
+            ),
+            "metric_name": "mean_topic_probability",
+        }
+    )
+    topic_answer = (
+        "Topic 0 presenta i termini 'feel alone, cant sleep' "
+        "(mean_topic_probability=0.42 in label=1; statistiche puramente descrittive)."
+    )
+    topic_res = build_agent_graph(
+        settings=settings,
+        router_model=topic_router,
+        critic_model=_critic(topic_answer),
+        sql_executor=lambda _q, _cfg: [
+            {
+                "label": 1,
+                "topic": 0,
+                "mean_topic_probability": 0.42,
+                "document_count": 40,
+                "top_terms": "feel alone, cant sleep",
+            },
+            {
+                "label": 0,
+                "topic": 0,
+                "mean_topic_probability": 0.11,
+                "document_count": 40,
+                "top_terms": "morning coffee, weekend hike",
+            },
+        ],
+    ).invoke(make_initial_state("Mostra i topic LDA principali per coorte."))
+
+    topic_guard = StatisticalGuardResult.model_validate(topic_res["statistical_validation"])
+    assert topic_guard.assessment_status == "descriptive"
+    assert topic_guard.p_value is None
+    assert topic_guard.effect_size_cohens_d is None
+    assert topic_res["final_response"] == topic_answer
+
+    # 3. Single count query (silver_posts WHERE year = 2014)
+    count_router = _router(
+        {
+            "user_intent": "ad_hoc_sql",
+            "answer_from_manifest": False,
+            "sql_query": "SELECT COUNT(*) AS post_count FROM silver_posts WHERE year = 2014",
+        }
+    )
+    count_answer = "Nel 2014 sono presenti 1250 post in `silver_posts`."
+    count_res = build_agent_graph(
+        settings=settings,
+        router_model=count_router,
+        critic_model=_critic(count_answer),
+        sql_executor=lambda _q, _cfg: [{"post_count": 1250}],
+    ).invoke(make_initial_state("Quanti post ci sono nel 2014?"))
+
+    count_guard = StatisticalGuardResult.model_validate(count_res["statistical_validation"])
+    assert count_guard.assessment_status == "descriptive"
+    assert count_guard.p_value is None
+    assert count_guard.effect_size_cohens_d is None
+    assert count_res["sql_cost_estimate"]["triggers_hitl"] is False
+    assert count_res["final_response"] == count_answer
+
+    # 4. Descriptive result making a forbidden significance claim is caught and replaced
+    rogue_desc = "C'è una differenza statisticamente significativa nei bigrammi tra le coorti."
+    desc_rogue_res = build_agent_graph(
+        settings=settings,
+        router_model=ngram_router,
+        critic_model=_critic(rogue_desc, rogue_desc),
+        sql_executor=lambda _q, _cfg: [
+            {"label": 1, "ngram_type": "bigram", "ngram": "feel alone", "tfidf_weight": 0.14},
+            {"label": 0, "ngram_type": "bigram", "ngram": "weekend hike", "tfidf_weight": 0.11},
+        ],
+    ).invoke(make_initial_state("Quali bigrammi caratterizzano i depressi?"))
+
+    desc_rogue_guard = StatisticalGuardResult.model_validate(
+        desc_rogue_res["statistical_validation"]
+    )
+    assert desc_rogue_guard.assessment_status == "descriptive"
+    assert desc_rogue_res["critic_call_count"] == 2
+    assert desc_rogue_res["critic_output_check_failed"] is not None
+    assert "risultato descrittivo" in desc_rogue_res["final_response"].lower()
+    assert validate_critic_output(desc_rogue_res["final_response"], desc_rogue_guard).passed is True
+
+
+def test_hitl_pruned_silver_posts_skips_gate_while_unfiltered_triggers_gate(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(_env_file=None, hitl_cost_threshold=1.0)
+
+    pruned_res = build_agent_graph(
+        settings=settings,
+        router_model=_router(
+            {
+                "user_intent": "ad_hoc_sql",
+                "answer_from_manifest": False,
+                "sql_query": "SELECT COUNT(*) FROM silver_posts WHERE year = 2014",
+            }
+        ),
+        critic_model=_critic("Sono presenti 420 post nel 2014."),
+        sql_executor=lambda _q, _cfg: [{"count(1)": 420}],
+    ).invoke(make_initial_state("Quanti post ci sono nel 2014?"))
+
+    assert pruned_res["status"] == "completed"
+    assert pruned_res["sql_cost_estimate"]["triggers_hitl"] is False
+    assert pruned_res["sql_cost_estimate"]["estimated_cost"] < 1.0
+
+    with open_sqlite_checkpointer(tmp_path / "hitl_unfiltered.sqlite") as saver:
+        unfiltered_graph = build_agent_graph(
+            settings=settings,
+            router_model=_router(
+                {
+                    "user_intent": "ad_hoc_sql",
+                    "answer_from_manifest": False,
+                    "sql_query": "SELECT * FROM silver_posts",
+                }
+            ),
+            critic_model=_critic("unused"),
+            sql_executor=lambda _q, _cfg: [],
+            checkpointer=saver,
+        )
+        interrupted = unfiltered_graph.invoke(
+            make_initial_state("Mostra tutti i post di silver_posts."),
+            config={"configurable": {"thread_id": "unfiltered-silver-test"}},
+        )
+
+    assert "__interrupt__" in interrupted
+    assert interrupted["__interrupt__"][0].value["estimated_cost"] > 1.0
+
+
+def test_spark_job_plan_never_reports_ad_hoc_sql_intent() -> None:
+    settings = Settings(_env_file=None, hitl_cost_threshold=5.0)
+
+    lda_res = build_agent_graph(
+        settings=settings,
+        router_model=_router(
+            {
+                "user_intent": "ad_hoc_sql",
+                "answer_from_manifest": False,
+                "spark_job": "topic_model",
+                "job_params": {"k": 8},
+                "sql_query": None,
+            }
+        ),
+        critic_model=_critic("Topic estratti (statistiche descrittive)."),
+        job_executor=lambda _name, _params, _cfg: [
+            {
+                "label": 1,
+                "topic": 0,
+                "mean_topic_probability": 0.4,
+                "document_count": 10,
+                "top_terms": "feel alone",
+            },
+            {
+                "label": 0,
+                "topic": 0,
+                "mean_topic_probability": 0.1,
+                "document_count": 10,
+                "top_terms": "morning coffee",
+            },
+        ],
+    ).invoke(make_initial_state("Ricalcola il modello LDA sui post Silver."))
+
+    assert lda_res["status"] == "completed"
+    assert lda_res["user_intent"] == "topic_model"
+    assert lda_res["user_intent"] != "ad_hoc_sql"
+    assert lda_res["statistical_validation"]["assessment_status"] == "descriptive"
+
+    inline_res = build_agent_graph(
+        settings=settings,
+        router_model=_router(
+            {
+                "user_intent": "ad_hoc_sql",
+                "answer_from_manifest": False,
+                "sql_query": 'SPARK_JOB:{"job": "circadian_features", "params": {"window_days": 30}}',
+                "metric_name": "night_post_ratio",
+            }
+        ),
+        critic_model=_critic(
+            "Significant shift (depressed=30, control=30, p = 2.41976e-11, Cohen's d = 15.6425)."
+        ),
+        job_executor=lambda _name, _params, _cfg: _cohort_rows(30),
+    ).invoke(make_initial_state("Ricalcola le feature circadiane."))
+
+    assert inline_res["status"] == "completed"
+    assert inline_res["user_intent"] == "circadian_features"
+    assert inline_res["user_intent"] != "ad_hoc_sql"
 
 
 @pytest.mark.spark
@@ -1080,3 +1335,22 @@ def test_fetch_limit_cap_marks_truncated_and_demands_critic_disclosure(
 
     critic_user_msg = str(critic.recorded_invocations[0][1].content)
     assert '"truncated": true' in critic_user_msg
+
+
+def test_hitl_cost_scale_separates_a_pruned_partition_from_a_full_scan() -> None:
+    """One cost unit must mean "worth a human's time" for THIS dataset.
+
+    Calibrated on the real corpus: at 50 MiB per unit a single year partition
+    (57 MiB) tripped the gate on a query Spark answers in half a second, so a
+    simple count needed manual approval. A pruned scan must stay below the
+    threshold and an unfiltered full scan above it.
+    """
+    settings = Settings(_env_file=None, hitl_cost_threshold=1.0)
+    pruned = estimate_sql_cost(
+        "SELECT COUNT(*) AS post_count FROM silver_posts WHERE year = 2014",
+        settings=settings,
+    )
+    full = estimate_sql_cost("SELECT * FROM silver_posts", settings=settings)
+
+    assert pruned["triggers_hitl"] is False
+    assert full["triggers_hitl"] is True

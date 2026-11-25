@@ -16,7 +16,7 @@ import streamlit as st
 from langgraph.types import Command
 
 from src.agent.graph import build_agent_graph, create_sqlite_checkpointer
-from src.agent.nodes import _as_finite_float
+from src.agent.guards import _as_finite_float
 from src.agent.state import make_initial_state
 from src.config import PROJECT_ROOT, Settings, get_settings
 from src.lakehouse.manifest import DatasetManifest, load_manifest
@@ -174,7 +174,14 @@ def _render_statistical_card(stats_payload: dict[str, Any]) -> None:
     cohens_d = stats_payload.get("effect_size_cohens_d")
     col4.metric("Cohen's d", f"{cohens_d:.3f}" if isinstance(cohens_d, (int, float)) else "N/A")
 
-    if stats_payload.get("is_underpowered"):
+    if stats_payload.get("assessment_status") == "descriptive":
+        st.info("Analisi descrittiva: nessun test di significatività statistica applicato.")
+    elif stats_payload.get("assessment_status") == "cannot_assess":
+        st.warning(
+            stats_payload.get("cannot_assess_reason")
+            or "Impossibile valutare la significatività statistica senza dimensione `subject_id`."
+        )
+    elif stats_payload.get("is_underpowered"):
         st.warning(
             stats_payload.get("underpowered_reason") or "Campione sottodimensionato (underpowered)."
         )

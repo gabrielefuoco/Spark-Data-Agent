@@ -10,6 +10,7 @@ from scipy import stats
 from src.agent.guards import (
     StatisticalComparisonInput,
     SubjectObservation,
+    evaluate_query_result_guard,
     evaluate_statistical_guard,
     format_critic_guard_instructions,
 )
@@ -210,6 +211,8 @@ def test_missing_subject_dimension_returns_cannot_assess_verdict() -> None:
     assert result.assessment_status == "cannot_assess"
     assert result.cannot_assess_reason is not None
     assert "cannot assess: no subject dimension" in result.cannot_assess_reason.lower()
+    assert result.p_value is None
+    assert result.effect_size_cohens_d is None
     assert result.statistical_confidence == "cannot_assess"
     assert result.is_significant is False
     assert result.test_used == "none"
@@ -222,6 +225,67 @@ def test_missing_subject_dimension_returns_cannot_assess_verdict() -> None:
     prompt = format_critic_guard_instructions(result)
     assert "FORBIDDEN" in prompt
     assert "cannot assess: no subject dimension" in prompt.lower()
+    assert "N/A (not tested)" in prompt
+
+
+def test_query_result_guard_classifies_descriptive_tables_and_counts() -> None:
+    ngram_rows = [
+        {
+            "label": 1,
+            "ngram_type": "bigram",
+            "ngram": "feel alone",
+            "frequency": 42,
+            "tfidf_weight": 0.14,
+            "tfidf_rank": 1,
+        },
+        {
+            "label": 0,
+            "ngram_type": "bigram",
+            "ngram": "weekend hike",
+            "frequency": 35,
+            "tfidf_weight": 0.11,
+            "tfidf_rank": 1,
+        },
+    ]
+    ngram_guard = evaluate_query_result_guard(ngram_rows)
+    assert ngram_guard.assessment_status == "descriptive"
+    assert ngram_guard.p_value is None
+    assert ngram_guard.effect_size_cohens_d is None
+    assert ngram_guard.descriptive_reason is not None
+    assert "lexical" in ngram_guard.descriptive_reason
+
+    topic_rows = [
+        {
+            "label": 1,
+            "topic": 0,
+            "mean_topic_probability": 0.35,
+            "document_count": 50,
+            "top_terms": "feel alone, cant sleep",
+        },
+        {
+            "label": 0,
+            "topic": 0,
+            "mean_topic_probability": 0.12,
+            "document_count": 50,
+            "top_terms": "morning coffee, weekend hike",
+        },
+    ]
+    topic_guard = evaluate_query_result_guard(topic_rows)
+    assert topic_guard.assessment_status == "descriptive"
+    assert topic_guard.p_value is None
+    assert topic_guard.effect_size_cohens_d is None
+    assert topic_guard.descriptive_reason is not None
+    assert "topic" in topic_guard.descriptive_reason
+
+    count_guard = evaluate_query_result_guard([{"count(1)": 1234}])
+    assert count_guard.assessment_status == "descriptive"
+    assert count_guard.p_value is None
+    assert count_guard.effect_size_cohens_d is None
+
+    prompt = format_critic_guard_instructions(ngram_guard)
+    assert "DESCRIPTIVE_ONLY" in prompt
+    assert "DO NOT refuse" in prompt
+    assert "N/A (not tested)" in prompt
 
 
 def test_non_finite_input_values_are_rejected() -> None:

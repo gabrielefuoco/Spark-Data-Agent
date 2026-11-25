@@ -8,7 +8,6 @@ import pytest
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import IntegerType, StringType, StructField, StructType, TimestampType
-from src.lakehouse.bronze import run_bronze_ingestion
 from src.lakehouse.silver import REASON_CONTRACT_VIOLATION, build_silver
 from src.lakehouse.validation import (
     VIOLATION_INVALID_LABEL,
@@ -101,17 +100,10 @@ def test_validation_rejects_structural_type_mismatch(spark: SparkSession) -> Non
 @pytest.mark.spark
 def test_silver_accounting_invariant_with_contract_violation_in_mix(
     spark: SparkSession,
-    lakehouse_env: tuple,
+    bronze_lakehouse: tuple,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings, paths, _ = lakehouse_env
-    bronze_posts, _ = run_bronze_ingestion(
-        spark,
-        paths.sample_chunks,
-        paths.sample_truth,
-        settings=settings,
-        paths=paths,
-    )
+    settings, paths, bronze_posts, _ = bronze_lakehouse
     bronze_count = bronze_posts.count()
 
     # Flag the first valid Silver candidate deterministically to exercise contract quarantine routing.

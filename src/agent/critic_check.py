@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 from src.agent.guards import StatisticalGuardResult
 from src.agent.prompts import (
     describe_descriptive_guard_it,
+    format_cohens_d,
     format_critic_fallback_closing_line,
 )
 
@@ -274,14 +275,6 @@ def _normalize_guards(
     return list(guard)
 
 
-def _is_assessed_guard(guard: StatisticalGuardResult) -> bool:
-    return (
-        guard.assessment_status == "assessed"
-        and guard.p_value is not None
-        and guard.effect_size_cohens_d is not None
-    )
-
-
 def _validate_single_assessed(
     text: str,
     guard: StatisticalGuardResult,
@@ -315,7 +308,7 @@ def validate_critic_output(
     """
     text = _normalise_decimal_commas(critique_text or "")
     guards = _normalize_guards(guard)
-    assessed = [item for item in guards if _is_assessed_guard(item)]
+    assessed = [item for item in guards if item.is_assessed]
 
     has_p_value = True
     has_cohens_d = True
@@ -350,11 +343,7 @@ def validate_critic_output(
     # Cohort imbalance (`balance_ratio` / `is_imbalanced`) is intentionally kept
     # in the guard payload and critic prompt without a regex output check:
     # prose validators over-reject valid paraphrases across languages.
-    has_supported_significant = any(
-        _is_assessed_guard(item) and item.is_significant and not item.is_underpowered
-        for item in guards
-    )
-    claims_forbidden = not has_supported_significant
+    claims_forbidden = not any(item.allows_claims for item in guards)
     forbidden_claims = _detect_forbidden_claims(text) if claims_forbidden else []
 
     passed = (not ordered_missing) and (not forbidden_claims)
@@ -383,41 +372,40 @@ def format_critic_correction_prompt(
             f"{', '.join(repr(claim) for claim in check.forbidden_claims)}."
         )
     problems_block = "\n".join(f"- {line}" for line in problems)
+    scope = "" if len(guards) == 1 else " across the tool results"
+    header = (
+        "CORRECTION REQUIRED: Your previous response failed deterministic statistical "
+        f"guardrail verification{scope}.\n"
+        f"{problems_block}\n\n"
+        "Rewrite the complete response in the SAME language as the user's question"
+    )
 
     if len(guards) == 1:
         single = guards[0]
         if single.assessment_status == "descriptive":
             return (
-                "CORRECTION REQUIRED: Your previous response failed deterministic statistical "
-                "guardrail verification.\n"
-                f"{problems_block}\n\n"
-                "Rewrite the complete response in the SAME language as the user's question so that it:\n"
+                f"{header} so that it:\n"
                 "- Presents the descriptive results faithfully (terms/weights, topics/terms, counts, or summary rows).\n"
                 "- Does NOT fabricate p-values or Cohen's d.\n"
                 "- Does NOT assert any cohort difference, statistical significance, correlation, or clinical signal "
                 "associated with depression."
             )
 
-        if (
-            single.assessment_status == "cannot_assess"
-            or single.p_value is None
-            or single.effect_size_cohens_d is None
-        ):
+        if not single.is_assessed:
             return (
-                "CORRECTION REQUIRED: Your previous response failed deterministic statistical "
-                "guardrail verification.\n"
-                f"{problems_block}\n\n"
-                "Rewrite the complete response in the SAME language as the user's question so that it:\n"
+                f"{header} so that it:\n"
                 "- Explains that statistical significance cannot be evaluated without a `subject_id` dimension.\n"
                 "- Does NOT fabricate p-values or Cohen's d.\n"
                 "- Does NOT assert any significant difference, correlation, or clinical signal associated with depression."
             )
 
+        assert single.p_value is not None
+        assert single.effect_size_cohens_d is not None
         claim_rule = (
-            "Do NOT assert any significant difference, correlation, or clinical signal "
+            "Keep any comparative claim strictly scoped to the observed metric."
+            if single.allows_claims
+            else "Do NOT assert any significant difference, correlation, or clinical signal "
             "associated with depression because the statistical guard forbids claims."
-            if (not single.is_significant) or single.is_underpowered
-            else "Keep any comparative claim strictly scoped to the observed metric."
         )
         d_line = (
             f"- Cohen's d = {single.effect_size_cohens_d:.6g}\n"
@@ -425,10 +413,7 @@ def format_critic_correction_prompt(
             else ""
         )
         return (
-            "CORRECTION REQUIRED: Your previous response failed deterministic statistical "
-            "guardrail verification.\n"
-            f"{problems_block}\n\n"
-            "Rewrite the complete response in the SAME language as the user's question so that it explicitly quotes:\n"
+            f"{header} so that it explicitly quotes:\n"
             f"- sample_size_depressed = {single.sample_size_depressed} and "
             f"sample_size_control = {single.sample_size_control}\n"
             f"- p_value = {single.p_value:.6g}\n"
@@ -438,12 +423,12 @@ def format_critic_correction_prompt(
 
     assessed_lines: list[str] = []
     for idx, item in enumerate(guards, start=1):
-        if _is_assessed_guard(item):
+        if item.is_assessed:
             assert item.p_value is not None
             assert item.effect_size_cohens_d is not None
             status_note = (
                 "SIGNIFICANT (scope claim to this metric)"
-                if item.is_significant and not item.is_underpowered
+                if item.allows_claims
                 else "NON-SIGNIFICANT/UNDERPOWERED (do NOT claim difference for this metric)"
             )
             d_part = (
@@ -465,10 +450,7 @@ def format_critic_correction_prompt(
 
     requirements = "\n".join(assessed_lines)
     return (
-        "CORRECTION REQUIRED: Your previous response failed deterministic statistical "
-        "guardrail verification across the tool results.\n"
-        f"{problems_block}\n\n"
-        "Rewrite the complete response in the SAME language as the user's question, citing n, p, "
+        f"{header}, citing n, p, "
         "and d for every significant result and at least one assessed result's n and p when all "
         "assessed results are non-significant, obeying every result's verdict:\n"
         f"{requirements}"
@@ -480,11 +462,7 @@ def _format_guard_fallback_section(
     *,
     heading: str,
 ) -> str:
-    if (
-        guard.assessment_status == "cannot_assess"
-        or guard.p_value is None
-        or guard.effect_size_cohens_d is None
-    ):
+    if not guard.is_assessed:
         if guard.assessment_status == "descriptive":
             description = describe_descriptive_guard_it(
                 guard.metric_name, guard.descriptive_reason
@@ -498,12 +476,10 @@ def _format_guard_fallback_section(
             "non viene affermata alcuna differenza tra le coorti."
         )
 
-    d_display = (
-        "0.0000"
-        if abs(guard.effect_size_cohens_d) < 1e-12
-        else f"{guard.effect_size_cohens_d:.6g}"
-    )
-    if guard.is_significant and not guard.is_underpowered:
+    assert guard.p_value is not None
+    assert guard.effect_size_cohens_d is not None
+    d_display = format_cohens_d(guard.effect_size_cohens_d)
+    if guard.allows_claims:
         return (
             f"{heading}\n"
             f"**Risultato statisticamente significativo** "

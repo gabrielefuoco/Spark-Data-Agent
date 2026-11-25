@@ -20,6 +20,9 @@ def _make_guard(
     is_significant: bool = True,
     is_underpowered: bool = False,
     assessment_status: str = "assessed",
+    metric_name: str = "metric",
+    descriptive_reason: str | None = None,
+    cannot_assess_reason: str | None = None,
 ) -> StatisticalGuardResult:
     is_non_assessed = assessment_status in {"cannot_assess", "descriptive"}
     return StatisticalGuardResult(
@@ -30,10 +33,14 @@ def _make_guard(
         aggregation_method="none" if is_non_assessed else "subject_mean",
         assessment_status=assessment_status,  # type: ignore[arg-type]
         cannot_assess_reason=(
-            "cannot assess: no subject dimension" if assessment_status == "cannot_assess" else None
+            cannot_assess_reason or "cannot assess: no subject dimension"
+            if assessment_status == "cannot_assess"
+            else None
         ),
         descriptive_reason=(
-            "descriptive: lexical_frequency_table" if assessment_status == "descriptive" else None
+            descriptive_reason or "descriptive: lexical_frequency_table"
+            if assessment_status == "descriptive"
+            else None
         ),
         p_value=None if is_non_assessed else p_value,
         is_significant=False if is_non_assessed else is_significant,
@@ -46,6 +53,7 @@ def _make_guard(
         is_underpowered=False if is_non_assessed else is_underpowered,
         underpowered_reason="Underpowered sample." if (is_underpowered and not is_non_assessed) else None,
         test_used="none" if is_non_assessed else "welch_t",
+        metric_name=metric_name,
     )
 
 
@@ -307,22 +315,8 @@ def test_correction_prompt_and_deterministic_fallback_always_comply() -> None:
         _make_guard(is_significant=True),
         _make_guard(is_significant=False, p_value=0.25, cohens_d=-9.67e-16),
         _make_guard(n_dep=5, n_ctrl=5, is_significant=False, is_underpowered=True),
-        _make_guard(
-            n_dep=0,
-            n_ctrl=0,
-            p_value=None,
-            cohens_d=None,
-            is_significant=False,
-            assessment_status="cannot_assess",
-        ),
-        _make_guard(
-            n_dep=0,
-            n_ctrl=0,
-            p_value=None,
-            cohens_d=None,
-            is_significant=False,
-            assessment_status="descriptive",
-        ),
+        _make_guard(assessment_status="cannot_assess"),
+        _make_guard(assessment_status="descriptive"),
     ):
         failed = validate_critic_output("Depressed users post significantly more.", guard)
         assert failed.passed is False
@@ -331,11 +325,11 @@ def test_correction_prompt_and_deterministic_fallback_always_comply() -> None:
             assert item in correction
 
         fallback = format_inconclusive_critic_fallback(guard, failed)
-        if guard.assessment_status in {"cannot_assess", "descriptive"}:
+        if not guard.is_assessed:
             assert "non viene affermata alcuna differenza" in fallback.lower()
             assert "p_value =" not in fallback
             assert "cohen's d =" not in fallback.lower()
-        elif guard.is_significant and not guard.is_underpowered:
+        elif guard.allows_claims:
             assert "non conclusivo" not in fallback.lower()
             assert "inconclusiv" not in fallback.lower()
             assert "non viene affermata alcuna differenza" not in fallback.lower()
@@ -351,42 +345,6 @@ def test_correction_prompt_and_deterministic_fallback_always_comply() -> None:
         recheck = validate_critic_output(fallback, guard)
         assert recheck.passed is True
         assert recheck.forbidden_claims == []
-
-
-def test_fallback_preserves_significant_finding_and_keeps_inconclusive_for_nonsignificant() -> None:
-    sig_guard = _make_guard(
-        n_dep=79,
-        n_ctrl=740,
-        p_value=0.0005936535745210291,
-        cohens_d=0.68,
-        is_significant=True,
-        is_underpowered=False,
-    )
-    sig_failed = validate_critic_output("Differenza significativa senza numeri.", sig_guard)
-    assert sig_failed.passed is False
-    sig_fallback = format_inconclusive_critic_fallback(sig_guard, sig_failed)
-    assert "79" in sig_fallback
-    assert "740" in sig_fallback
-    assert f"{sig_guard.p_value:.6g}" in sig_fallback
-    assert "0.68" in sig_fallback
-    assert "non conclusivo" not in sig_fallback.lower()
-    assert "non viene affermata alcuna differenza" not in sig_fallback.lower()
-    assert validate_critic_output(sig_fallback, sig_guard).passed is True
-
-    ns_guard = _make_guard(
-        n_dep=79,
-        n_ctrl=740,
-        p_value=0.31,
-        cohens_d=0.08,
-        is_significant=False,
-        is_underpowered=False,
-    )
-    ns_failed = validate_critic_output("Depressed users differ significantly.", ns_guard)
-    assert ns_failed.passed is False
-    ns_fallback = format_inconclusive_critic_fallback(ns_guard, ns_failed)
-    assert "risultato non conclusivo" in ns_fallback.lower()
-    assert "non viene affermata alcuna differenza" in ns_fallback.lower()
-    assert validate_critic_output(ns_fallback, ns_guard).passed is True
 
 
 def test_descriptive_mode_allows_italian_presentation_and_blocks_significance_claims() -> None:
@@ -497,70 +455,43 @@ def test_cohens_d_required_only_when_significant() -> None:
 
 
 def test_fallback_reads_like_an_answer_with_single_closing_note() -> None:
-    manifest_guard = StatisticalGuardResult(
-        sample_size_depressed=0,
-        sample_size_control=0,
-        aggregation_method="none",
-        assessment_status="descriptive",
-        descriptive_reason="descriptive: no_cohort_label_column",
-        statistical_confidence="descriptive",
-        test_used="none",
-        metric_name="total_posts",
-    )
-    lexical_guard = StatisticalGuardResult(
-        sample_size_depressed=0,
-        sample_size_control=0,
-        aggregation_method="none",
-        assessment_status="descriptive",
-        descriptive_reason="descriptive: lexical_frequency_table",
-        statistical_confidence="descriptive",
-        test_used="none",
-        metric_name="lexical_ngram",
-    )
-    topic_guard = StatisticalGuardResult(
-        sample_size_depressed=0,
-        sample_size_control=0,
-        aggregation_method="none",
-        assessment_status="descriptive",
-        descriptive_reason="descriptive: topic_distribution_table",
-        statistical_confidence="descriptive",
-        test_used="none",
-        metric_name="topic_distribution",
-    )
-    cannot_assess_guard = StatisticalGuardResult(
-        sample_size_depressed=0,
-        sample_size_control=0,
-        aggregation_method="none",
-        assessment_status="cannot_assess",
-        cannot_assess_reason="cannot assess: no subject dimension for 'night_post_ratio'",
-        statistical_confidence="cannot_assess",
-        test_used="none",
-        metric_name="night_post_ratio",
-    )
-    sig_guard = _make_guard(
-        n_dep=79,
-        n_ctrl=740,
-        p_value=0.0005936535745210291,
-        cohens_d=0.68,
-        is_significant=True,
-    )
-    sig_guard = sig_guard.model_copy(update={"metric_name": "session_count"})
-    ns_guard = _make_guard(
-        n_dep=79,
-        n_ctrl=740,
-        p_value=0.5587,
-        cohens_d=0.068,
-        is_significant=False,
-    )
-    ns_guard = ns_guard.model_copy(update={"metric_name": "mean_text_length"})
-
     guards = [
-        manifest_guard,
-        lexical_guard,
-        topic_guard,
-        cannot_assess_guard,
-        sig_guard,
-        ns_guard,
+        _make_guard(
+            assessment_status="descriptive",
+            metric_name="total_posts",
+            descriptive_reason="descriptive: no_cohort_label_column",
+        ),
+        _make_guard(
+            assessment_status="descriptive",
+            metric_name="lexical_ngram",
+            descriptive_reason="descriptive: lexical_frequency_table",
+        ),
+        _make_guard(
+            assessment_status="descriptive",
+            metric_name="topic_distribution",
+            descriptive_reason="descriptive: topic_distribution_table",
+        ),
+        _make_guard(
+            assessment_status="cannot_assess",
+            metric_name="night_post_ratio",
+            cannot_assess_reason="cannot assess: no subject dimension for 'night_post_ratio'",
+        ),
+        _make_guard(
+            n_dep=79,
+            n_ctrl=740,
+            p_value=0.0005936535745210291,
+            cohens_d=0.68,
+            is_significant=True,
+            metric_name="session_count",
+        ),
+        _make_guard(
+            n_dep=79,
+            n_ctrl=740,
+            p_value=0.5587,
+            cohens_d=0.068,
+            is_significant=False,
+            metric_name="mean_text_length",
+        ),
     ]
     failed = validate_critic_output("Incomplete synthesis.", guards)
     assert failed.passed is False

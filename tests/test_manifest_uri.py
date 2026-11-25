@@ -4,15 +4,14 @@ from __future__ import annotations
 
 import os
 import uuid
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
 import pyarrow.fs as pafs
 import pytest
-from pydantic import SecretStr
 from pyspark.sql import SparkSession
 from pyspark.sql.types import IntegerType, StringType, StructField, StructType, TimestampType
-from src.config import Settings
 from src.lakehouse.manifest import (
     DatasetManifest,
     build_dataset_manifest,
@@ -21,17 +20,12 @@ from src.lakehouse.manifest import (
 )
 from src.lakehouse.paths import LakehousePaths
 from src.lakehouse.storage import StorageConfigurationError
+from tests.conftest import make_s3_settings
 from tests.test_storage import _is_endpoint_reachable, _minio_endpoint_from_env
 
 
 def test_resolve_manifest_filesystem_maps_s3a_uris() -> None:
-    s3_settings = Settings(
-        _env_file=None,
-        spark_storage_uri="s3a://lakehouse/prefix",
-        aws_access_key_id=SecretStr("minioadmin"),
-        aws_secret_access_key=SecretStr("minioadmin"),
-        s3_endpoint_url="http://minio:9000",
-    )
+    s3_settings = make_s3_settings("s3a://lakehouse/prefix")
     manifest_uri = LakehousePaths.from_settings(s3_settings).gold_dataset_manifest
     s3_fs, s3_fs_path = resolve_manifest_filesystem(manifest_uri, settings=s3_settings)
     assert isinstance(s3_fs, pafs.S3FileSystem)
@@ -40,12 +34,8 @@ def test_resolve_manifest_filesystem_maps_s3a_uris() -> None:
     with pytest.raises(StorageConfigurationError, match="Invalid S3A manifest URI"):
         resolve_manifest_filesystem("s3a://lakehouse", settings=s3_settings)
 
-    missing_creds = Settings(
-        _env_file=None,
-        spark_storage_uri="s3a://lakehouse",
-        aws_access_key_id=None,
-        aws_secret_access_key=None,
-        s3_endpoint_url=None,
+    missing_creds = make_s3_settings(
+        "s3a://lakehouse", endpoint=None, access_key=None, secret_key=None
     )
     with pytest.raises(StorageConfigurationError, match="AWS_ACCESS_KEY_ID"):
         resolve_manifest_filesystem(manifest_uri, settings=missing_creds)
@@ -53,12 +43,9 @@ def test_resolve_manifest_filesystem_maps_s3a_uris() -> None:
 
 def test_load_manifest_reads_local_json_without_spark(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    forbid_active_spark: Callable[[], None],
 ) -> None:
-    def _forbid_spark(*args: object, **kwargs: object) -> None:
-        raise AssertionError("load_manifest must never invoke SparkSession")
-
-    monkeypatch.setattr(SparkSession, "getActiveSession", staticmethod(_forbid_spark))
+    forbid_active_spark()
 
     manifest_file = tmp_path / "gold_dataset_manifest.json"
     sample = DatasetManifest(
@@ -86,19 +73,15 @@ def test_load_manifest_reads_local_json_without_spark(
 )
 def test_manifest_s3a_roundtrip_on_minio(
     spark: SparkSession,
-    monkeypatch: pytest.MonkeyPatch,
+    forbid_active_spark: Callable[[], None],
 ) -> None:
     endpoint = _minio_endpoint_from_env()
     access_key = os.environ.get("AWS_ACCESS_KEY_ID", "minioadmin")
     secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin")
     prefix = f"s3a://lakehouse/pytest-manifest-{uuid.uuid4().hex[:10]}"
 
-    settings = Settings(
-        _env_file=None,
-        spark_storage_uri=prefix,
-        aws_access_key_id=SecretStr(access_key),
-        aws_secret_access_key=SecretStr(secret_key),
-        s3_endpoint_url=endpoint,
+    settings = make_s3_settings(
+        prefix, endpoint=endpoint, access_key=access_key, secret_key=secret_key
     )
     paths = LakehousePaths.from_settings(settings)
 
@@ -137,11 +120,7 @@ def test_manifest_s3a_roundtrip_on_minio(
         )
 
         jobs_before = spark._jsc.sc().dagScheduler().nextJobId()
-
-        def _forbid_spark(*args: object, **kwargs: object) -> None:
-            raise AssertionError("load_manifest must never invoke SparkSession")
-
-        monkeypatch.setattr(SparkSession, "getActiveSession", staticmethod(_forbid_spark))
+        forbid_active_spark()
         loaded = load_manifest(settings=settings)
         jobs_after = spark._jsc.sc().dagScheduler().nextJobId()
 

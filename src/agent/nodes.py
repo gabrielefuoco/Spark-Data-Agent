@@ -34,8 +34,10 @@ from src.agent.memory import (
 from src.agent.models import create_chat_model
 from src.agent.prompts import (
     AGENT_SYSTEM_PROMPT,
+    TOOL_PREVIEW_ROW_LIMIT,
     build_critic_system_prompt,
     build_critic_user_prompt,
+    build_result_preview,
     format_manifest_digest,
     format_statistical_appendix,
     format_tool_results_summary,
@@ -62,7 +64,6 @@ ManifestLoader = Callable[[], DatasetManifest]
 SUPPORTED_SPARK_JOBS: frozenset[str] = frozenset({"circadian_features", "topic_model"})
 _SPARK_JOB_PREFIX = "SPARK_JOB:"
 _CONSECUTIVE_REPEAT_CAP = 2
-_TOOL_PREVIEW_ROW_LIMIT = 20
 
 
 def _to_json_value(value: Any) -> Any:
@@ -187,6 +188,17 @@ def make_spark_job_executor(
     return _execute_job
 
 
+def _missing_spark(kind: str, target: str) -> Callable[..., dict[str, Any]]:
+    def _raise(query_or_job: str, *_args: Any) -> dict[str, Any]:
+        raise SafeSQLError(
+            "SPARK_UNAVAILABLE",
+            f"No SparkSession or {kind} is configured for {target} execution.",
+            query=query_or_job,
+        )
+
+    return _raise
+
+
 @dataclass
 class AgentRuntimeDeps:
     """Injected or lazily resolved runtime dependencies shared by agent nodes."""
@@ -217,15 +229,7 @@ class AgentRuntimeDeps:
             return self.sql_executor
         if self.spark is not None:
             return make_spark_sql_executor(self.spark, settings=self.settings)
-
-        def _missing_spark(query: str, _cfg: Settings) -> dict[str, Any]:
-            raise SafeSQLError(
-                "SPARK_UNAVAILABLE",
-                "No SparkSession or SQL executor is configured for query execution.",
-                query=query,
-            )
-
-        return _missing_spark
+        return _missing_spark("SQL executor", "query")
 
     def get_job_executor(self) -> JobExecutor:
         """Return the configured Spark job executor or one backed by ``spark``."""
@@ -233,17 +237,7 @@ class AgentRuntimeDeps:
             return self.job_executor
         if self.spark is not None:
             return make_spark_job_executor(self.spark, settings=self.settings)
-
-        def _missing_spark_job(
-            job_name: str, _params: dict[str, Any], _cfg: Settings
-        ) -> dict[str, Any]:
-            raise SafeSQLError(
-                "SPARK_UNAVAILABLE",
-                "No SparkSession or job executor is configured for Spark job execution.",
-                query=job_name,
-            )
-
-        return _missing_spark_job
+        return _missing_spark("job executor", "Spark job")
 
     def load_manifest(self) -> DatasetManifest:
         """Load the Gold dataset manifest using the injected loader or settings."""
@@ -254,11 +248,11 @@ class AgentRuntimeDeps:
 
 def _filter_prior_conversation(messages: Sequence[BaseMessage]) -> list[BaseMessage]:
     """Keep only user turns and final assistant replies for cross-turn memory."""
-    filtered: list[BaseMessage] = []
-    for msg in messages:
-        if isinstance(msg, HumanMessage) or (isinstance(msg, AIMessage) and not msg.tool_calls):
-            filtered.append(msg)
-    return filtered
+    return [
+        msg
+        for msg in messages
+        if isinstance(msg, HumanMessage) or (isinstance(msg, AIMessage) and not msg.tool_calls)
+    ]
 
 
 def _split_turn_messages(
@@ -276,33 +270,26 @@ def _split_turn_messages(
 
 
 def _normalize_query_result(raw: dict[str, Any] | list[dict[str, Any]]) -> dict[str, Any]:
-    if isinstance(raw, list):
-        rows = [{str(k): _to_json_value(v) for k, v in row.items()} for row in raw]
-        columns = list(rows[0].keys()) if rows else []
-        return {
-            "columns": columns,
-            "rows": rows,
-            "row_count": len(rows),
-            "rows_returned": len(rows),
-            "truncated": False,
-        }
-
     if isinstance(raw, dict):
-        if "columns" in raw and "row_count" in raw and "rows_returned" in raw:
+        if {"columns", "row_count", "rows_returned"} <= raw.keys():
             return raw
+        source: dict[str, Any] = raw
         rows_raw = raw.get("rows", [])
-        rows = [{str(k): _to_json_value(v) for k, v in row.items()} for row in rows_raw]
-        columns = list(raw.get("columns") or (rows[0].keys() if rows else []))
-        rows_returned = int(raw.get("rows_returned", len(rows)))
-        return {
-            "columns": columns,
-            "rows": rows,
-            "row_count": rows_returned,
-            "rows_returned": rows_returned,
-            "truncated": bool(raw.get("truncated", False)),
-        }
+    elif isinstance(raw, list):
+        source = {}
+        rows_raw = raw
+    else:
+        raise TypeError(f"Unexpected SQL executor return type: {type(raw).__name__}")
 
-    raise TypeError(f"Unexpected SQL executor return type: {type(raw).__name__}")
+    rows = [{str(k): _to_json_value(v) for k, v in row.items()} for row in rows_raw]
+    rows_returned = int(source.get("rows_returned", len(rows)))
+    return {
+        "columns": list(source.get("columns") or (rows[0].keys() if rows else [])),
+        "rows": rows,
+        "row_count": rows_returned,
+        "rows_returned": rows_returned,
+        "truncated": bool(source.get("truncated", False)),
+    }
 
 
 def _normalize_hitl_decision(decision: Any) -> bool:
@@ -369,11 +356,10 @@ def _build_guard_and_display(
 
 def _select_ui_summary_entry(tool_results: Sequence[ToolResultEntry]) -> ToolResultEntry | None:
     """Pick the latest assessed comparison for the UI card, falling back to the latest result."""
-    for idx in range(len(tool_results) - 1, -1, -1):
-        entry = tool_results[idx]
-        if entry["guard_payload"].get("assessment_status") == "assessed":
-            return entry
-    return tool_results[-1] if tool_results else None
+    return next(
+        (e for e in reversed(tool_results) if e["guard_payload"].get("assessment_status") == "assessed"),
+        tool_results[-1] if tool_results else None,
+    )
 
 
 def _format_tool_success_message(
@@ -383,21 +369,15 @@ def _format_tool_success_message(
     display_payload: dict[str, Any],
     guard_payload: dict[str, Any],
 ) -> str:
-    rows = display_payload["rows"]
     payload: dict[str, Any] = {
         "status": "executed",
         "tool": name,
         "query": query,
-        "columns": display_payload["columns"],
-        "rows_returned": display_payload["rows_returned"],
-        "rows_shown": display_payload["rows_shown"],
-        "truncated": display_payload["truncated"],
-        "sample_rows": rows[:_TOOL_PREVIEW_ROW_LIMIT],
-        "statistical_validation": guard_payload,
+        **build_result_preview(display_payload, guard_payload),
     }
-    if len(rows) > _TOOL_PREVIEW_ROW_LIMIT:
+    if len(display_payload["rows"]) > TOOL_PREVIEW_ROW_LIMIT:
         payload["preview_note"] = (
-            f"Showing first {_TOOL_PREVIEW_ROW_LIMIT} of {display_payload['rows_returned']} rows; "
+            f"Showing first {TOOL_PREVIEW_ROW_LIMIT} of {display_payload['rows_returned']} rows; "
             "all fetched rows were evaluated by the statistical guard."
         )
     return json.dumps(payload, ensure_ascii=False, default=str)
@@ -530,15 +510,35 @@ def agent(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str, Any]:
     }
 
 
-_ToolExecOutcome = tuple[
-    str,
-    str | None,
-    dict[str, Any] | None,
-    dict[str, Any] | None,
-    dict[str, Any] | None,
-    str,
-    dict[str, Any],
-]
+@dataclass(frozen=True)
+class _ToolExecOutcome:
+    status: str
+    query_label: str | None
+    cost_info: dict[str, Any] | None
+    display_payload: dict[str, Any] | None
+    error: dict[str, Any] | None
+    hitl_decision: str
+    guard_payload: dict[str, Any]
+
+
+def _error_outcome(
+    settings: Settings,
+    error: SafeSQLError | dict[str, Any],
+    *,
+    status: str = "error",
+    query_label: str | None = None,
+    cost_info: dict[str, Any] | None = None,
+    hitl_decision: str = "not_required",
+) -> _ToolExecOutcome:
+    return _ToolExecOutcome(
+        status=status,
+        query_label=query_label,
+        cost_info=cost_info,
+        display_payload=None,
+        error=error.to_dict() if isinstance(error, SafeSQLError) else error,
+        hitl_decision=hitl_decision,
+        guard_payload=_empty_guard_payload(settings),
+    )
 
 
 def _run_gated_tool(
@@ -563,47 +563,33 @@ def _run_gated_tool(
             }
         )
         if not _normalize_hitl_decision(decision):
-            err = {
-                "code": "HITL_REJECTED",
-                "message": (
-                    f"{hitl_noun.capitalize()} execution cancelled/rejected by user at the "
-                    "human-in-the-loop approval gate."
-                ),
-                "query": query_label,
-            }
-            return (
-                "hitl_rejected",
-                query_label,
-                cost_info,
-                None,
-                err,
-                "rejected",
-                _empty_guard_payload(settings),
+            return _error_outcome(
+                settings,
+                {
+                    "code": "HITL_REJECTED",
+                    "message": (
+                        f"{hitl_noun.capitalize()} execution cancelled/rejected by user at the "
+                        "human-in-the-loop approval gate."
+                    ),
+                    "query": query_label,
+                },
+                status="hitl_rejected",
+                query_label=query_label,
+                cost_info=cost_info,
+                hitl_decision="rejected",
             )
         hitl_decision = "approved"
 
     try:
         raw_result = runner()
     except SafeSQLError as exc:
-        return (
-            "error",
-            query_label,
-            cost_info,
-            None,
-            exc.to_dict(),
-            hitl_decision,
-            _empty_guard_payload(settings),
+        return _error_outcome(
+            settings, exc, query_label=query_label, cost_info=cost_info, hitl_decision=hitl_decision
         )
 
     display_payload, guard_payload = _build_guard_and_display(raw_result, settings=settings)
-    return (
-        "executed",
-        query_label,
-        cost_info,
-        display_payload,
-        None,
-        hitl_decision,
-        guard_payload,
+    return _ToolExecOutcome(
+        "executed", query_label, cost_info, display_payload, None, hitl_decision, guard_payload
     )
 
 
@@ -611,22 +597,15 @@ def _execute_sql_tool(args: dict[str, Any], deps: AgentRuntimeDeps) -> _ToolExec
     """Validate, cost-gate (HITL), execute, and guard a ``run_safe_sql`` call."""
     raw_query = args.get("query")
     if not isinstance(raw_query, str):
-        err = SafeSQLError("EMPTY_QUERY", "Argument 'query' must be a SQL string.").to_dict()
-        return "error", None, None, None, err, "not_required", _empty_guard_payload(deps.settings)
+        return _error_outcome(
+            deps.settings, SafeSQLError("EMPTY_QUERY", "Argument 'query' must be a SQL string.")
+        )
 
     try:
         safe_sql = validate_and_rewrite_sql(raw_query, row_limit=deps.settings.sql_fetch_limit)
         cost_info = estimate_sql_cost(safe_sql, settings=deps.settings, spark=deps.spark)
     except SafeSQLError as exc:
-        return (
-            "error",
-            raw_query,
-            None,
-            None,
-            exc.to_dict(),
-            "not_required",
-            _empty_guard_payload(deps.settings),
-        )
+        return _error_outcome(deps.settings, exc, query_label=raw_query)
 
     return _run_gated_tool(
         query_label=safe_sql,
@@ -642,35 +621,35 @@ def _execute_spark_job_tool(args: dict[str, Any], deps: AgentRuntimeDeps) -> _To
     raw_job = args.get("job")
     raw_params = args.get("params")
     if not isinstance(raw_job, str) or not raw_job.strip():
-        err = SafeSQLError("INVALID_JOB_SPEC", "Argument 'job' must be a non-empty string.").to_dict()
-        return "error", None, None, None, err, "not_required", _empty_guard_payload(deps.settings)
+        return _error_outcome(
+            deps.settings,
+            SafeSQLError("INVALID_JOB_SPEC", "Argument 'job' must be a non-empty string."),
+        )
 
     if raw_params is not None and not isinstance(raw_params, dict):
-        err = SafeSQLError(
-            "INVALID_JOB_PARAMS",
-            "Spark job parameters must be a JSON object or null.",
-            query=raw_job,
-        ).to_dict()
-        return "error", raw_job, None, None, err, "not_required", _empty_guard_payload(deps.settings)
+        return _error_outcome(
+            deps.settings,
+            SafeSQLError(
+                "INVALID_JOB_PARAMS",
+                "Spark job parameters must be a JSON object or null.",
+                query=raw_job,
+            ),
+            query_label=raw_job,
+        )
 
     job_name = raw_job.strip().lower()
     clean_params = dict(raw_params or {})
     canonical = encode_spark_job(job_name, clean_params)
 
     if job_name not in SUPPORTED_SPARK_JOBS:
-        err = SafeSQLError(
-            "UNKNOWN_SPARK_JOB",
-            f"Unsupported Spark job {job_name!r}; expected one of {sorted(SUPPORTED_SPARK_JOBS)}.",
-            query=canonical,
-        ).to_dict()
-        return (
-            "error",
-            canonical,
-            None,
-            None,
-            err,
-            "not_required",
-            _empty_guard_payload(deps.settings),
+        return _error_outcome(
+            deps.settings,
+            SafeSQLError(
+                "UNKNOWN_SPARK_JOB",
+                f"Unsupported Spark job {job_name!r}; expected one of {sorted(SUPPORTED_SPARK_JOBS)}.",
+                query=canonical,
+            ),
+            query_label=canonical,
         )
 
     cost_info = estimate_job_cost(job_name, clean_params, settings=deps.settings)
@@ -787,63 +766,57 @@ def execute_tools(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str, An
     next_repeat = (repeat_count + 1) if sig == last_sig else 1
 
     if name == "run_safe_sql":
-        status, query_label, cost_info, display_payload, err, call_hitl, guard_payload = (
-            _execute_sql_tool(args, deps)
-        )
-        if call_hitl != "not_required":
-            hitl_decision = call_hitl
+        outcome = _execute_sql_tool(args, deps)
     elif name == "run_spark_job":
-        status, query_label, cost_info, display_payload, err, call_hitl, guard_payload = (
-            _execute_spark_job_tool(args, deps)
-        )
-        if call_hitl != "not_required":
-            hitl_decision = call_hitl
+        outcome = _execute_spark_job_tool(args, deps)
     else:
-        status = "error"
-        query_label = None
-        cost_info = None
-        display_payload = None
-        err = {
-            "code": "UNKNOWN_TOOL",
-            "message": f"Unsupported tool {name!r}; expected run_safe_sql or run_spark_job.",
-        }
-        guard_payload = _empty_guard_payload(deps.settings)
+        outcome = _error_outcome(
+            deps.settings,
+            {
+                "code": "UNKNOWN_TOOL",
+                "message": f"Unsupported tool {name!r}; expected run_safe_sql or run_spark_job.",
+            },
+        )
+    if outcome.hitl_decision != "not_required":
+        hitl_decision = outcome.hitl_decision
 
-    rows_returned = int(display_payload["rows_returned"]) if display_payload is not None else 0
+    rows_returned = (
+        int(outcome.display_payload["rows_returned"]) if outcome.display_payload is not None else 0
+    )
     trace.append(
         ToolTraceEntry(
             tool_call_id=call_id,
             name=name,
             arguments=args,
             rows_returned=rows_returned,
-            guard_payload=guard_payload,
-            status=status,
-            cost_estimate=cost_info,
-            error=err,
+            guard_payload=outcome.guard_payload,
+            status=outcome.status,
+            cost_estimate=outcome.cost_info,
+            error=outcome.error,
         )
     )
 
-    if status == "executed" and display_payload is not None:
+    if outcome.status == "executed" and outcome.display_payload is not None:
         results.append(
             ToolResultEntry(
                 tool_call_id=call_id,
                 name=name,
                 arguments=args,
-                query=query_label,
-                cost_estimate=cost_info,
-                result=display_payload,
-                guard_payload=guard_payload,
+                query=outcome.query_label,
+                cost_estimate=outcome.cost_info,
+                result=outcome.display_payload,
+                guard_payload=outcome.guard_payload,
             )
         )
         tool_msg_content = _format_tool_success_message(
             name,
-            query=query_label,
-            display_payload=display_payload,
-            guard_payload=guard_payload,
+            query=outcome.query_label,
+            display_payload=outcome.display_payload,
+            guard_payload=outcome.guard_payload,
         )
     else:
-        assert err is not None
-        tool_msg_content = _format_tool_error_message(status=status, error=err)
+        assert outcome.error is not None
+        tool_msg_content = _format_tool_error_message(status=outcome.status, error=outcome.error)
 
     primary_entry = _select_ui_summary_entry(results)
     updates: dict[str, Any] = {

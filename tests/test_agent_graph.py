@@ -3,18 +3,18 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
-from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 from pyspark.sql import SparkSession
 from src.agent.cost import estimate_sql_cost
 from src.agent.critic_check import validate_critic_output
-from src.agent.graph import build_agent_graph, open_sqlite_checkpointer
+from src.agent.graph import build_agent_graph
 from src.agent.guards import (
     CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS,
     StatisticalGuardResult,
@@ -26,32 +26,7 @@ from src.agent.prompts import format_manifest_digest, format_statistical_appendi
 from src.agent.state import make_initial_state
 from src.config import Settings
 from src.lakehouse.manifest import DatasetManifest
-
-
-class RecordingFakeChatModel(FakeMessagesListChatModel):
-    """Fake tool-calling chat model capturing invocations and bound tools."""
-
-    recorded_invocations: list[list[BaseMessage]] = []
-    bound_tools: list[Any] = []
-
-    def __init__(self, responses: list[BaseMessage]) -> None:
-        super().__init__(responses=responses)
-        self.recorded_invocations = []
-        self.bound_tools = []
-
-    def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> RecordingFakeChatModel:
-        self.bound_tools = list(tools)
-        return self
-
-    def _generate(
-        self,
-        messages: list[BaseMessage],
-        stop: list[str] | None = None,
-        run_manager: Any = None,
-        **kwargs: Any,
-    ) -> Any:
-        self.recorded_invocations.append(list(messages))
-        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+from tests.conftest import RecordingFakeChatModel
 
 
 def _tool_msg(
@@ -63,6 +38,10 @@ def _tool_msg(
         content="",
         tool_calls=[{"name": name, "args": args or {}, "id": call_id}],
     )
+
+
+def _sql_msg(query: str, call_id: str = "call_1") -> AIMessage:
+    return _tool_msg("run_safe_sql", {"query": query}, call_id)
 
 
 def _make_manifest() -> DatasetManifest:
@@ -79,33 +58,60 @@ def _make_manifest() -> DatasetManifest:
     )
 
 
+def _counting_manifest() -> tuple[list[int], Callable[[], DatasetManifest]]:
+    calls = [0]
+
+    def _load() -> DatasetManifest:
+        calls[0] += 1
+        return _make_manifest()
+
+    return calls, _load
+
+
 def _cohort_rows(
-    n_per_class: int,
+    n_dep: int,
+    n_ctrl: int | None = None,
     *,
     metric_name: str = "night_post_ratio",
-    depressed_offset: float = 0.25,
+    dep_base: float = 0.55,
+    ctrl_base: float = 0.10,
+    mod: int = 5,
+    step: float = 0.02,
+    single_dep_subject: bool = False,
 ) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for i in range(n_per_class):
-        rows.append(
-            {
-                "subject_id": f"dep_{i}",
-                "label": 1,
-                metric_name: 0.30 + depressed_offset + (i % 5) * 0.02,
-            }
-        )
-        rows.append(
-            {
-                "subject_id": f"ctrl_{i}",
-                "label": 0,
-                metric_name: 0.10 + (i % 5) * 0.02,
-            }
-        )
-    return rows
+    ctrl_count = n_dep if n_ctrl is None else n_ctrl
+    dep = [
+        {
+            "subject_id": "dep_only" if single_dep_subject else f"dep_{i}",
+            "label": 1,
+            metric_name: dep_base + (i % mod) * step,
+        }
+        for i in range(n_dep)
+    ]
+    ctrl = [
+        {
+            "subject_id": f"ctrl_{i}",
+            "label": 0,
+            metric_name: ctrl_base + (i % mod) * step,
+        }
+        for i in range(ctrl_count)
+    ]
+    return dep + ctrl
 
 
 def _critic(*texts: str) -> RecordingFakeChatModel:
     return RecordingFakeChatModel([AIMessage(content=t) for t in texts])
+
+
+def _mixed_sql(cohort_rows: list[dict[str, Any]]) -> Callable[[str, Settings], list[dict[str, Any]]]:
+    def _exec(query: str, _cfg: Settings) -> list[dict[str, Any]]:
+        if "silver_posts" in query:
+            return [{"total_posts": 1200}]
+        if "gold_cohort_lexical_matrix" in query:
+            return [{"label": 1, "ngram": "feel alone", "frequency": 42}]
+        return cohort_rows
+
+    return _exec
 
 
 def test_three_query_investigation_collects_three_guards_and_one_critic_call() -> None:
@@ -117,34 +123,18 @@ def test_three_query_investigation_collects_three_guards_and_one_critic_call() -
 
     agent_model = RecordingFakeChatModel(
         [
-            _tool_msg(
-                "run_safe_sql",
-                {
-                    "query": (
-                        "SELECT label, topic, mean_topic_probability, document_count, top_terms "
-                        "FROM gold_cohort_topic_matrix"
-                    )
-                },
+            _sql_msg(
+                "SELECT label, topic, mean_topic_probability, document_count, top_terms "
+                "FROM gold_cohort_topic_matrix",
                 "c1",
             ),
-            _tool_msg(
-                "run_safe_sql",
-                {
-                    "query": (
-                        "SELECT label, ngram, frequency, tfidf_weight "
-                        "FROM gold_cohort_lexical_matrix ORDER BY tfidf_weight DESC"
-                    )
-                },
+            _sql_msg(
+                "SELECT label, ngram, frequency, tfidf_weight "
+                "FROM gold_cohort_lexical_matrix ORDER BY tfidf_weight DESC",
                 "c2",
             ),
-            _tool_msg(
-                "run_safe_sql",
-                {
-                    "query": (
-                        "SELECT subject_id, label, night_post_ratio "
-                        "FROM gold_user_longitudinal_features"
-                    )
-                },
+            _sql_msg(
+                "SELECT subject_id, label, night_post_ratio FROM gold_user_longitudinal_features",
                 "c3",
             ),
             AIMessage(content="Gathered topic distribution, lexical bigrams, and circadian comparison."),
@@ -158,12 +148,7 @@ def test_three_query_investigation_collects_three_guards_and_one_critic_call() -
         f"Cohen's d = {expected_guard.effect_size_cohens_d:.6g})."
     )
     sql_calls: list[str] = []
-    manifest_calls = 0
-
-    def counting_manifest() -> DatasetManifest:
-        nonlocal manifest_calls
-        manifest_calls += 1
-        return _make_manifest()
+    manifest_calls, counting_manifest = _counting_manifest()
 
     def fake_sql(query: str, _cfg: Settings) -> list[dict[str, Any]]:
         sql_calls.append(query)
@@ -198,7 +183,7 @@ def test_three_query_investigation_collects_three_guards_and_one_critic_call() -
         "run_safe_sql",
         "run_spark_job",
     ]
-    assert manifest_calls == 1
+    assert manifest_calls[0] == 1
     assert len(sql_calls) == 3
     assert result["tool_call_count"] == 3
     assert len(result["tool_results"]) == 3
@@ -253,12 +238,7 @@ def test_manifest_digest_answers_catalog_without_tools_and_handles_missing_manif
     assert "not instructions" in digest.lower()
 
     # Case 1: Present manifest -> agent answers catalog question directly with zero tools/Spark/critic.
-    manifest_calls = 0
-
-    def counting_manifest() -> DatasetManifest:
-        nonlocal manifest_calls
-        manifest_calls += 1
-        return _make_manifest()
+    manifest_calls, counting_manifest = _counting_manifest()
 
     agent_model = RecordingFakeChatModel(
         [AIMessage(content="The dataset has 5000 posts across 100 subjects (50 depressed, 50 control).")]
@@ -274,7 +254,7 @@ def test_manifest_digest_answers_catalog_without_tools_and_handles_missing_manif
         manifest_loader=counting_manifest,
     ).invoke(make_initial_state("How many posts and subjects are in the dataset?"))
 
-    assert manifest_calls == 1
+    assert manifest_calls[0] == 1
     assert sql_calls == []
     assert res["status"] == "completed"
     assert res["tool_call_count"] == 0
@@ -312,28 +292,32 @@ def test_manifest_digest_answers_catalog_without_tools_and_handles_missing_manif
     assert "Manifest unavailable" in missing_sys_prompt
 
 
+def _budget_responses(n_calls: int, final_text: str | None = None) -> list[AIMessage]:
+    msgs = [
+        _sql_msg(
+            f"SELECT COUNT(*) AS c FROM gold_user_longitudinal_features WHERE post_count > {i}",
+            f"call_{i}",
+        )
+        for i in range(n_calls)
+    ]
+    if final_text is not None:
+        msgs.append(AIMessage(content=final_text))
+    return msgs
+
+
 def test_budget_stops_21st_tool_call_and_synthesizes_or_fails_transparently() -> None:
     settings = Settings(_env_file=None, max_tool_calls=20, min_subjects_per_class=30)
 
     # Case 1: Model asks for 21 tool calls, then obeys the budget-exhausted instruction.
-    responses_obey = [
-        _tool_msg(
-            "run_safe_sql",
-            {"query": f"SELECT COUNT(*) AS c FROM gold_user_longitudinal_features WHERE post_count > {i}"},
-            f"call_{i}",
-        )
-        for i in range(21)
-    ]
-    responses_obey.append(AIMessage(content="Summarizing the 20 queries gathered within budget."))
-
     executed_queries: list[str] = []
-    critic_obey = _critic(
-        "Sintesi basata sulle 20 query eseguite (statistiche descrittive; budget raggiunto)."
-    )
     res_obey = build_agent_graph(
         settings=settings,
-        router_model=RecordingFakeChatModel(responses_obey),
-        critic_model=critic_obey,
+        router_model=RecordingFakeChatModel(
+            _budget_responses(21, "Summarizing the 20 queries gathered within budget.")
+        ),
+        critic_model=_critic(
+            "Sintesi basata sulle 20 query eseguite (statistiche descrittive; budget raggiunto)."
+        ),
         sql_executor=lambda q, _cfg: executed_queries.append(q) or [{"c": len(executed_queries)}],
     ).invoke(make_initial_state("Explore all thresholds."))
 
@@ -347,18 +331,10 @@ def test_budget_stops_21st_tool_call_and_synthesizes_or_fails_transparently() ->
     assert res_obey["tool_trace"][-1]["rows_returned"] == 0
 
     # Case 2: Model still asks for a tool after being told budget is exhausted -> transparent failure.
-    responses_refuse = [
-        _tool_msg(
-            "run_safe_sql",
-            {"query": f"SELECT COUNT(*) AS c FROM gold_user_longitudinal_features WHERE post_count > {i}"},
-            f"call_{i}",
-        )
-        for i in range(22)
-    ]
     executed_2: list[str] = []
     res_fail = build_agent_graph(
         settings=settings,
-        router_model=RecordingFakeChatModel(responses_refuse),
+        router_model=RecordingFakeChatModel(_budget_responses(22)),
         critic_model=_critic("unused"),
         sql_executor=lambda q, _cfg: executed_2.append(q) or [{"c": 1}],
     ).invoke(make_initial_state("Keep querying forever."))
@@ -439,7 +415,7 @@ def test_hitl_interrupt_approval_executes_once_and_refusal_feeds_model_without_e
     approve_calls: list[str] = []
     cfg_approve = {"configurable": {"thread_id": "loop-hitl-approve"}}
 
-    with open_sqlite_checkpointer(db_approve) as saver1:
+    with SqliteSaver.from_conn_string(str(db_approve)) as saver1:
         g1 = build_agent_graph(
             settings=settings,
             router_model=approve_agent,
@@ -454,7 +430,7 @@ def test_hitl_interrupt_approval_executes_once_and_refusal_feeds_model_without_e
     assert "silver_posts" in interrupted["__interrupt__"][0].value["query"]
     assert approve_calls == []
 
-    with open_sqlite_checkpointer(db_approve) as saver2:
+    with SqliteSaver.from_conn_string(str(db_approve)) as saver2:
         g2 = build_agent_graph(
             settings=settings,
             router_model=approve_agent,
@@ -474,14 +450,14 @@ def test_hitl_interrupt_approval_executes_once_and_refusal_feeds_model_without_e
     db_reject = tmp_path / "hitl_reject.sqlite"
     reject_agent = RecordingFakeChatModel(
         [
-            _tool_msg("run_safe_sql", {"query": expensive_sql}, "h2"),
+            _sql_msg(expensive_sql, "h2"),
             AIMessage(content="Execution was refused at the HITL gate; no raw posts were scanned."),
         ]
     )
     reject_calls: list[str] = []
     cfg_reject = {"configurable": {"thread_id": "loop-hitl-reject"}}
 
-    with open_sqlite_checkpointer(db_reject) as saver:
+    with SqliteSaver.from_conn_string(str(db_reject)) as saver:
         g_rej = build_agent_graph(
             settings=settings,
             router_model=reject_agent,
@@ -519,7 +495,7 @@ def test_spark_job_tool_hitl_and_offline_execution(tmp_path: Path) -> None:
     job_calls: list[tuple[str, dict[str, Any]]] = []
     config = {"configurable": {"thread_id": "hitl-job-loop"}}
 
-    with open_sqlite_checkpointer(db_path) as saver:
+    with SqliteSaver.from_conn_string(str(db_path)) as saver:
         graph = build_agent_graph(
             settings=settings,
             router_model=agent_model,
@@ -616,36 +592,15 @@ def test_significant_comparison_among_descriptive_results_requires_citations_and
     def _build_mixed_agent() -> RecordingFakeChatModel:
         return RecordingFakeChatModel(
             [
-                _tool_msg(
-                    "run_safe_sql",
-                    {"query": "SELECT COUNT(*) AS total_posts FROM silver_posts WHERE year = 2015"},
-                    "m1",
-                ),
-                _tool_msg(
-                    "run_safe_sql",
-                    {"query": "SELECT label, ngram, frequency FROM gold_cohort_lexical_matrix"},
-                    "m2",
-                ),
-                _tool_msg(
-                    "run_safe_sql",
-                    {
-                        "query": (
-                            "SELECT subject_id, label, night_post_ratio "
-                            "FROM gold_user_longitudinal_features"
-                        )
-                    },
+                _sql_msg("SELECT COUNT(*) AS total_posts FROM silver_posts WHERE year = 2015", "m1"),
+                _sql_msg("SELECT label, ngram, frequency FROM gold_cohort_lexical_matrix", "m2"),
+                _sql_msg(
+                    "SELECT subject_id, label, night_post_ratio FROM gold_user_longitudinal_features",
                     "m3",
                 ),
                 AIMessage(content="Mixed descriptive + significant results ready."),
             ]
         )
-
-    def _mixed_sql(query: str, _cfg: Settings) -> list[dict[str, Any]]:
-        if "silver_posts" in query:
-            return [{"total_posts": 1200}]
-        if "gold_cohort_lexical_matrix" in query:
-            return [{"label": 1, "ngram": "feel alone", "frequency": 42}]
-        return cohort_rows
 
     # 1. Prose omits every number; deterministic appendix supplies n, p, d and passes in 1 call.
     prose_no_numbers = (
@@ -657,7 +612,7 @@ def test_significant_comparison_among_descriptive_results_requires_citations_and
         settings=settings,
         router_model=_build_mixed_agent(),
         critic_model=critic_ok,
-        sql_executor=_mixed_sql,
+        sql_executor=_mixed_sql(cohort_rows),
         manifest_loader=_make_manifest,
     ).invoke(make_initial_state("How do the cohorts differ?"))
 
@@ -685,28 +640,14 @@ def test_significant_comparison_among_descriptive_results_requires_citations_and
 
     # 2. Genuine claim violation (asserting significance on a non-significant result twice)
     # still triggers retry and reaches the readable deterministic fallback.
-    ns_rows = [
-        {"subject_id": f"dep_{i}", "label": 1, "night_post_ratio": 0.20 + (i % 5) * 0.02}
-        for i in range(35)
-    ] + [
-        {"subject_id": f"ctrl_{i}", "label": 0, "night_post_ratio": 0.20 + (i % 5) * 0.02}
-        for i in range(35)
-    ]
-
-    def _mixed_ns_sql(query: str, _cfg: Settings) -> list[dict[str, Any]]:
-        if "silver_posts" in query:
-            return [{"total_posts": 1200}]
-        if "gold_cohort_lexical_matrix" in query:
-            return [{"label": 1, "ngram": "feel alone", "frequency": 42}]
-        return ns_rows
-
+    ns_rows = _cohort_rows(35, dep_base=0.20, ctrl_base=0.20)
     rogue_claim = "Depressed users post at night significantly more often than controls."
     critic_fallback = _critic(rogue_claim, rogue_claim)
     res_fallback = build_agent_graph(
         settings=settings,
         router_model=_build_mixed_agent(),
         critic_model=critic_fallback,
-        sql_executor=_mixed_ns_sql,
+        sql_executor=_mixed_sql(ns_rows),
         manifest_loader=_make_manifest,
     ).invoke(make_initial_state("How do the cohorts differ?"))
 
@@ -785,23 +726,11 @@ def test_statistical_appendix_is_deterministic_and_omitted_for_all_descriptive()
 
 def test_prose_claiming_significance_when_appendix_is_nonsignificant_still_fails() -> None:
     settings = Settings(_env_file=None, min_subjects_per_class=30)
-    ns_rows = [
-        {"subject_id": f"dep_{i}", "label": 1, "night_post_ratio": 0.25 + (i % 4) * 0.02}
-        for i in range(35)
-    ] + [
-        {"subject_id": f"ctrl_{i}", "label": 0, "night_post_ratio": 0.25 + (i % 4) * 0.02}
-        for i in range(35)
-    ]
+    ns_rows = _cohort_rows(35, dep_base=0.25, ctrl_base=0.25, mod=4)
     agent_model = RecordingFakeChatModel(
         [
-            _tool_msg(
-                "run_safe_sql",
-                {
-                    "query": (
-                        "SELECT subject_id, label, night_post_ratio "
-                        "FROM gold_user_longitudinal_features"
-                    )
-                },
+            _sql_msg(
+                "SELECT subject_id, label, night_post_ratio FROM gold_user_longitudinal_features",
                 "ns1",
             ),
             AIMessage(content="Comparison ready."),
@@ -860,14 +789,8 @@ def test_cannot_assess_and_underpowered_never_ship_significance_claims() -> None
     # underpowered (pseudo-replicated single subject)
     up_agent = RecordingFakeChatModel(
         [
-            _tool_msg(
-                "run_safe_sql",
-                {
-                    "query": (
-                        "SELECT subject_id, label, night_post_ratio "
-                        "FROM gold_user_longitudinal_features"
-                    )
-                },
+            _sql_msg(
+                "SELECT subject_id, label, night_post_ratio FROM gold_user_longitudinal_features",
                 "up1",
             ),
             AIMessage(content="Done."),
@@ -877,13 +800,7 @@ def test_cannot_assess_and_underpowered_never_ship_significance_claims() -> None
         "Depressed users post at night significantly more often "
         "(depressed=1, control=35, p = 1.0, Cohen's d = 0.0)."
     )
-    up_rows = [
-        {"subject_id": "dep_only", "label": 1, "night_post_ratio": 0.85 + (i % 4) * 0.02}
-        for i in range(40)
-    ] + [
-        {"subject_id": f"ctrl_{i}", "label": 0, "night_post_ratio": 0.10 + (i % 5) * 0.02}
-        for i in range(35)
-    ]
+    up_rows = _cohort_rows(40, 35, dep_base=0.85, ctrl_base=0.10, single_dep_subject=True)
     up_res = build_agent_graph(
         settings=settings,
         router_model=up_agent,
@@ -922,7 +839,7 @@ def test_followup_turn_receives_prior_conversation_without_tool_noise(tmp_path: 
     )
     config = {"configurable": {"thread_id": "followup-loop-thread"}}
 
-    with open_sqlite_checkpointer(db_path) as saver:
+    with SqliteSaver.from_conn_string(str(db_path)) as saver:
         graph = build_agent_graph(
             settings=settings,
             router_model=agent_model,
@@ -963,59 +880,64 @@ def test_cost_estimation_registers_lakehouse_views_before_explaining(
     assert estimate["estimated_cost"] >= 0.0
 
 
+def _run_spark_cohort_query(
+    spark: SparkSession,
+    lakehouse_env: tuple,
+    *,
+    rows: list[tuple[str, int, float]],
+    query: str,
+    critic_text: str,
+    min_subjects_per_class: int,
+    sql_fetch_limit: int,
+) -> tuple[dict[str, Any], RecordingFakeChatModel]:
+    base_settings, paths, _ = lakehouse_env
+    settings = Settings(
+        _env_file=None,
+        spark_storage_uri=base_settings.spark_storage_uri,
+        min_subjects_per_class=min_subjects_per_class,
+        sql_row_limit=500,
+        sql_fetch_limit=sql_fetch_limit,
+    )
+    spark.createDataFrame(
+        rows,
+        "subject_id STRING, label INT, night_post_ratio DOUBLE",
+    ).write.mode("overwrite").parquet(str(paths.gold_user_longitudinal_features))
+
+    critic = _critic(critic_text)
+    result = build_agent_graph(
+        settings=settings,
+        router_model=RecordingFakeChatModel(
+            [_sql_msg(query, "sp1"), AIMessage(content="Cohort query complete.")]
+        ),
+        critic_model=critic,
+        sql_executor=make_spark_sql_executor(spark, settings=settings, paths=paths),
+        spark=spark,
+    ).invoke(make_initial_state("Compare night_post_ratio across cohorts."))
+    return result, critic
+
+
 @pytest.mark.spark
 def test_full_cohort_819_subjects_analyzed_while_state_rows_capped_at_500(
     spark: SparkSession,
     lakehouse_env: tuple,
 ) -> None:
-    base_settings, paths, _ = lakehouse_env
-    settings = Settings(
-        _env_file=None,
-        spark_storage_uri=base_settings.spark_storage_uri,
-        min_subjects_per_class=30,
-        sql_row_limit=500,
-        sql_fetch_limit=50_000,
-    )
-
     synthetic_rows = [
         (f"dep_{i:04d}", 1, 0.55 + (i % 7) * 0.02) for i in range(100)
     ] + [
         (f"ctrl_{i:04d}", 0, 0.15 + (i % 7) * 0.02) for i in range(719)
     ]
-    spark.createDataFrame(
-        synthetic_rows,
-        "subject_id STRING, label INT, night_post_ratio DOUBLE",
-    ).write.mode("overwrite").parquet(str(paths.gold_user_longitudinal_features))
-
-    agent_model = RecordingFakeChatModel(
-        [
-            _tool_msg(
-                "run_safe_sql",
-                {
-                    "query": (
-                        "SELECT subject_id, label, night_post_ratio "
-                        "FROM gold_user_longitudinal_features"
-                    )
-                },
-                "sp1",
-            ),
-            AIMessage(content="Compared 819 subjects."),
-        ]
+    result, critic = _run_spark_cohort_query(
+        spark,
+        lakehouse_env,
+        rows=synthetic_rows,
+        query="SELECT subject_id, label, night_post_ratio FROM gold_user_longitudinal_features",
+        critic_text=(
+            "Full cohort comparison across depressed=100 and control=719 subjects "
+            "(p = 5.84328e-60, Cohen's d = 9.96672)."
+        ),
+        min_subjects_per_class=30,
+        sql_fetch_limit=50_000,
     )
-    critic = _critic(
-        "Full cohort comparison across depressed=100 and control=719 subjects "
-        "(p = 5.84328e-60, Cohen's d = 9.96672)."
-    )
-    sql_executor = make_spark_sql_executor(spark, settings=settings, paths=paths)
-    graph = build_agent_graph(
-        settings=settings,
-        router_model=agent_model,
-        critic_model=critic,
-        sql_executor=sql_executor,
-        spark=spark,
-    )
-
-    result = graph.invoke(make_initial_state("Compare night_post_ratio across cohorts."))
 
     assert result["status"] == "completed"
     assert len(critic.recorded_invocations) == 1
@@ -1031,18 +953,6 @@ def test_full_cohort_819_subjects_analyzed_while_state_rows_capped_at_500(
     assert qr["rows_shown"] == 500
     assert len(qr["rows"]) == 500
     assert qr["truncated"] is False
-
-
-def test_hitl_cost_scale_separates_a_pruned_partition_from_a_full_scan() -> None:
-    settings = Settings(_env_file=None, hitl_cost_threshold=1.0)
-    pruned = estimate_sql_cost(
-        "SELECT COUNT(*) AS post_count FROM silver_posts WHERE year = 2014",
-        settings=settings,
-    )
-    full = estimate_sql_cost("SELECT * FROM silver_posts", settings=settings)
-
-    assert pruned["triggers_hitl"] is False
-    assert full["triggers_hitl"] is True
 
 
 def test_multi_tool_call_batch_with_hitl_does_not_reexecute_prior_tool(tmp_path: Path) -> None:
@@ -1067,7 +977,7 @@ def test_multi_tool_call_batch_with_hitl_does_not_reexecute_prior_tool(tmp_path:
     executed: list[str] = []
     config = {"configurable": {"thread_id": "batch-hitl-thread"}}
 
-    with open_sqlite_checkpointer(db_path) as saver:
+    with SqliteSaver.from_conn_string(str(db_path)) as saver:
         graph = build_agent_graph(
             settings=settings,
             router_model=agent_model,
@@ -1089,74 +999,27 @@ def test_multi_tool_call_batch_with_hitl_does_not_reexecute_prior_tool(tmp_path:
     assert len(resumed["tool_trace"]) == 2
 
 
-def test_direct_conversational_reply_skips_critic() -> None:
-    settings = Settings(_env_file=None)
-    agent_model = RecordingFakeChatModel(
-        [AIMessage(content="I can query the eRISK lakehouse using SQL or Spark jobs.")]
-    )
-    critic = _critic("Critic should not be called.")
-    res = build_agent_graph(
-        settings=settings,
-        router_model=agent_model,
-        critic_model=critic,
-    ).invoke(make_initial_state("What can you do?"))
-
-    assert res["status"] == "completed"
-    assert res["tool_call_count"] == 0
-    assert res["tool_trace"] == []
-    assert critic.recorded_invocations == []
-    assert "eRISK lakehouse" in res["final_response"]
-
-
 @pytest.mark.spark
 def test_fetch_limit_cap_marks_truncated_and_demands_critic_disclosure(
     spark: SparkSession,
     lakehouse_env: tuple,
 ) -> None:
-    base_settings, paths, _ = lakehouse_env
-    settings = Settings(
-        _env_file=None,
-        spark_storage_uri=base_settings.spark_storage_uri,
+    synthetic_rows = [(f"s_{i:03d}", i % 2, 0.2 + (i % 5) * 0.05) for i in range(60)]
+    result, critic = _run_spark_cohort_query(
+        spark,
+        lakehouse_env,
+        rows=synthetic_rows,
+        query=(
+            "SELECT subject_id, label, night_post_ratio "
+            "FROM gold_user_longitudinal_features ORDER BY subject_id"
+        ),
+        critic_text=(
+            "Capped sample analysis (truncated at 20 rows): "
+            "depressed=10, control=10, p = 1.0, Cohen's d = 0.0."
+        ),
         min_subjects_per_class=5,
-        sql_row_limit=500,
         sql_fetch_limit=20,
     )
-
-    synthetic_rows = [
-        (f"s_{i:03d}", i % 2, 0.2 + (i % 5) * 0.05) for i in range(60)
-    ]
-    spark.createDataFrame(
-        synthetic_rows,
-        "subject_id STRING, label INT, night_post_ratio DOUBLE",
-    ).write.mode("overwrite").parquet(str(paths.gold_user_longitudinal_features))
-
-    agent_model = RecordingFakeChatModel(
-        [
-            _tool_msg(
-                "run_safe_sql",
-                {
-                    "query": (
-                        "SELECT subject_id, label, night_post_ratio "
-                        "FROM gold_user_longitudinal_features ORDER BY subject_id"
-                    )
-                },
-                "trunc1",
-            ),
-            AIMessage(content="Capped sample returned."),
-        ]
-    )
-    critic = _critic(
-        "Capped sample analysis (truncated at 20 rows): "
-        "depressed=10, control=10, p = 1.0, Cohen's d = 0.0."
-    )
-    sql_executor = make_spark_sql_executor(spark, settings=settings, paths=paths)
-    result = build_agent_graph(
-        settings=settings,
-        router_model=agent_model,
-        critic_model=critic,
-        sql_executor=sql_executor,
-        spark=spark,
-    ).invoke(make_initial_state("Compare night_post_ratio across cohorts."))
 
     assert result["status"] == "completed"
     assert result["query_result"]["truncated"] is True

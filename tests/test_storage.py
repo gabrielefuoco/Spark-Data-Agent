@@ -12,7 +12,6 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import pytest
-from pydantic import SecretStr
 from pyspark.sql import SparkSession
 from src.analytics.safe_sql import execute_safe_spark_sql, register_lakehouse_views
 from src.config import Settings
@@ -25,6 +24,7 @@ from src.lakehouse.storage import (
     is_s3a_uri,
 )
 from src.spark import write_parquet_zstd
+from tests.conftest import make_s3_settings
 
 
 def _minio_endpoint_from_env() -> str:
@@ -54,14 +54,7 @@ def test_uri_detection_and_target_resolution(tmp_path: Path) -> None:
     local_settings = Settings(_env_file=None, spark_storage_uri=str(tmp_path / "data"))
     assert build_s3a_hadoop_options(local_settings) == {}
 
-    s3_settings = Settings(
-        _env_file=None,
-        spark_storage_uri="s3a://lakehouse/prefix/",
-        aws_access_key_id=SecretStr("minioadmin"),
-        aws_secret_access_key=SecretStr("minioadmin"),
-        s3_endpoint_url="http://minio:9000",
-    )
-    lakehouse_paths = LakehousePaths.from_settings(s3_settings)
+    lakehouse_paths = LakehousePaths.from_settings(make_s3_settings("s3a://lakehouse/prefix/"))
     assert lakehouse_paths.silver_posts == "s3a://lakehouse/prefix/lakehouse/silver/posts"
     assert lakehouse_paths.gold_dataset_manifest == (
         "s3a://lakehouse/prefix/lakehouse/gold/gold_dataset_manifest.json"
@@ -69,14 +62,9 @@ def test_uri_detection_and_target_resolution(tmp_path: Path) -> None:
 
 
 def test_build_s3a_hadoop_options_for_minio_and_https() -> None:
-    minio_settings = Settings(
-        _env_file=None,
-        spark_storage_uri="s3a://lakehouse/",
-        aws_access_key_id=SecretStr("minioadmin"),
-        aws_secret_access_key=SecretStr("minioadmin"),
-        s3_endpoint_url="http://minio:9000/",
+    opts = build_s3a_hadoop_options(
+        make_s3_settings("s3a://lakehouse/", endpoint="http://minio:9000/")
     )
-    opts = build_s3a_hadoop_options(minio_settings)
     assert opts == {
         "fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem",
         "fs.s3a.endpoint": "http://minio:9000",
@@ -87,25 +75,16 @@ def test_build_s3a_hadoop_options_for_minio_and_https() -> None:
         "fs.s3a.aws.credentials.provider": SIMPLE_CREDENTIALS_PROVIDER,
     }
 
-    https_settings = Settings(
-        _env_file=None,
-        spark_storage_uri="s3a://lakehouse/",
-        aws_access_key_id=SecretStr("minioadmin"),
-        aws_secret_access_key=SecretStr("minioadmin"),
-        s3_endpoint_url="https://s3.example.internal",
+    https_opts = build_s3a_hadoop_options(
+        make_s3_settings("s3a://lakehouse/", endpoint="https://s3.example.internal")
     )
-    https_opts = build_s3a_hadoop_options(https_settings)
     assert https_opts["fs.s3a.connection.ssl.enabled"] == "true"
     assert https_opts["fs.s3a.endpoint"] == "https://s3.example.internal"
 
 
 def test_s3a_configuration_fails_loudly_without_leaking_secrets() -> None:
-    missing_all = Settings(
-        _env_file=None,
-        spark_storage_uri="s3a://lakehouse/",
-        aws_access_key_id=None,
-        aws_secret_access_key=None,
-        s3_endpoint_url=None,
+    missing_all = make_s3_settings(
+        "s3a://lakehouse/", endpoint=None, access_key=None, secret_key=None
     )
     with pytest.raises(StorageConfigurationError) as exc_all:
         build_s3a_hadoop_options(missing_all)
@@ -115,12 +94,11 @@ def test_s3a_configuration_fails_loudly_without_leaking_secrets() -> None:
     assert "S3_ENDPOINT_URL" in msg_all
 
     sentinel_secret = "super-secret-value-never-log"
-    missing_endpoint = Settings(
-        _env_file=None,
-        spark_storage_uri="s3a://lakehouse/",
-        aws_access_key_id=SecretStr("test-access-key-id"),
-        aws_secret_access_key=SecretStr(sentinel_secret),
-        s3_endpoint_url="   ",
+    missing_endpoint = make_s3_settings(
+        "s3a://lakehouse/",
+        endpoint="   ",
+        access_key="test-access-key-id",
+        secret_key=sentinel_secret,
     )
     with pytest.raises(StorageConfigurationError) as exc_endpoint:
         build_s3a_hadoop_options(missing_endpoint)
@@ -141,12 +119,11 @@ def test_s3a_parquet_roundtrip_and_safe_sql_on_minio(spark: SparkSession) -> Non
     secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY", "minioadmin")
     prefix = f"s3a://lakehouse/pytest-storage-{uuid.uuid4().hex[:10]}"
 
-    settings = Settings(
-        _env_file=None,
-        spark_storage_uri=prefix,
-        aws_access_key_id=SecretStr(access_key),
-        aws_secret_access_key=SecretStr(secret_key),
-        s3_endpoint_url=endpoint,
+    settings = make_s3_settings(
+        prefix,
+        endpoint=endpoint,
+        access_key=access_key,
+        secret_key=secret_key,
         sql_row_limit=10,
     )
     apply_s3a_config(spark, settings)

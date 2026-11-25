@@ -184,6 +184,20 @@ class StatisticalGuardResult(BaseModel):
     alpha: float = 0.05
     metric_name: str = "metric"
 
+    @property
+    def is_assessed(self) -> bool:
+        """True when a two-group hypothesis test ran with finite p-value and Cohen's d."""
+        return (
+            self.assessment_status == "assessed"
+            and self.p_value is not None
+            and self.effect_size_cohens_d is not None
+        )
+
+    @property
+    def allows_claims(self) -> bool:
+        """True only when an assessed comparison is both statistically significant and powered."""
+        return self.is_assessed and self.is_significant and not self.is_underpowered
+
 
 def _as_finite_float(value: object) -> float | None:
     """Return ``value`` as a float when it is a finite real number, else ``None``."""
@@ -622,28 +636,19 @@ def _format_guard_verdict_body(
     """Format a single guard verdict block and any mandatory cohort imbalance disclosure."""
     if result.assessment_status == "descriptive":
         claim_policy = (
-            "DESCRIPTIVE_ONLY: Present the descriptive results directly and clearly in the "
-            "user's language (top n-grams with weights/frequencies, LDA topics with top terms, "
-            "counts, or summary rows). Do NOT refuse to answer and do NOT fabricate p-values or "
-            "Cohen's d. FORBIDDEN: Do NOT claim any statistically significant cohort difference, "
-            "correlation, or clinical signal from descriptive results."
+            "DESCRIPTIVE_ONLY: present descriptive results without p-values or significance claims."
         )
     elif result.assessment_status == "cannot_assess":
         claim_policy = (
-            "FORBIDDEN: Cannot assess statistical significance (no subject dimension). "
-            "Do NOT claim any depression correlation or class difference; state in the "
-            "user's language that subject-level significance cannot be evaluated without "
-            "`subject_id`, and do NOT fabricate p-values or Cohen's d."
+            "FORBIDDEN: cannot assess without `subject_id`; do not claim differences or fabricate stats."
         )
-    elif result.is_significant and not result.is_underpowered:
+    elif result.allows_claims:
         claim_policy = (
-            "ALLOWED: Statistical significance gate passed; report findings strictly "
-            "scoped to the observed metric."
+            "ALLOWED: significance gate passed; scope findings strictly to the observed metric."
         )
     else:
         claim_policy = (
-            "FORBIDDEN: Do NOT claim any depression correlation or class difference "
-            "because the result is underpowered or not statistically significant."
+            "FORBIDDEN: underpowered or not statistically significant; do not claim differences."
         )
 
     p_display = f"{result.p_value:.6g}" if result.p_value is not None else "N/A (not tested)"

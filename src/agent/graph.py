@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -25,16 +23,6 @@ from src.agent.nodes import (
 from src.agent.routing import route_after_agent, route_after_tools
 from src.agent.state import DataAgentState
 from src.config import Settings, get_settings
-
-
-@contextmanager
-def open_sqlite_checkpointer(db_path: str | Path = ":memory:") -> Iterator[SqliteSaver]:
-    """Open a ``SqliteSaver`` checkpointer as a managed context."""
-    target = str(db_path)
-    if target != ":memory:":
-        Path(target).parent.mkdir(parents=True, exist_ok=True)
-    with SqliteSaver.from_conn_string(target) as saver:
-        yield saver
 
 
 def create_sqlite_checkpointer(db_path: str | Path = ":memory:") -> SqliteSaver:

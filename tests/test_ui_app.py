@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import Any
 
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
@@ -11,13 +10,9 @@ from src.agent.graph import build_agent_graph, create_sqlite_checkpointer
 from src.config import PROJECT_ROOT, Settings
 from src.ui.app import build_result_figure
 from streamlit.testing.v1 import AppTest
+from tests.conftest import RecordingFakeChatModel
 
 APP_PATH = PROJECT_ROOT / "src" / "ui" / "app.py"
-
-
-class _ToolCallingFakeModel(FakeMessagesListChatModel):
-    def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> _ToolCallingFakeModel:
-        return self
 
 
 def test_build_result_figure_handles_cohort_and_empty_results() -> None:
@@ -36,14 +31,16 @@ def test_build_result_figure_handles_cohort_and_empty_results() -> None:
     assert len(fig.data) >= 1
 
 
-def _build_hitl_test_graph(
-    executor_calls: list[str],
+def _start_hitl_app(
     *,
+    thread_id: str,
+    prompt: str,
     final_agent_text: str = "Query executed after HITL.",
-) -> Any:
+) -> tuple[AppTest, list[str]]:
+    executor_calls: list[str] = []
     settings = Settings(_env_file=None, hitl_cost_threshold=1.0)
-    router = _ToolCallingFakeModel(
-        responses=[
+    router = RecordingFakeChatModel(
+        [
             AIMessage(
                 content="",
                 tool_calls=[
@@ -75,26 +72,26 @@ def _build_hitl_test_graph(
             {"subject_id": "s2", "label": 0, "text": "post 2"},
         ]
 
-    saver = create_sqlite_checkpointer(":memory:")
-    return build_agent_graph(
+    graph = build_agent_graph(
         settings=settings,
         router_model=router,
         critic_model=critic,
         sql_executor=fake_executor,
-        checkpointer=saver,
+        checkpointer=create_sqlite_checkpointer(":memory:"),
     )
+    at = AppTest.from_file(APP_PATH, default_timeout=10)
+    at.session_state["agent_graph"] = graph
+    at.session_state["thread_id"] = thread_id
+    at.run()
+    at.chat_input[0].set_value(prompt).run()
+    return at, executor_calls
 
 
 def test_ui_hitl_approve_flow_resumes_same_thread() -> None:
-    executor_calls: list[str] = []
-    graph = _build_hitl_test_graph(executor_calls)
-
-    at = AppTest.from_file(APP_PATH, default_timeout=10)
-    at.session_state["agent_graph"] = graph
-    at.session_state["thread_id"] = "ui-test-approve"
-    at.run()
-
-    at.chat_input[0].set_value("Analizza i post raw in silver_posts").run()
+    at, executor_calls = _start_hitl_app(
+        thread_id="ui-test-approve",
+        prompt="Analizza i post raw in silver_posts",
+    )
 
     # Interrupted at HITL gate: executor has not run yet, warning + buttons are visible.
     assert executor_calls == []
@@ -113,18 +110,11 @@ def test_ui_hitl_approve_flow_resumes_same_thread() -> None:
 
 
 def test_ui_hitl_reject_flow_never_executes_query() -> None:
-    executor_calls: list[str] = []
-    graph = _build_hitl_test_graph(
-        executor_calls,
+    at, executor_calls = _start_hitl_app(
+        thread_id="ui-test-reject",
+        prompt="Scansiona silver_posts",
         final_agent_text="Query execution cancelled by user.",
     )
-
-    at = AppTest.from_file(APP_PATH, default_timeout=10)
-    at.session_state["agent_graph"] = graph
-    at.session_state["thread_id"] = "ui-test-reject"
-    at.run()
-
-    at.chat_input[0].set_value("Scansiona silver_posts").run()
     assert executor_calls == []
 
     reject_btn = next(btn for btn in at.button if btn.key == "hitl_reject")

@@ -7,6 +7,7 @@ without mutating or filtering raw business values.
 
 from __future__ import annotations
 
+from functools import reduce
 from pathlib import Path
 
 from pyspark.sql import DataFrame, SparkSession
@@ -74,11 +75,7 @@ def _read_xml_paths(spark: SparkSession, xml_inputs: str | list[str]) -> DataFra
             .load(path)
         )
 
-    frames = [read_one(path) for path in paths]
-    merged = frames[0]
-    for frame in frames[1:]:
-        merged = merged.unionByName(frame)
-    return merged
+    return reduce(DataFrame.unionByName, (read_one(path) for path in paths))
 
 
 def _row_hash_expr(columns: tuple[str, ...]) -> F.Column:

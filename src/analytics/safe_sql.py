@@ -93,12 +93,7 @@ def register_lakehouse_views(
     resolved = paths or LakehousePaths.from_settings(settings)
     views = _lakehouse_view_paths(resolved)
     storage_root = str(resolved.storage_root)
-
-    if spark.conf.get(_VIEWS_ROOT_KEY, None) == storage_root:
-        already_registered = True
-    else:
-        already_registered = False
-
+    already_registered = spark.conf.get(_VIEWS_ROOT_KEY, None) == storage_root
     registered: list[str] = []
 
     for view_name, table_path in views.items():

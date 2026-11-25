@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,6 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from src.agent.nodes import make_spark_job_executor
 from src.analytics.safe_sql import execute_safe_spark_sql
-from src.lakehouse.bronze import run_bronze_ingestion
 from src.lakehouse.gold import build_gold
 from src.lakehouse.manifest import load_manifest
 from src.lakehouse.silver import build_silver
@@ -19,17 +19,11 @@ from src.lakehouse.silver import build_silver
 @pytest.mark.spark
 def test_gold_tables_and_manifest_zero_spark_jobs(
     spark: SparkSession,
-    lakehouse_env: tuple,
+    bronze_lakehouse: tuple,
+    forbid_active_spark: Callable[[], None],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings, paths, _ = lakehouse_env
-    run_bronze_ingestion(
-        spark,
-        paths.sample_chunks,
-        paths.sample_truth,
-        settings=settings,
-        paths=paths,
-    )
+    settings, paths, _, _ = bronze_lakehouse
     build_silver(spark, settings=settings, paths=paths)
     user_features_df, lexical_df, built_manifest = build_gold(
         spark,
@@ -113,11 +107,7 @@ def test_gold_tables_and_manifest_zero_spark_jobs(
 
     # Loading the manifest must NOT issue any Spark jobs or touch SparkSession.
     jobs_before = spark._jsc.sc().dagScheduler().nextJobId()
-
-    def _forbid_spark(*args, **kwargs):
-        raise AssertionError("load_manifest must never invoke SparkSession")
-
-    monkeypatch.setattr(SparkSession, "getActiveSession", staticmethod(_forbid_spark))
+    forbid_active_spark()
     loaded = load_manifest(settings=settings)
     jobs_after = spark._jsc.sc().dagScheduler().nextJobId()
 

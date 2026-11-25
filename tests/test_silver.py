@@ -24,16 +24,9 @@ from src.lakehouse.silver import (
 @pytest.mark.spark
 def test_silver_quarantine_reasons_partitioning_and_accounting(
     spark: SparkSession,
-    lakehouse_env: tuple,
+    bronze_lakehouse: tuple,
 ) -> None:
-    settings, paths, _ = lakehouse_env
-    bronze_posts, _ = run_bronze_ingestion(
-        spark,
-        paths.sample_chunks,
-        paths.sample_truth,
-        settings=settings,
-        paths=paths,
-    )
+    settings, paths, bronze_posts, _ = bronze_lakehouse
     bronze_count = bronze_posts.count()
 
     silver_df, quarantine_df = build_silver(spark, settings=settings, paths=paths)

@@ -17,6 +17,12 @@ from src.lakehouse.paths import LakehousePaths
 from src.spark import write_parquet_zstd
 
 
+def _assert_sql_error(query: str, code: str) -> None:
+    with pytest.raises(SafeSQLError) as exc_info:
+        validate_and_rewrite_sql(query)
+    assert exc_info.value.code == code
+
+
 @pytest.mark.parametrize(
     "bad_query",
     [
@@ -32,23 +38,13 @@ from src.spark import write_parquet_zstd
     ],
 )
 def test_rejects_ddl_and_dml_statements(bad_query: str) -> None:
-    with pytest.raises(SafeSQLError) as exc_info:
-        validate_and_rewrite_sql(bad_query)
-    assert exc_info.value.code == "DISALLOWED_STATEMENT"
+    _assert_sql_error(bad_query, "DISALLOWED_STATEMENT")
 
 
 def test_rejects_multiple_statements_empty_and_syntax_errors() -> None:
-    with pytest.raises(SafeSQLError) as multi_exc:
-        validate_and_rewrite_sql("SELECT 1; DROP TABLE silver_posts")
-    assert multi_exc.value.code == "MULTIPLE_STATEMENTS"
-
-    with pytest.raises(SafeSQLError) as empty_exc:
-        validate_and_rewrite_sql("   ")
-    assert empty_exc.value.code == "EMPTY_QUERY"
-
-    with pytest.raises(SafeSQLError) as syntax_exc:
-        validate_and_rewrite_sql("SELECT FROM WHERE")
-    assert syntax_exc.value.code == "SQL_SYNTAX_ERROR"
+    _assert_sql_error("SELECT 1; DROP TABLE silver_posts", "MULTIPLE_STATEMENTS")
+    _assert_sql_error("   ", "EMPTY_QUERY")
+    _assert_sql_error("SELECT FROM WHERE", "SQL_SYNTAX_ERROR")
 
 
 @pytest.mark.parametrize(
@@ -65,9 +61,7 @@ def test_rejects_multiple_statements_empty_and_syntax_errors() -> None:
 def test_rejects_file_paths_qualified_and_non_allowlisted_tables(
     forbidden_table_query: str,
 ) -> None:
-    with pytest.raises(SafeSQLError) as exc_info:
-        validate_and_rewrite_sql(forbidden_table_query)
-    assert exc_info.value.code == "TABLE_NOT_ALLOWED"
+    _assert_sql_error(forbidden_table_query, "TABLE_NOT_ALLOWED")
 
 
 def test_limit_injection_and_capping() -> None:

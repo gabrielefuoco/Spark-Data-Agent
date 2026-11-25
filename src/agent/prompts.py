@@ -16,6 +16,8 @@ from src.agent.memory import ConversationWindow, extract_message_text
 from src.agent.state import ToolResultEntry, ToolTraceEntry
 from src.lakehouse.manifest import DatasetManifest
 
+TOOL_PREVIEW_ROW_LIMIT = 20
+
 LAKEHOUSE_SCHEMA_GUIDE = """Available Spark SQL lakehouse views (SELECT/WITH/UNION only, no qualified names):
 1. `gold_user_longitudinal_features` (pre-aggregated per subject — prefer for user/cohort comparisons):
    - subject_id (STRING), label (INT: 1=depressed, 0=control), post_count (BIGINT),
@@ -75,36 +77,29 @@ def _format_planner_history(
     """Render every kept message at full fidelity with clear block delimiters."""
     if history is None:
         return ""
-    if isinstance(history, ConversationWindow):
-        messages: Sequence[BaseMessage] = history.messages
-        dropped_messages = history.dropped_messages
-    else:
-        messages = history
-        dropped_messages = 0
-
-    if not messages and dropped_messages <= 0:
-        return ""
+    messages: Sequence[BaseMessage] = (
+        history.messages if isinstance(history, ConversationWindow) else history
+    )
+    dropped_messages = history.dropped_messages if isinstance(history, ConversationWindow) else 0
 
     entries: list[str] = []
     for msg in messages:
         text = extract_message_text(msg)
-        if isinstance(msg, HumanMessage):
-            if text.strip():
-                entries.append(f"User:\n{text}")
-        elif isinstance(msg, AIMessage):
+        stripped = text.strip()
+        if isinstance(msg, AIMessage):
             raw_query = msg.additional_kwargs.get("generated_query")
-            query_text = (
-                raw_query.strip() if isinstance(raw_query, str) and raw_query.strip() else ""
+            parts = (
+                [f"Generated query:\n{raw_query.strip()}"]
+                if isinstance(raw_query, str) and raw_query.strip()
+                else []
             )
-            parts: list[str] = []
-            if query_text:
-                parts.append(f"Generated query:\n{query_text}")
-            if text.strip():
+            if stripped:
                 parts.append(f"Answer:\n{text}")
             if parts:
                 entries.append("Assistant:\n" + "\n".join(parts))
-        elif text.strip():
-            entries.append(f"{msg.type.capitalize()}:\n{text}")
+        elif stripped:
+            role = "User" if isinstance(msg, HumanMessage) else msg.type.capitalize()
+            entries.append(f"{role}:\n{text}")
 
     if not entries and dropped_messages <= 0:
         return ""
@@ -216,24 +211,34 @@ def build_critic_system_prompt(
     )
 
 
-def _format_tool_result_payload(entry: ToolResultEntry, index: int) -> dict[str, Any]:
-    qr = entry.get("result") or {}
+def build_result_preview(
+    qr: dict[str, Any],
+    guard_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Build shared query-result preview fields for tool messages and critic prompts."""
     rows = qr.get("rows", [])
     rows_returned = qr.get("rows_returned", qr.get("row_count", len(rows)))
-    rows_shown = qr.get("rows_shown", len(rows))
+    return {
+        "columns": qr.get("columns", []),
+        "rows_returned": rows_returned,
+        "rows_shown": qr.get("rows_shown", len(rows)),
+        "truncated": bool(qr.get("truncated", False)),
+        "sample_rows": rows[:TOOL_PREVIEW_ROW_LIMIT],
+        "statistical_validation": guard_payload,
+    }
+
+
+def _format_tool_result_payload(entry: ToolResultEntry, index: int) -> dict[str, Any]:
+    qr = entry.get("result") or {}
+    preview = build_result_preview(qr, entry.get("guard_payload"))
     return {
         "index": index,
         "tool_name": entry.get("name"),
         "arguments": entry.get("arguments"),
         "executed_query": entry.get("query"),
         "cost_estimate": entry.get("cost_estimate"),
-        "row_count": qr.get("row_count", rows_returned),
-        "rows_returned": rows_returned,
-        "rows_shown": rows_shown,
-        "truncated": bool(qr.get("truncated", False)),
-        "columns": qr.get("columns", []),
-        "sample_rows": rows[:20],
-        "statistical_validation": entry.get("guard_payload"),
+        "row_count": qr.get("row_count", preview["rows_returned"]),
+        **preview,
     }
 
 
@@ -337,6 +342,11 @@ def _escape_markdown_cell(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", " ").strip()
 
 
+def format_cohens_d(value: float) -> str:
+    """Format Cohen's d, snapping sub-1e-12 floating-point noise to ``0.0000``."""
+    return "0.0000" if abs(value) < 1e-12 else f"{value:.6g}"
+
+
 def format_statistical_appendix(guards: Sequence[StatisticalGuardResult]) -> str:
     """Render a deterministic Italian statistical appendix table when any ``assessed`` result exists.
 
@@ -347,13 +357,7 @@ def format_statistical_appendix(guards: Sequence[StatisticalGuardResult]) -> str
     continues to catch prose that asserts a difference where this table reports
     ``non significativo``.
     """
-    has_assessed = any(
-        g.assessment_status == "assessed"
-        and g.p_value is not None
-        and g.effect_size_cohens_d is not None
-        for g in guards
-    )
-    if not has_assessed:
+    if not any(g.is_assessed for g in guards):
         return ""
 
     lines = [
@@ -364,21 +368,14 @@ def format_statistical_appendix(guards: Sequence[StatisticalGuardResult]) -> str
     ]
     for guard in guards:
         metric_cell = _escape_markdown_cell(guard.metric_name)
-        if (
-            guard.assessment_status == "assessed"
-            and guard.p_value is not None
-            and guard.effect_size_cohens_d is not None
-        ):
+        if guard.is_assessed:
+            assert guard.p_value is not None
+            assert guard.effect_size_cohens_d is not None
             n_dep = str(guard.sample_size_depressed)
             n_ctrl = str(guard.sample_size_control)
             p_cell = f"p = {guard.p_value:.6g}"
-            d_display = (
-                "0.0000"
-                if abs(guard.effect_size_cohens_d) < 1e-12
-                else f"{guard.effect_size_cohens_d:.6g}"
-            )
-            d_cell = f"d = {d_display}"
-            if guard.is_significant and not guard.is_underpowered:
+            d_cell = f"d = {format_cohens_d(guard.effect_size_cohens_d)}"
+            if guard.allows_claims:
                 verdict = "significativo"
             elif guard.is_underpowered:
                 verdict = "non significativo (campione insufficiente)"

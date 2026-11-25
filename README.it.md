@@ -31,7 +31,6 @@ R:  No. 79 soggetti depressi vs 740 controlli, Mann-Whitney U,
 - [I dati](#i-dati)
 - [Documentazione](#documentazione)
 - [Principi di progetto](#principi-di-progetto)
-- [Perimetro onesto](#perimetro-onesto)
 - [Stato](#stato)
 
 ---
@@ -196,24 +195,6 @@ Quattro frasi che spiegano la maggior parte del codice:
    che tronca 819 soggetti — è stato trovato facendo una domanda al sistema, non
    eseguendo la suite.
 
-## Perimetro onesto
-
-Questo è un progetto per il portfolio, ed essere precisi su cosa fa ne fa parte.
-
-- **Storage**: **MinIO** locale attraverso l'API compatibile S3
-  (`s3a://lakehouse`). Il vero AWS è supportato per configurazione e **non è mai
-  stato esercitato**. In nessun punto di questo repository si afferma di aver
-  girato su AWS.
-- **LLM**: duale per progetto — Ollama in locale, OpenRouter in remoto. Ogni
-  misura qui è stata fatta con OpenRouter e
-  `deepseek/deepseek-v4.1-flash-1017`; nessun modello locale è stato scaricato.
-  L'intera suite di test gira offline contro modelli di chat finti.
-- **Affermazioni cliniche**: nessuna. Il corpus sostiene analisi esplorative, non
-  diagnosi, e la guardia esiste per impedire all'agente di vestire il rumore da
-  scoperta.
-- **Non è produzione**: Spark su singolo nodo, nessuna CI, nessuna
-  autenticazione, nessun isolamento multi-utente. È una dimostrazione di metodo.
-
 ## Stato
 
 Sette ticket del piano sono chiusi: ambiente Docker, igiene del progetto,
@@ -227,4 +208,5 @@ nella storia con i propri commit, e la mappa annota cosa ciascuno ha chiuso.
 src/ 5.804 righe · tests/ 3.944 · 4 ADR · 10 documenti
 ```
 
-Cosa manca e cosa farei dopo: [docs/roadmap.md](docs/roadmap.md).
+Cosa manca, cosa rifiuta di aggiungere, e cosa farei dopo:
+[docs/roadmap.md](docs/roadmap.md).

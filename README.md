@@ -30,7 +30,6 @@ A:  No. 79 soggetti depressi vs 740 controlli, Mann-Whitney U,
 - [The data](#the-data)
 - [Documentation](#documentation)
 - [Design principles](#design-principles)
-- [Honest scope](#honest-scope)
 - [Status](#status)
 
 ---
@@ -190,23 +189,6 @@ Four sentences that explain most of the code:
    `EXPLAIN` before views were registered, `LIMIT 500` truncating 819 subjects —
    was found by asking the system a question, not by running the suite.
 
-## Honest scope
-
-This is a portfolio project, and being accurate about what it does is part of it.
-
-- **Storage**: local **MinIO** through the S3-compatible API (`s3a://lakehouse`).
-  Real AWS is supported by configuration and has **never been exercised**. No
-  claim of a run on AWS is made anywhere in this repository.
-- **LLM**: dual by design — Ollama locally, OpenRouter remotely. Every
-  measurement here used OpenRouter with `deepseek/deepseek-v4.1-flash-1017`; no
-  local model was pulled. The whole test suite runs offline against fake chat
-  models.
-- **Clinical claims**: none. The corpus supports exploratory analysis, not
-  diagnosis, and the guard exists to keep the agent from dressing up noise as a
-  finding.
-- **Not production**: single-node Spark, no CI, no authentication, no multi-user
-  isolation. It is a demonstration of method.
-
 ## Status
 
 Seven tickets of the plan are closed: Docker environment, project hygiene,
@@ -220,4 +202,5 @@ their own commits, and the map records what each one closed.
 src/ 5,804 lines · tests/ 3,944 · 4 ADRs · 10 documentation files
 ```
 
-What is missing and what I would do next: [docs/roadmap.md](docs/roadmap.md).
+What is missing, what it refuses to add, and what I would do next:
+[docs/roadmap.md](docs/roadmap.md).

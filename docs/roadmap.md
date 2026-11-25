@@ -38,10 +38,15 @@ session — does not have to discover it by breaking something.
 - **The Ollama path is configured but unexercised.** No local model was pulled;
   every measurement used OpenRouter.
 - **No CI.** Tests, lint and type checks are commands a human runs.
+- **No authentication, no multi-user isolation.** One operator, one container, one
+  lakehouse. There is no session model to isolate, and no account to revoke.
 - **Single-node Spark.** `local[*]` in one container. The medallion design does
   not need a cluster at this size, and the code does not pretend to one.
 - **Windows host caveats remain at the edges**: Docker Desktop must be started by
   hand, and bind-mount paths need `MSYS_NO_PATHCONV=1` in Git Bash.
+
+This is a portfolio project, and being accurate about what it does is part of it:
+a demonstration of method, not a production system.
 
 ## What I would do next, in order
 

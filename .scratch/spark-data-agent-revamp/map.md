@@ -32,6 +32,20 @@ Un repository completamente refattorizzato in lingua inglese (`spark-data-agent`
 - [04 — Data Quality con Pandera e Guardia di Significatività Statistica a Runtime](issues/04-data-quality-and-statistical-guard.md) — Blocked by 02
 - [05 — Orchestrazione Ciclica con LangGraph, OpenRouter Multi-Modello e Human-in-the-Loop (HITL)](issues/05-langgraph-cyclic-orchestration-openrouter-hitl.md) — Blocked by 03, 04
 - [06 — Connettore Cloud S3 / MinIO, Suite di Test Pytest e Formalizzazione ADR](issues/06-cloud-storage-s3-and-pytest-suite.md) — Blocked by 05
+- [07 — Tipizzazione Statica con Mypy](issues/07-mypy-static-typing.md) — Blocked by 06
+
+## Review post-implementazione
+
+I sette ticket erano tutti `resolved`, poi una review a due assi (`e2976dc..HEAD`) ha trovato che tre di essi erano resolti **solo in apparenza**. Le correzioni sono commit separati, non riscritture silenziose dei ticket:
+
+- **La guardia contava righe, non soggetti** (`32da190`). `min_subjects_per_class` era confrontato col numero di righe SQL: 40 post di una sola persona passavano il controllo di potenza e producevano un p-value calcolato su osservazioni non indipendenti — pseudo-replicazione, nel componente che esiste per impedirla. Ora l'unità di osservazione è il soggetto: media per soggetto prima del test, conteggio dei soggetti unici, e verdetto `cannot_assess` esplicito quando la query non ha `subject_id`.
+- **S3A non era mai applicato alla sessione** (`e404c9c`). `build_spark_session` non chiamava `apply_s3a_config`, e manifest e checkpointer passavano `spark_storage_uri` dentro `Path(...)`: la promessa «trasparente su S3» era vera solo nel test che la cablava a mano. Chiuso nel giro anche un **import circolare** (`import src.spark` come primo import falliva) che la suite non vedeva per via dell'ordine degli import.
+- **Analitica scritta ma mai chiamata** (`8462126`). `nlp_pipeline.py` e `features.py` esistevano solo nei test: la gold table lessicale era senza TF-IDF né LDA, e l'agente non poteva lanciare alcun job Spark. La review dello spec (§2 e §5) ha reso la cosa visibile; ora la gold deriva dall'analitica vera e il planner dispatcha job con HITL.
+- **Il manifest conteneva dati che il modello scartava** (`8462126`): `storage_volumes` finiva nel JSON ma non in `DatasetManifest`, quindi l'oggetto restituito dall'ETL e quello riletto erano diversi senza che nulla lo segnalasse.
+- **Validazione dell'output del critico** (ticket 04, punto 3). Il vincolo era solo nel prompt: un modello poteva ignorarlo e affermare correlazioni su un risultato non significativo. Ora un controllo deterministico esige la citazione di p-value, Cohen's d e sample size (le disuguaglianze-soglia come `p < 0.05` **non** valgono), con un solo retry correttivo e un fallback *inconclusive* deterministico.
+- **Struttura e duplicazioni** (`07ef0b5`): `graph.py` da 400 righe in una funzione sola è diventato `nodes.py` + `routing.py` + assemblaggio di 91 righe; tre duplicazioni eliminate.
+
+Lezioni che restano nel repository: un ticket `resolved` non è una verifica, e un test verde che dipende dall'ordine degli import non è un test.
 
 ## Not yet specified
 

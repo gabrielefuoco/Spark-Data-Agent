@@ -458,3 +458,202 @@ def test_restating_the_question_is_not_a_forbidden_claim() -> None:
     )
 
     assert check.forbidden_claims == []
+
+
+def test_cohens_d_required_only_when_significant() -> None:
+    ns_guard = _make_guard(p_value=0.412, cohens_d=0.05, is_significant=False)
+    ns_without_d = (
+        "Nessuna differenza significativa tra 35 soggetti depressi e 40 controlli "
+        "(p = 0.412)."
+    )
+    ns_check = validate_critic_output(ns_without_d, ns_guard)
+    assert ns_check.passed is True
+    assert ns_check.missing_items == []
+    assert ns_check.has_p_value is True
+    assert ns_check.has_sample_sizes is True
+
+    # A non-significant result still requires p_value and sample_sizes.
+    assert validate_critic_output("35 depressed and 40 control subjects.", ns_guard).missing_items == [
+        "p_value"
+    ]
+    assert validate_critic_output("p = 0.412, no difference.", ns_guard).missing_items == [
+        "sample_sizes"
+    ]
+
+    # A significant result that omits Cohen's d must still fail.
+    sig_guard = _make_guard(p_value=0.0312, cohens_d=0.54, is_significant=True)
+    sig_without_d = "Significant difference between 35 depressed and 40 control subjects (p = 0.0312)."
+    sig_check = validate_critic_output(sig_without_d, sig_guard)
+    assert sig_check.passed is False
+    assert sig_check.has_cohens_d is False
+    assert sig_check.missing_items == ["cohens_d"]
+
+    # Mixed results: omitting d on the non-significant one passes when the significant one cites d.
+    mixed_text = (
+        "Metric A: significant difference (35 depressed, 40 control, p = 0.0312, d = 0.54). "
+        "Metric B: no significant difference (35 depressed, 40 control, p = 0.412)."
+    )
+    assert validate_critic_output(mixed_text, [sig_guard, ns_guard]).passed is True
+
+
+def test_fallback_reads_like_an_answer_with_single_closing_note() -> None:
+    manifest_guard = StatisticalGuardResult(
+        sample_size_depressed=0,
+        sample_size_control=0,
+        aggregation_method="none",
+        assessment_status="descriptive",
+        descriptive_reason="descriptive: no_cohort_label_column",
+        statistical_confidence="descriptive",
+        test_used="none",
+        metric_name="total_posts",
+    )
+    lexical_guard = StatisticalGuardResult(
+        sample_size_depressed=0,
+        sample_size_control=0,
+        aggregation_method="none",
+        assessment_status="descriptive",
+        descriptive_reason="descriptive: lexical_frequency_table",
+        statistical_confidence="descriptive",
+        test_used="none",
+        metric_name="lexical_ngram",
+    )
+    topic_guard = StatisticalGuardResult(
+        sample_size_depressed=0,
+        sample_size_control=0,
+        aggregation_method="none",
+        assessment_status="descriptive",
+        descriptive_reason="descriptive: topic_distribution_table",
+        statistical_confidence="descriptive",
+        test_used="none",
+        metric_name="topic_distribution",
+    )
+    cannot_assess_guard = StatisticalGuardResult(
+        sample_size_depressed=0,
+        sample_size_control=0,
+        aggregation_method="none",
+        assessment_status="cannot_assess",
+        cannot_assess_reason="cannot assess: no subject dimension for 'night_post_ratio'",
+        statistical_confidence="cannot_assess",
+        test_used="none",
+        metric_name="night_post_ratio",
+    )
+    sig_guard = _make_guard(
+        n_dep=79,
+        n_ctrl=740,
+        p_value=0.0005936535745210291,
+        cohens_d=0.68,
+        is_significant=True,
+    )
+    sig_guard = sig_guard.model_copy(update={"metric_name": "session_count"})
+    ns_guard = _make_guard(
+        n_dep=79,
+        n_ctrl=740,
+        p_value=0.5587,
+        cohens_d=0.068,
+        is_significant=False,
+    )
+    ns_guard = ns_guard.model_copy(update={"metric_name": "mean_text_length"})
+
+    guards = [
+        manifest_guard,
+        lexical_guard,
+        topic_guard,
+        cannot_assess_guard,
+        sig_guard,
+        ns_guard,
+    ]
+    failed = validate_critic_output("Incomplete synthesis.", guards)
+    assert failed.passed is False
+
+    fallback = format_inconclusive_critic_fallback(guards, failed)
+    lines = fallback.splitlines()
+    assert not lines[0].lower().startswith("verifica dei vincoli")
+    assert "verifica dei vincoli fallita" not in fallback.lower()
+    assert "elementi_mancanti" not in fallback.lower()
+    assert "Verifica fallita:" not in fallback
+
+    # One heading per result, in tool call order.
+    positions = [fallback.index(f"### Risultato {idx}:") for idx in range(1, 7)]
+    assert positions == sorted(positions)
+    assert "`total_posts`" in fallback
+    assert "`lexical_ngram`" in fallback
+    assert "`topic_distribution`" in fallback
+    assert "`night_post_ratio`" in fallback
+    assert "`session_count`" in fallback
+    assert "`mean_text_length`" in fallback
+
+    # Descriptive tables explain what they hold; cannot_assess carries the one-line reason.
+    assert "catalogo del dataset" in fallback.lower()
+    assert "n-grammi" in fallback.lower()
+    assert "topic latenti" in fallback.lower()
+    assert "cannot assess: no subject dimension" in fallback
+
+    # Significant finding stays visible; closing line appears once at the end.
+    assert "Risultato statisticamente significativo" in fallback
+    assert "0.000593654" in fallback
+    assert "0.68" in fallback
+    assert fallback.count("l'interpretazione narrativa è stata omessa") == 1
+    assert lines[-1].startswith("Nota: l'interpretazione narrativa è stata omessa")
+
+    recheck = validate_critic_output(fallback, guards)
+    assert recheck.passed is True
+    assert recheck.forbidden_claims == []
+
+
+def test_multi_nonsignificant_passes_with_one_full_citation_and_fails_without_numbers() -> None:
+    guards = [
+        _make_guard(n_dep=79, n_ctrl=740, p_value=p_val, cohens_d=0.05, is_significant=False)
+        for p_val in (0.5587, 0.412, 0.31, 0.28, 0.19, 0.64)
+    ]
+
+    supported = (
+        "Nessuno dei sei confronti mostra una differenza "
+        "(79 soggetti depressi, 740 controlli, p = 0,5587)."
+    )
+    ok_check = validate_critic_output(supported, guards)
+    assert ok_check.passed is True
+    assert ok_check.missing_items == []
+    assert ok_check.forbidden_claims == []
+
+    no_numbers = "Nessuno dei sei confronti mostra una differenza."
+    bad_check = validate_critic_output(no_numbers, guards)
+    assert bad_check.passed is False
+    assert bad_check.missing_items == ["p_value"]
+
+    only_p = "Nessuno dei sei confronti mostra una differenza (p = 0,5587)."
+    partial_check = validate_critic_output(only_p, guards)
+    assert partial_check.passed is False
+    assert partial_check.missing_items == ["sample_sizes"]
+
+
+def test_multi_results_require_full_citation_only_for_significant_ones() -> None:
+    sig_guard = _make_guard(
+        n_dep=79,
+        n_ctrl=740,
+        p_value=0.0005936535745210291,
+        cohens_d=0.68,
+        is_significant=True,
+    )
+    ns_guards = [
+        _make_guard(n_dep=79, n_ctrl=740, p_value=p_val, cohens_d=0.05, is_significant=False)
+        for p_val in (0.5587, 0.412, 0.31, 0.28, 0.19)
+    ]
+    guards = [sig_guard, *ns_guards]
+
+    sig_only_text = (
+        "Tra le sei metriche, una sola differenza è significativa: "
+        "79 soggetti depressi vs 740 controlli, p = 0,0006, Cohen's d = 0,68; "
+        "le altre cinque non mostrano differenze."
+    )
+    ok_check = validate_critic_output(sig_only_text, guards)
+    assert ok_check.passed is True
+    assert ok_check.missing_items == []
+
+    missing_d_text = (
+        "Tra le sei metriche, una sola differenza è significativa: "
+        "79 soggetti depressi vs 740 controlli, p = 0,0006; "
+        "le altre citano p = 0,5587."
+    )
+    bad_check = validate_critic_output(missing_d_text, guards)
+    assert bad_check.passed is False
+    assert bad_check.missing_items == ["cohens_d"]

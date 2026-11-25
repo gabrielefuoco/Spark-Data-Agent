@@ -1,4 +1,4 @@
-"""Cyclic LangGraph StateGraph assembly and SQLite checkpointer helpers."""
+"""Tool-calling LangGraph StateGraph assembly and SQLite checkpointer helpers."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from src.agent.nodes import (
     SqlExecutor,
     build_agent_nodes,
 )
-from src.agent.routing import build_agent_routers
+from src.agent.routing import route_after_agent, route_after_tools
 from src.agent.state import DataAgentState
 from src.config import Settings, get_settings
 
@@ -59,7 +59,7 @@ def build_agent_graph(
     manifest_loader: ManifestLoader | None = None,
     checkpointer: BaseCheckpointSaver[Any] | None = None,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
-    """Compile the cyclic LangGraph ``StateGraph`` for lakehouse analytics.
+    """Compile the tool-calling LangGraph ``StateGraph`` for lakehouse analytics.
 
     Dependencies (chat models, Spark/SQL executor, Spark job executor,
     manifest loader, SQLite checkpointer) are injected so offline tests never
@@ -76,64 +76,33 @@ def build_agent_graph(
         manifest_loader=manifest_loader,
     )
     nodes = build_agent_nodes(deps)
-    routers = build_agent_routers(cfg.max_query_retries)
 
     builder = StateGraph(DataAgentState)
     for name, node_fn in nodes.items():
         builder.add_node(name, node_fn)
 
-    builder.add_edge(START, "intent_router_planner")
+    builder.add_edge(START, "agent")
     builder.add_conditional_edges(
-        "intent_router_planner",
-        routers.after_planner,
+        "agent",
+        route_after_agent,
         {
-            "ast_validator_and_cost": "ast_validator_and_cost",
-            "query_rewriter": "query_rewriter",
+            "execute_tools": "execute_tools",
+            "scientific_critic": "scientific_critic",
             "handle_failure": "handle_failure",
             END: END,
         },
     )
     builder.add_conditional_edges(
-        "ast_validator_and_cost",
-        routers.after_validator,
+        "execute_tools",
+        route_after_tools,
         {
-            "hitl_gate": "hitl_gate",
-            "execute_sql": "execute_sql",
-            "execute_job": "execute_job",
-            "query_rewriter": "query_rewriter",
+            "execute_tools": "execute_tools",
+            "agent": "agent",
             "handle_failure": "handle_failure",
         },
     )
-    builder.add_conditional_edges(
-        "hitl_gate",
-        routers.after_hitl,
-        {
-            "execute_sql": "execute_sql",
-            "execute_job": "execute_job",
-            END: END,
-        },
-    )
-    builder.add_conditional_edges(
-        "execute_sql",
-        routers.after_execute,
-        {
-            "statistical_guard": "statistical_guard",
-            "query_rewriter": "query_rewriter",
-            "handle_failure": "handle_failure",
-        },
-    )
-    builder.add_conditional_edges(
-        "execute_job",
-        routers.after_execute,
-        {
-            "statistical_guard": "statistical_guard",
-            "query_rewriter": "query_rewriter",
-            "handle_failure": "handle_failure",
-        },
-    )
-    builder.add_edge("query_rewriter", "intent_router_planner")
-    builder.add_edge("statistical_guard", "scientific_critic")
     builder.add_edge("scientific_critic", END)
     builder.add_edge("handle_failure", END)
 
-    return builder.compile(checkpointer=checkpointer)
+    compiled = builder.compile(checkpointer=checkpointer)
+    return compiled.with_config({"recursion_limit": max(25, cfg.max_tool_calls * 3 + 15)})

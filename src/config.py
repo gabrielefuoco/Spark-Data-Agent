@@ -64,6 +64,7 @@ class Settings(BaseSettings):
     # Queries estimated above this cost stop at the human-in-the-loop gate.
     hitl_cost_threshold: float = 1.0
     max_query_retries: int = 2
+    max_tool_calls: int = 20
     # The underlying model offers 1M of context and we deliberately use 800k
     # for conversation history so system prompts and model output retain headroom.
     conversation_token_budget: int = 800_000

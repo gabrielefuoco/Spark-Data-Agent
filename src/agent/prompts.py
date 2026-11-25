@@ -1,4 +1,4 @@
-"""Prompt builders and deterministic formatters for the LangGraph agent."""
+"""Prompt builders and deterministic formatters for the tool-calling LangGraph agent."""
 
 from __future__ import annotations
 
@@ -8,8 +8,12 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
-from src.agent.guards import StatisticalGuardResult, format_critic_guard_instructions
+from src.agent.guards import (
+    StatisticalGuardResult,
+    format_multi_critic_guard_instructions,
+)
 from src.agent.memory import ConversationWindow, extract_message_text
+from src.agent.state import ToolResultEntry, ToolTraceEntry
 from src.lakehouse.manifest import DatasetManifest
 
 LAKEHOUSE_SCHEMA_GUIDE = """Available Spark SQL lakehouse views (SELECT/WITH/UNION only, no qualified names):
@@ -46,26 +50,19 @@ Definitions you must not improvise:
 - **Night post ratio** is `night_post_count / post_count` per subject, a 0–1
   share, not a percentage."""
 
-ROUTER_SYSTEM_PROMPT = f"""You are the Intent Router and Spark SQL Query Planner for the eRISK depression lakehouse.
+AGENT_SYSTEM_PROMPT = f"""You are the Analytical Data Agent for the eRISK depression lakehouse.
 
-Classify the user request and respond with a single JSON object (no markdown prose outside JSON):
-{{
-  "user_intent": "catalog_metadata" | "lexical_analysis" | "circadian_study" | "ad_hoc_sql" | "general_conversation",
-  "answer_from_manifest": true | false,
-  "sql_query": "<Spark SQL SELECT query or null>",
-  "metric_name": "<short metric name for statistical guard or null>",
-  "direct_response": "<string when user_intent is general_conversation, else null>"
-}}
+Use your tools iteratively to answer the user's question thoroughly and accurately:
+- `read_dataset_manifest()`: Read global corpus counts, subjects per class, posts per class, date range, and ETL quarantine totals from `gold_dataset_manifest.json` with zero Spark jobs. Always use this for catalog metadata instead of scanning raw tables; note that catalog numbers are purely descriptive.
+- `run_safe_sql(query)`: Execute read-only Spark SQL (`SELECT`/`WITH`/`UNION`) against the allowlisted lakehouse views. Never use DDL/DML, file paths, or qualified table names.
+- `run_spark_job(job, params)`: Run heavy non-SQL Spark analytics (`circadian_features` or `topic_model`) over `silver_posts` when asked to recompute circadian features or fit/recompute LDA topics.
 
-Rules:
-- Set `answer_from_manifest: true` and `sql_query: null` ONLY when the question asks for global corpus counts, subjects per class, posts per class, global min/max date range, or ETL quarantine totals available in `gold_dataset_manifest.json`.
-- For cohort statistical comparisons (e.g., circadian night posting, post length, posting rate), query `gold_user_longitudinal_features` selecting per-subject rows including `subject_id`, `label`, and the numeric metric column so the statistical guard can compute sample sizes and hypothesis tests.
-- When recent conversation history is provided, resolve follow-up references (such as ellipsis, pronouns, or year/metric overrides) against the prior question and executed query.
-- Never use DDL/DML, file paths, or qualified table names.
-
-Non-SQL Spark job dispatch:
-- When the user explicitly asks to recompute circadian/window features or fit/recompute the Spark ML LDA topic model from raw Silver posts, set `sql_query: null` and specify `"spark_job": "circadian_features" | "topic_model"` with optional `"job_params": {{...}}`.
-- When dispatching a `spark_job`, set `user_intent` to the job name (`"circadian_features"` or `"topic_model"`) or its domain intent (`"circadian_study"` or `"lexical_analysis"`), never `"ad_hoc_sql"`.
+Analytical rules:
+- Broad exploratory questions (e.g., how the two cohorts differ across multiple dimensions) should issue multiple targeted queries across `gold_user_longitudinal_features`, `gold_cohort_lexical_matrix`, `gold_cohort_topic_matrix`, and the manifest before concluding.
+- For cohort statistical comparisons (e.g., circadian night posting, post length, posting rate, sessionization), select per-subject rows including `subject_id`, `label`, and the numeric metric column from `gold_user_longitudinal_features` so the statistical guard can compute sample sizes, p-values, and Cohen's d.
+- If a tool call returns an error (such as a SQL syntax or column error), read the error and adjust your query; do NOT repeat an identical tool call.
+- If a tool call is rejected at the human-in-the-loop gate, do NOT re-run the same expensive query; either use a cheaper/partition-pruned Gold or Silver query or explain the limitation.
+- When you have gathered sufficient evidence (or when the tool budget is exhausted), stop calling tools and write a concise summary of what you observed, in the SAME language as the user's question.
 
 {LAKEHOUSE_SCHEMA_GUIDE}"""
 
@@ -127,7 +124,7 @@ def build_planner_user_prompt(
     planner_notes: str | None = None,
     retry_count: int = 0,
 ) -> str:
-    """Build the planner prompt, prepending windowed history on non-retry turns."""
+    """Build a prompt prepending windowed conversation history."""
     if last_error is not None:
         error_json = json.dumps(last_error, ensure_ascii=False, indent=2)
         notes_block = f"\nCorrection guidance:\n{planner_notes}\n" if planner_notes else ""
@@ -147,15 +144,68 @@ def build_planner_user_prompt(
     )
 
 
+def format_tool_results_summary(
+    tool_trace: Sequence[ToolTraceEntry],
+    tool_results: Sequence[ToolResultEntry],
+    *,
+    tool_call_count: int,
+    max_tool_calls: int,
+    budget_exhausted: bool = False,
+) -> str:
+    """Render a compact summary of tool calls and guard outcomes gathered in this turn."""
+    lines: list[str] = [f"Tool call budget used: {tool_call_count}/{max_tool_calls}."]
+    if tool_trace:
+        lines.append("Tool results gathered so far:")
+        result_by_id = {entry["tool_call_id"]: entry for entry in tool_results}
+        for idx, trace in enumerate(tool_trace, start=1):
+            call_id = trace["tool_call_id"]
+            guard = trace["guard_payload"]
+            status = trace["status"]
+            name = trace["name"]
+            if call_id in result_by_id and status == "executed":
+                metric = guard.get("metric_name", "metric")
+                assess = guard.get("assessment_status", "descriptive")
+                if assess == "assessed":
+                    p_val = guard.get("p_value")
+                    d_val = guard.get("effect_size_cohens_d")
+                    p_str = f"{p_val:.4g}" if isinstance(p_val, (int, float)) else "N/A"
+                    d_str = f"{d_val:.4f}" if isinstance(d_val, (int, float)) else "N/A"
+                    verdict = (
+                        f"assessed ({metric}: n_dep={guard.get('sample_size_depressed')}, "
+                        f"n_ctrl={guard.get('sample_size_control')}, p={p_str}, d={d_str}, "
+                        f"sig={guard.get('is_significant')}, underpowered={guard.get('is_underpowered')})"
+                    )
+                else:
+                    verdict = f"{assess} ({metric})"
+                lines.append(
+                    f"  {idx}. {name} -> {trace['rows_returned']} row(s), guard={verdict}"
+                )
+            else:
+                err_code = (trace.get("error") or {}).get("code", status)
+                lines.append(f"  {idx}. {name} -> status={status} ({err_code})")
+
+    if budget_exhausted:
+        lines.append(
+            f"TOOL CALL BUDGET EXHAUSTED ({max_tool_calls}/{max_tool_calls}): "
+            "Do NOT call any more tools. Answer the user's question now using only "
+            "the results gathered so far, and explicitly state that the tool-call budget was reached."
+        )
+    return "\n".join(lines)
+
+
 def build_critic_system_prompt(
-    guard_result: StatisticalGuardResult,
+    guard_result: StatisticalGuardResult | Sequence[StatisticalGuardResult],
     *,
     truncated: bool = False,
     rows_returned: int | None = None,
     sql_fetch_limit: int | None = None,
+    budget_exhausted: bool = False,
+    max_tool_calls: int | None = None,
 ) -> str:
     """Build the scientific critic system prompt embedding mandatory guardrails."""
-    guard_instructions = format_critic_guard_instructions(guard_result)
+    guard_instructions = format_multi_critic_guard_instructions(
+        [guard_result] if isinstance(guard_result, StatisticalGuardResult) else guard_result
+    )
     truncation_note = ""
     if truncated:
         limit_detail = (
@@ -168,10 +218,19 @@ def build_critic_system_prompt(
         )
         truncation_note = (
             "\n\nMANDATORY CAPPED-SAMPLE DISCLOSURE (`truncated=true`):\n"
-            f"The query result reached the fetch ceiling{limit_detail}{fetched_detail}. "
+            f"One or more query results reached the fetch ceiling{limit_detail}{fetched_detail}. "
             "Your narrative MUST explicitly state that the statistical analysis was performed on "
             "a capped/truncated sample rather than the full population, and note that findings "
             "may reflect partition/order selection bias."
+        )
+    budget_note = ""
+    if budget_exhausted:
+        limit_str = str(max_tool_calls) if max_tool_calls is not None else "configured limit"
+        budget_note = (
+            "\n\nMANDATORY BUDGET EXHAUSTION DISCLOSURE:\n"
+            f"The agent reached the maximum tool-call budget (`max_tool_calls={limit_str}`). "
+            "Your response MUST explicitly mention that the tool-call budget limit was reached "
+            "and summarize only the results actually gathered."
         )
     return (
         "You are the Scientific Interpreter & Critic for the eRISK computational linguistics lakehouse.\n"
@@ -181,40 +240,83 @@ def build_critic_system_prompt(
         "noting dataset limitations and that correlation does not imply causation.\n\n"
         f"{guard_instructions}"
         f"{truncation_note}"
+        f"{budget_note}"
     )
+
+
+def _format_tool_result_payload(entry: ToolResultEntry, index: int) -> dict[str, Any]:
+    qr = entry.get("result") or {}
+    rows = qr.get("rows", [])
+    rows_returned = qr.get("rows_returned", qr.get("row_count", len(rows)))
+    rows_shown = qr.get("rows_shown", len(rows))
+    return {
+        "index": index,
+        "tool_name": entry.get("name"),
+        "arguments": entry.get("arguments"),
+        "executed_query": entry.get("query"),
+        "cost_estimate": entry.get("cost_estimate"),
+        "row_count": qr.get("row_count", rows_returned),
+        "rows_returned": rows_returned,
+        "rows_shown": rows_shown,
+        "truncated": bool(qr.get("truncated", False)),
+        "columns": qr.get("columns", []),
+        "sample_rows": rows[:20],
+        "statistical_validation": entry.get("guard_payload"),
+    }
 
 
 def build_critic_user_prompt(
     question: str,
     *,
-    query: str | None,
-    query_result: dict[str, Any] | None,
-    cost_estimate: dict[str, Any] | None,
-    guard_result: StatisticalGuardResult,
+    tool_results: Sequence[ToolResultEntry] | None = None,
+    query: str | None = None,
+    query_result: dict[str, Any] | None = None,
+    cost_estimate: dict[str, Any] | None = None,
+    guard_result: StatisticalGuardResult | None = None,
     history: ConversationWindow | Sequence[BaseMessage] | None = None,
+    agent_draft: str | None = None,
+    budget_exhausted: bool = False,
+    max_tool_calls: int | None = None,
 ) -> str:
-    """Format executed SQL evidence, guard statistics, and optional history for the critic."""
-    qr = query_result or {}
-    rows = qr.get("rows", [])
-    rows_returned = qr.get("rows_returned", qr.get("row_count", len(rows)))
-    rows_shown = qr.get("rows_shown", len(rows))
-    truncated = bool(qr.get("truncated", False))
-    preview_rows = rows[:20]
-    payload = {
-        "question": question,
-        "executed_sql": query,
-        "cost_estimate": cost_estimate,
-        "row_count": qr.get("row_count", rows_returned),
-        "rows_returned": rows_returned,
-        "rows_shown": rows_shown,
-        "truncated": truncated,
-        "columns": qr.get("columns", []),
-        "sample_rows": preview_rows,
-        "statistical_validation": guard_result.model_dump(mode="json"),
-    }
+    """Format all tool results, guard statistics, and optional history for the critic."""
+    if tool_results is not None:
+        payload: dict[str, Any] = {
+            "question": question,
+            "result_count": len(tool_results),
+            "results": [
+                _format_tool_result_payload(entry, idx)
+                for idx, entry in enumerate(tool_results, start=1)
+            ],
+        }
+        if agent_draft:
+            payload["agent_draft_summary"] = agent_draft
+        if budget_exhausted:
+            payload["budget_exhausted"] = True
+            if max_tool_calls is not None:
+                payload["max_tool_calls"] = max_tool_calls
+    else:
+        qr = query_result or {}
+        rows = qr.get("rows", [])
+        rows_returned = qr.get("rows_returned", qr.get("row_count", len(rows)))
+        rows_shown = qr.get("rows_shown", len(rows))
+        payload = {
+            "question": question,
+            "executed_sql": query,
+            "cost_estimate": cost_estimate,
+            "row_count": qr.get("row_count", rows_returned),
+            "rows_returned": rows_returned,
+            "rows_shown": rows_shown,
+            "truncated": bool(qr.get("truncated", False)),
+            "columns": qr.get("columns", []),
+            "sample_rows": rows[:20],
+            "statistical_validation": (
+                guard_result.model_dump(mode="json") if guard_result is not None else None
+            ),
+        }
+
     history_block = _format_planner_history(history)
     evidence_block = (
-        "Interpret the following Spark SQL results strictly within the mandatory statistical guardrails:\n"
+        "Interpret all gathered tool results strictly within the mandatory statistical guardrails:\n"
         f"{json.dumps(payload, ensure_ascii=False, indent=2, default=str)}"
     )
     return f"{history_block}\n\n{evidence_block}" if history_block else evidence_block
@@ -242,4 +344,144 @@ def format_manifest_answer(manifest: DatasetManifest, question: str) -> str:
         f"- **Date range**: {manifest.min_date or 'N/A'} -> {manifest.max_date or 'N/A'}\n"
         f"- **Quarantined rows**: {manifest.quarantine_count} ({quarantine_breakdown})\n"
         f"- **Manifest generated at**: {manifest.generated_at}"
+    )
+
+
+_DESCRIPTIVE_FALLBACK_DESCRIPTIONS: dict[str, str] = {
+    "descriptive: lexical_frequency_table": (
+        "Tabella descrittiva con gli n-grammi principali e le relative frequenze/pesi TF-IDF per coorte"
+    ),
+    "descriptive: topic_distribution_table": (
+        "Tabella descrittiva con i topic latenti (LDA) e i termini principali per coorte"
+    ),
+    "descriptive: cohort_aggregate_metric": (
+        "Conteggi o metriche aggregate per coorte senza granularità per soggetto"
+    ),
+    "descriptive: single_cohort_only": (
+        "Statistiche descrittive riferite a una sola coorte (confronto tra coorti non applicabile)"
+    ),
+    "descriptive: no_numeric_metric_column": (
+        "Tabella descrittiva priva di una metrica numerica continua"
+    ),
+    "descriptive: empty_result": "La query non ha restituito righe",
+}
+
+_DEFAULT_DESCRIPTIVE_FALLBACK = (
+    "Statistiche descrittive senza test di significatività a livello di soggetto"
+)
+
+
+def _descriptive_summary_core_it(metric_name: str, descriptive_reason: str | None) -> str:
+    if descriptive_reason == "descriptive: no_cohort_label_column":
+        if metric_name == "total_posts":
+            return (
+                "Riepilogo descrittivo del catalogo del dataset (conteggi globali di post e "
+                "soggetti senza confronto tra coorti)"
+            )
+        return "Tabella descrittiva riepilogativa senza colonna di confronto tra coorti"
+    if descriptive_reason and descriptive_reason in _DESCRIPTIVE_FALLBACK_DESCRIPTIONS:
+        return _DESCRIPTIVE_FALLBACK_DESCRIPTIONS[descriptive_reason]
+    return _DEFAULT_DESCRIPTIVE_FALLBACK
+
+
+def describe_descriptive_guard_it(metric_name: str, descriptive_reason: str | None) -> str:
+    """Return a readable Italian description of what a ``descriptive`` result holds."""
+    core = _descriptive_summary_core_it(metric_name, descriptive_reason)
+    return f"{core}; non viene affermata alcuna differenza tra le coorti."
+
+
+def _escape_markdown_cell(text: str) -> str:
+    return text.replace("|", "\\|").replace("\n", " ").strip()
+
+
+def format_statistical_appendix(guards: Sequence[StatisticalGuardResult]) -> str:
+    """Render a deterministic Italian statistical appendix table when any ``assessed`` result exists.
+
+    All numeric values (sample sizes, ``p``-values, Cohen's ``d``, and verdicts) come
+    exclusively from the deterministic statistical guards, never from the model's
+    recollection. As a consequence, deterministic fallback should fire only on genuine
+    claim violations rather than transcription misses, and the forbidden-claim tripwire
+    continues to catch prose that asserts a difference where this table reports
+    ``non significativo``.
+    """
+    has_assessed = any(
+        g.assessment_status == "assessed"
+        and g.p_value is not None
+        and g.effect_size_cohens_d is not None
+        for g in guards
+    )
+    if not has_assessed:
+        return ""
+
+    lines = [
+        "## Appendice statistica (generata dal sistema)",
+        "",
+        "| Metrica / Tabella | n depressi | n controlli | p | Cohen's d | Esito |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for guard in guards:
+        metric_cell = _escape_markdown_cell(guard.metric_name)
+        if (
+            guard.assessment_status == "assessed"
+            and guard.p_value is not None
+            and guard.effect_size_cohens_d is not None
+        ):
+            n_dep = str(guard.sample_size_depressed)
+            n_ctrl = str(guard.sample_size_control)
+            p_cell = f"p = {guard.p_value:.6g}"
+            d_display = (
+                "0.0000"
+                if abs(guard.effect_size_cohens_d) < 1e-12
+                else f"{guard.effect_size_cohens_d:.6g}"
+            )
+            d_cell = f"d = {d_display}"
+            if guard.is_significant and not guard.is_underpowered:
+                verdict = "significativo"
+            elif guard.is_underpowered:
+                verdict = "non significativo (campione insufficiente)"
+            else:
+                verdict = "non significativo"
+        elif guard.assessment_status == "descriptive":
+            n_dep = "—"
+            n_ctrl = "—"
+            p_cell = "—"
+            d_cell = "—"
+            desc = _escape_markdown_cell(
+                _descriptive_summary_core_it(guard.metric_name, guard.descriptive_reason)
+            )
+            verdict = f"descrittivo — {desc}"
+        else:
+            n_dep = "—"
+            n_ctrl = "—"
+            p_cell = "—"
+            d_cell = "—"
+            reason = _escape_markdown_cell(
+                guard.cannot_assess_reason or "manca la dimensione per soggetto (`subject_id`)"
+            )
+            verdict = f"non valutabile — {reason}"
+        lines.append(
+            f"| `{metric_cell}` | {n_dep} | {n_ctrl} | {p_cell} | {d_cell} | {verdict} |"
+        )
+    return "\n".join(lines)
+
+
+def format_critic_fallback_closing_line(
+    *,
+    has_missing_items: bool,
+    has_forbidden_claims: bool,
+) -> str:
+    """Return the single Italian closing note explaining why narrative prose was withheld."""
+    if has_missing_items:
+        return (
+            "Nota: l'interpretazione narrativa è stata omessa perché la risposta generata "
+            "non ha citato le statistiche richieste."
+        )
+    if has_forbidden_claims:
+        return (
+            "Nota: l'interpretazione narrativa è stata omessa perché la risposta generata "
+            "conteneva affermazioni comparative non supportate dai vincoli statistici."
+        )
+    return (
+        "Nota: l'interpretazione narrativa è stata omessa perché la risposta generata "
+        "non ha soddisfatto i vincoli statistici richiesti."
     )

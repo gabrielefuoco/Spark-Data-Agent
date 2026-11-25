@@ -614,8 +614,12 @@ def evaluate_query_result_guard(
     )
 
 
-def format_critic_guard_instructions(result: StatisticalGuardResult) -> str:
-    """Format the guard verdict and mandatory constraints for the scientific critic prompt."""
+def _format_guard_verdict_body(
+    result: StatisticalGuardResult,
+    *,
+    heading: str | None = None,
+) -> str:
+    """Format a single guard verdict block and any mandatory cohort imbalance disclosure."""
     if result.assessment_status == "descriptive":
         claim_policy = (
             "DESCRIPTIVE_ONLY: Present the descriptive results directly and clearly in the "
@@ -680,9 +684,9 @@ def format_critic_guard_instructions(result: StatisticalGuardResult) -> str:
             "Your narrative MUST state this balance ratio and explain that the smaller cohort "
             "limits the precision of the comparison, in the SAME language as the user's question."
         )
+    title = heading or f"STATISTICAL GUARD VERDICT ({result.metric_name}):"
     return (
-        f"{CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS}\n\n"
-        f"STATISTICAL GUARD VERDICT ({result.metric_name}):\n"
+        f"{title}\n"
         f"- assessment_status: {result.assessment_status}\n"
         f"- Claim policy: {claim_policy}\n"
         f"- sample_size_depressed: {result.sample_size_depressed}\n"
@@ -703,3 +707,30 @@ def format_critic_guard_instructions(result: StatisticalGuardResult) -> str:
         f"{underpowered_line}".rstrip()
         + imbalance_block
     )
+
+
+def format_critic_guard_instructions(result: StatisticalGuardResult) -> str:
+    """Format the guard verdict and mandatory constraints for the scientific critic prompt."""
+    return f"{CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS}\n\n{_format_guard_verdict_body(result)}"
+
+
+def format_multi_critic_guard_instructions(results: Sequence[StatisticalGuardResult]) -> str:
+    """Format one shared guardrail header followed by every tool result's guard verdict."""
+    if not results:
+        empty = _make_non_assessed_result(
+            status="descriptive",
+            reason="descriptive: empty_result",
+            metric_name="descriptive_metric",
+        )
+        return format_critic_guard_instructions(empty)
+    if len(results) == 1:
+        return format_critic_guard_instructions(results[0])
+
+    sections = [
+        _format_guard_verdict_body(
+            result,
+            heading=f"STATISTICAL GUARD VERDICT #{idx} ({result.metric_name}):",
+        )
+        for idx, result in enumerate(results, start=1)
+    ]
+    return f"{CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS}\n\n" + "\n\n".join(sections)

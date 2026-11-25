@@ -1,21 +1,24 @@
 """Deterministic, non-LLM validation of scientific critic outputs.
 
-For ``assessed`` comparisons, verifies that the critic narrative explicitly cites
-the statistical guard's p-value, Cohen's d effect size, and both cohorts'
-unique-subject sample sizes. When claims are forbidden (non-significant,
-underpowered, ``cannot_assess``, or ``descriptive``), a narrow regex tripwire
-(covering both English and Italian phrasings) also flags assertive comparative,
-causal, or significance claims about depression.
+Requires full citation (``n``, ``p``, ``d``) for every significant ``assessed``
+result and at least one fully cited ``assessed`` result (``n``, ``p``) when any
+``assessed`` result exists, while flagging unnegated assertive claims in English
+and Italian whenever no significant, powered finding authorizes them.
 """
 
 from __future__ import annotations
 
 import math
 import re
+from collections.abc import Sequence
 
 from pydantic import BaseModel, Field
 
 from src.agent.guards import StatisticalGuardResult
+from src.agent.prompts import (
+    describe_descriptive_guard_it,
+    format_critic_fallback_closing_line,
+)
 
 _NUM_TOKEN = r"(?P<num>[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
 _METRIC_OP = r"(?P<op>(?:(?:is|was)\s+)?(?:<=|>=|≤|≥|<|>)|=|:|\bis\b|\bof\b|\bwas\b|\()"
@@ -263,86 +266,114 @@ def _detect_forbidden_claims(text: str) -> list[str]:
     return flagged
 
 
-def validate_critic_output(
-    critique_text: str,
-    guard: StatisticalGuardResult,
-) -> CriticOutputCheck:
-    """Validate that ``critique_text`` obeys statistical citation and claim rules.
+def _normalize_guards(
+    guard: StatisticalGuardResult | Sequence[StatisticalGuardResult],
+) -> list[StatisticalGuardResult]:
+    if isinstance(guard, StatisticalGuardResult):
+        return [guard]
+    return list(guard)
 
-    For ``assessed`` comparisons, checks three mandatory numeric citations against ``guard``:
-    - ``p_value``: explicit p-value citation (e.g. ``p = 0.03``, ``p-value: 0.03``)
-      matching ``guard.p_value`` within its displayed rounding precision, or a
-      true tight inequality within one order of magnitude (e.g. ``p < 0.001``
-      for ``p = 0.00059``, while ``p < 0.05`` for ``p = 0.0031`` is rejected).
-    - ``cohens_d``: explicit Cohen's d citation matching ``guard.effect_size_cohens_d``
-      or a true tight inequality within one order of magnitude (e.g. ``d > 0.5``
-      for ``d = 0.68``).
-    - ``sample_sizes``: both ``guard.sample_size_depressed`` and
-      ``guard.sample_size_control`` appearing as standalone integer counts.
 
-    For ``cannot_assess`` and ``descriptive`` verdicts (where ``p_value`` and
-    ``effect_size_cohens_d`` are ``None``), numeric citations are not required.
-    When ``guard`` forbids claims (``assessment_status`` in ``{"cannot_assess",
-    "descriptive"}``, ``not is_significant``, or ``is_underpowered``), a narrow
-    regex tripwire scans each clause for unnegated assertive phrasing about
-    depression in English or Italian.
-    """
-    text = _normalise_decimal_commas(critique_text or "")
-
-    is_assessed = (
+def _is_assessed_guard(guard: StatisticalGuardResult) -> bool:
+    return (
         guard.assessment_status == "assessed"
         and guard.p_value is not None
         and guard.effect_size_cohens_d is not None
     )
 
-    missing_items: list[str] = []
-    if is_assessed:
-        assert guard.p_value is not None
-        assert guard.effect_size_cohens_d is not None
-        has_p_value = _has_matching_metric(text, _P_VALUE_RE, guard.p_value)
-        has_cohens_d = _has_matching_metric(text, _COHENS_D_RE, guard.effect_size_cohens_d)
-        has_sample_sizes = _has_sample_sizes(
-            text,
-            guard.sample_size_depressed,
-            guard.sample_size_control,
-        )
-        if not has_p_value:
-            missing_items.append("p_value")
-        if not has_cohens_d:
-            missing_items.append("cohens_d")
-        if not has_sample_sizes:
-            missing_items.append("sample_sizes")
-        # Cohort imbalance (`balance_ratio` / `is_imbalanced`) is intentionally kept
-        # in the guard payload and critic prompt without a regex output check:
-        # prose validators over-reject valid paraphrases across languages.
-    else:
-        has_p_value = True
-        has_cohens_d = True
-        has_sample_sizes = True
 
-    claims_forbidden = (
-        guard.assessment_status in {"cannot_assess", "descriptive"}
-        or (not guard.is_significant)
-        or guard.is_underpowered
+def _validate_single_assessed(
+    text: str,
+    guard: StatisticalGuardResult,
+) -> tuple[bool, bool, bool, list[str]]:
+    assert guard.p_value is not None
+    assert guard.effect_size_cohens_d is not None
+    has_p = _has_matching_metric(text, _P_VALUE_RE, guard.p_value)
+    has_d = (
+        _has_matching_metric(text, _COHENS_D_RE, guard.effect_size_cohens_d)
+        if guard.is_significant
+        else True
     )
+    has_n = _has_sample_sizes(text, guard.sample_size_depressed, guard.sample_size_control)
+    missing: list[str] = []
+    if not has_p:
+        missing.append("p_value")
+    if guard.is_significant and not has_d:
+        missing.append("cohens_d")
+    if not has_n:
+        missing.append("sample_sizes")
+    return has_p, has_d, has_n, missing
+
+
+def validate_critic_output(
+    critique_text: str,
+    guard: StatisticalGuardResult | Sequence[StatisticalGuardResult],
+) -> CriticOutputCheck:
+    """Every significant ``assessed`` result must be cited in full (cohort sample sizes ``n``, ``p``-value, and Cohen's ``d``), and whenever ``assessed`` results exist any comparative or no-difference claim must cite at least one ``assessed`` result's ``n`` and ``p`` in full (failing with ``missing_items=["p_value"]`` if none is cited).
+
+    Non-significant results never require Cohen's ``d``, ``cannot_assess`` and ``descriptive`` verdicts require no numbers, and unnegated assertive comparative, causal, or significance claims are rejected unless a significant, powered ``assessed`` result supports them.
+    """
+    text = _normalise_decimal_commas(critique_text or "")
+    guards = _normalize_guards(guard)
+    assessed = [item for item in guards if _is_assessed_guard(item)]
+
+    has_p_value = True
+    has_cohens_d = True
+    has_sample_sizes = True
+    missing_union: set[str] = set()
+
+    if len(assessed) == 1:
+        has_p_value, has_cohens_d, has_sample_sizes, single_missing = _validate_single_assessed(
+            text, assessed[0]
+        )
+        missing_union.update(single_missing)
+    elif len(assessed) > 1:
+        per_item = [(item, *_validate_single_assessed(text, item)) for item in assessed]
+        sig_items = [entry for entry in per_item if entry[0].is_significant]
+        if sig_items:
+            for _, item_p, item_d, item_n, item_missing in sig_items:
+                has_p_value = has_p_value and item_p
+                has_cohens_d = has_cohens_d and item_d
+                has_sample_sizes = has_sample_sizes and item_n
+                missing_union.update(item_missing)
+        elif not any(item_p and item_n for _, item_p, _, item_n, _ in per_item):
+            any_p = any(item_p for _, item_p, _, _, _ in per_item)
+            any_n = any(item_n for _, _, _, item_n, _ in per_item)
+            has_p_value = any_p
+            has_sample_sizes = any_n
+            missing_union.add("sample_sizes" if any_p else "p_value")
+
+    ordered_missing: list[str] = [
+        key for key in ("p_value", "cohens_d", "sample_sizes") if key in missing_union
+    ]
+
+    # Cohort imbalance (`balance_ratio` / `is_imbalanced`) is intentionally kept
+    # in the guard payload and critic prompt without a regex output check:
+    # prose validators over-reject valid paraphrases across languages.
+    has_supported_significant = any(
+        _is_assessed_guard(item) and item.is_significant and not item.is_underpowered
+        for item in guards
+    )
+    claims_forbidden = not has_supported_significant
     forbidden_claims = _detect_forbidden_claims(text) if claims_forbidden else []
 
-    passed = (not missing_items) and (not forbidden_claims)
+    passed = (not ordered_missing) and (not forbidden_claims)
     return CriticOutputCheck(
         passed=passed,
         has_p_value=has_p_value,
         has_cohens_d=has_cohens_d,
         has_sample_sizes=has_sample_sizes,
-        missing_items=missing_items,
+        missing_items=ordered_missing,
         forbidden_claims=forbidden_claims,
     )
 
 
 def format_critic_correction_prompt(
-    guard: StatisticalGuardResult,
+    guard: StatisticalGuardResult | Sequence[StatisticalGuardResult],
     check: CriticOutputCheck,
 ) -> str:
     """Build the single corrective retry instruction naming exact missing items."""
+    guards = _normalize_guards(guard)
     problems: list[str] = []
     if check.missing_items:
         problems.append(f"Missing required citations: {', '.join(check.missing_items)}.")
@@ -353,115 +384,185 @@ def format_critic_correction_prompt(
         )
     problems_block = "\n".join(f"- {line}" for line in problems)
 
-    if guard.assessment_status == "descriptive":
+    if len(guards) == 1:
+        single = guards[0]
+        if single.assessment_status == "descriptive":
+            return (
+                "CORRECTION REQUIRED: Your previous response failed deterministic statistical "
+                "guardrail verification.\n"
+                f"{problems_block}\n\n"
+                "Rewrite the complete response in the SAME language as the user's question so that it:\n"
+                "- Presents the descriptive results faithfully (terms/weights, topics/terms, counts, or summary rows).\n"
+                "- Does NOT fabricate p-values or Cohen's d.\n"
+                "- Does NOT assert any cohort difference, statistical significance, correlation, or clinical signal "
+                "associated with depression."
+            )
+
+        if (
+            single.assessment_status == "cannot_assess"
+            or single.p_value is None
+            or single.effect_size_cohens_d is None
+        ):
+            return (
+                "CORRECTION REQUIRED: Your previous response failed deterministic statistical "
+                "guardrail verification.\n"
+                f"{problems_block}\n\n"
+                "Rewrite the complete response in the SAME language as the user's question so that it:\n"
+                "- Explains that statistical significance cannot be evaluated without a `subject_id` dimension.\n"
+                "- Does NOT fabricate p-values or Cohen's d.\n"
+                "- Does NOT assert any significant difference, correlation, or clinical signal associated with depression."
+            )
+
+        claim_rule = (
+            "Do NOT assert any significant difference, correlation, or clinical signal "
+            "associated with depression because the statistical guard forbids claims."
+            if (not single.is_significant) or single.is_underpowered
+            else "Keep any comparative claim strictly scoped to the observed metric."
+        )
+        d_line = (
+            f"- Cohen's d = {single.effect_size_cohens_d:.6g}\n"
+            if single.is_significant
+            else ""
+        )
         return (
             "CORRECTION REQUIRED: Your previous response failed deterministic statistical "
             "guardrail verification.\n"
             f"{problems_block}\n\n"
-            "Rewrite the complete response in the SAME language as the user's question so that it:\n"
-            "- Presents the descriptive results faithfully (terms/weights, topics/terms, counts, or summary rows).\n"
-            "- Does NOT fabricate p-values or Cohen's d.\n"
-            "- Does NOT assert any cohort difference, statistical significance, correlation, or clinical signal "
-            "associated with depression."
+            "Rewrite the complete response in the SAME language as the user's question so that it explicitly quotes:\n"
+            f"- sample_size_depressed = {single.sample_size_depressed} and "
+            f"sample_size_control = {single.sample_size_control}\n"
+            f"- p_value = {single.p_value:.6g}\n"
+            f"{d_line}"
+            f"{claim_rule}"
         )
 
-    if guard.assessment_status == "cannot_assess" or guard.p_value is None or guard.effect_size_cohens_d is None:
-        return (
-            "CORRECTION REQUIRED: Your previous response failed deterministic statistical "
-            "guardrail verification.\n"
-            f"{problems_block}\n\n"
-            "Rewrite the complete response in the SAME language as the user's question so that it:\n"
-            "- Explains that statistical significance cannot be evaluated without a `subject_id` dimension.\n"
-            "- Does NOT fabricate p-values or Cohen's d.\n"
-            "- Does NOT assert any significant difference, correlation, or clinical signal associated with depression."
-        )
+    assessed_lines: list[str] = []
+    for idx, item in enumerate(guards, start=1):
+        if _is_assessed_guard(item):
+            assert item.p_value is not None
+            assert item.effect_size_cohens_d is not None
+            status_note = (
+                "SIGNIFICANT (scope claim to this metric)"
+                if item.is_significant and not item.is_underpowered
+                else "NON-SIGNIFICANT/UNDERPOWERED (do NOT claim difference for this metric)"
+            )
+            d_part = (
+                f", Cohen's d = {item.effect_size_cohens_d:.6g}"
+                if item.is_significant
+                else ""
+            )
+            assessed_lines.append(
+                f"- Result #{idx} (`{item.metric_name}`, {status_note}): "
+                f"sample_size_depressed = {item.sample_size_depressed}, "
+                f"sample_size_control = {item.sample_size_control}, "
+                f"p_value = {item.p_value:.6g}{d_part}"
+            )
+        else:
+            assessed_lines.append(
+                f"- Result #{idx} (`{item.metric_name}`, {item.assessment_status}): "
+                "present without fabricating p-values or Cohen's d, and make NO significance/causal claim."
+            )
 
-    claim_rule = (
-        "Do NOT assert any significant difference, correlation, or clinical signal "
-        "associated with depression because the statistical guard forbids claims."
-        if (not guard.is_significant) or guard.is_underpowered
-        else "Keep any comparative claim strictly scoped to the observed metric."
-    )
+    requirements = "\n".join(assessed_lines)
     return (
         "CORRECTION REQUIRED: Your previous response failed deterministic statistical "
-        "guardrail verification.\n"
+        "guardrail verification across the tool results.\n"
         f"{problems_block}\n\n"
-        "Rewrite the complete response in the SAME language as the user's question so that it explicitly quotes:\n"
-        f"- sample_size_depressed = {guard.sample_size_depressed} and "
-        f"sample_size_control = {guard.sample_size_control}\n"
-        f"- p_value = {guard.p_value:.6g}\n"
-        f"- Cohen's d = {guard.effect_size_cohens_d:.6g}\n"
-        f"{claim_rule}"
+        "Rewrite the complete response in the SAME language as the user's question, citing n, p, "
+        "and d for every significant result and at least one assessed result's n and p when all "
+        "assessed results are non-significant, obeying every result's verdict:\n"
+        f"{requirements}"
+    )
+
+
+def _format_guard_fallback_section(
+    guard: StatisticalGuardResult,
+    *,
+    heading: str,
+) -> str:
+    if (
+        guard.assessment_status == "cannot_assess"
+        or guard.p_value is None
+        or guard.effect_size_cohens_d is None
+    ):
+        if guard.assessment_status == "descriptive":
+            description = describe_descriptive_guard_it(
+                guard.metric_name, guard.descriptive_reason
+            )
+            return f"{heading}\n{description}"
+
+        reason = guard.cannot_assess_reason or "manca la dimensione per soggetto (`subject_id`)"
+        return (
+            f"{heading}\n"
+            f"Impossibile valutare la significatività statistica ({reason}); "
+            "non viene affermata alcuna differenza tra le coorti."
+        )
+
+    d_display = (
+        "0.0000"
+        if abs(guard.effect_size_cohens_d) < 1e-12
+        else f"{guard.effect_size_cohens_d:.6g}"
+    )
+    if guard.is_significant and not guard.is_underpowered:
+        return (
+            f"{heading}\n"
+            f"**Risultato statisticamente significativo** "
+            f"(test `{guard.test_used}`, alpha = {guard.alpha:g}):\n"
+            f"- Campione: {guard.sample_size_depressed} soggetti depressi, "
+            f"{guard.sample_size_control} controlli\n"
+            f"- p = {guard.p_value:.6g}, Cohen's d = {d_display}"
+        )
+
+    if guard.is_underpowered:
+        detail = f" ({guard.underpowered_reason})" if guard.underpowered_reason else ""
+        verdict_line = (
+            f"Risultato non conclusivo — campione insufficiente{detail}: "
+            "non viene affermata alcuna differenza tra le coorti."
+        )
+    else:
+        verdict_line = (
+            f"Risultato non conclusivo (nessuna significatività statistica, "
+            f"test `{guard.test_used}`, alpha = {guard.alpha:g}): "
+            "non viene affermata alcuna differenza tra le coorti."
+        )
+    return (
+        f"{heading}\n"
+        f"{verdict_line}\n"
+        f"- Campione: {guard.sample_size_depressed} soggetti depressi, "
+        f"{guard.sample_size_control} controlli\n"
+        f"- p = {guard.p_value:.6g}, Cohen's d = {d_display}"
     )
 
 
 def format_inconclusive_critic_fallback(
-    guard: StatisticalGuardResult,
+    guard: StatisticalGuardResult | Sequence[StatisticalGuardResult],
     check: CriticOutputCheck,
 ) -> str:
-    """Build deterministic Italian fallback text when the critic still fails after retry."""
-    reasons: list[str] = []
-    if check.missing_items:
-        reasons.append(f"elementi_mancanti={', '.join(check.missing_items)}")
-    if check.forbidden_claims:
-        reasons.append(f"affermazioni_vietate_rilevate (conteggio={len(check.forbidden_claims)})")
-    reason_summary = "; ".join(reasons) or "verifica dei vincoli statistici fallita"
+    """Build a readable Italian fallback summary when the critic still fails after retry."""
+    guards = _normalize_guards(guard)
+    closing_line = format_critic_fallback_closing_line(
+        has_missing_items=bool(check.missing_items),
+        has_forbidden_claims=bool(check.forbidden_claims),
+    )
 
-    extra_reason = guard.cannot_assess_reason or guard.descriptive_reason or guard.underpowered_reason
-    extra_line = f"- Dettaglio guardia: {extra_reason}\n" if extra_reason else ""
-
-    if guard.assessment_status == "cannot_assess" or guard.p_value is None or guard.effect_size_cohens_d is None:
-        if guard.assessment_status == "descriptive":
-            header = (
-                f"Risultato descrittivo per `{guard.metric_name}`: i dati rappresentano "
-                "statistiche descrittive senza test di significatività a livello di soggetto, "
-                "pertanto non viene affermata alcuna differenza di coorte o segnale clinico "
-                "associato alla depressione.\n"
-            )
-        else:
-            header = (
-                f"Impossibile valutare la significatività statistica per `{guard.metric_name}`: "
-                "manca la dimensione per soggetto (`subject_id`) nei risultati e la risposta del "
-                "modello non ha superato la verifica dei vincoli, pertanto non viene affermata "
-                "alcuna differenza o segnale clinico associato alla depressione.\n"
-            )
+    if not guards:
         return (
-            f"{header}"
-            f"- assessment_status: {guard.assessment_status}\n"
-            f"{extra_line}"
-            f"- Verifica fallita: {reason_summary}"
+            "Nessun risultato statistico disponibile per la sintesi finale.\n\n"
+            f"{closing_line}"
         )
 
-    d_display = (
-        "0.0000" if abs(guard.effect_size_cohens_d) < 1e-12 else f"{guard.effect_size_cohens_d:.6g}"
-    )
-    if guard.is_significant and not guard.is_underpowered:
-        return (
-            f"Risultato statisticamente significativo per `{guard.metric_name}` "
-            f"(test `{guard.test_used}`, alpha = {guard.alpha:g}): l'interpretazione "
-            "narrativa è stata omessa perché la risposta generata dal modello non ha "
-            "soddisfatto i requisiti di citazione dopo il tentativo di correzione.\n"
-            f"- sample_size_depressed: {guard.sample_size_depressed}\n"
-            f"- sample_size_control: {guard.sample_size_control}\n"
-            f"- p_value = {guard.p_value:.6g}\n"
-            f"- Cohen's d = {d_display}\n"
-            f"- assessment_status: {guard.assessment_status}, "
-            f"is_significant: {guard.is_significant}, is_underpowered: {guard.is_underpowered}\n"
-            f"{extra_line}"
-            f"- Verifica fallita: {reason_summary}"
+    if len(guards) == 1:
+        body = _format_guard_fallback_section(
+            guards[0],
+            heading=f"### `{guards[0].metric_name}`",
         )
+        return f"{body}\n\n{closing_line}"
 
-    return (
-        f"Risultato non conclusivo per `{guard.metric_name}`: la soglia statistica o la "
-        "verifica dei vincoli non è stata soddisfatta dopo il tentativo di correzione, "
-        "pertanto non viene affermata alcuna differenza comparativa o segnale clinico "
-        "associato alla depressione.\n"
-        f"- sample_size_depressed: {guard.sample_size_depressed}\n"
-        f"- sample_size_control: {guard.sample_size_control}\n"
-        f"- p_value = {guard.p_value:.6g}\n"
-        f"- Cohen's d = {d_display}\n"
-        f"- assessment_status: {guard.assessment_status}, "
-        f"is_significant: {guard.is_significant}, is_underpowered: {guard.is_underpowered}\n"
-        f"{extra_line}"
-        f"- Verifica fallita: {reason_summary}"
-    )
+    sections = [
+        _format_guard_fallback_section(
+            item,
+            heading=f"### Risultato {idx}: `{item.metric_name}`",
+        )
+        for idx, item in enumerate(guards, start=1)
+    ]
+    return "\n\n".join(sections) + f"\n\n{closing_line}"

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import json
+from collections.abc import Sequence
 from typing import Any
 
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
@@ -13,6 +13,11 @@ from src.ui.app import build_result_figure
 from streamlit.testing.v1 import AppTest
 
 APP_PATH = PROJECT_ROOT / "src" / "ui" / "app.py"
+
+
+class _ToolCallingFakeModel(FakeMessagesListChatModel):
+    def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> _ToolCallingFakeModel:
+        return self
 
 
 def test_build_result_figure_handles_cohort_and_empty_results() -> None:
@@ -31,19 +36,25 @@ def test_build_result_figure_handles_cohort_and_empty_results() -> None:
     assert len(fig.data) >= 1
 
 
-def _build_hitl_test_graph(executor_calls: list[str]) -> Any:
+def _build_hitl_test_graph(
+    executor_calls: list[str],
+    *,
+    final_agent_text: str = "Query executed after HITL.",
+) -> Any:
     settings = Settings(_env_file=None, hitl_cost_threshold=1.0)
-    router = FakeMessagesListChatModel(
+    router = _ToolCallingFakeModel(
         responses=[
             AIMessage(
-                content=json.dumps(
+                content="",
+                tool_calls=[
                     {
-                        "user_intent": "ad_hoc_sql",
-                        "answer_from_manifest": False,
-                        "sql_query": "SELECT subject_id, label, text FROM silver_posts",
+                        "name": "run_safe_sql",
+                        "args": {"query": "SELECT subject_id, label, text FROM silver_posts"},
+                        "id": "call_hitl_1",
                     }
-                )
-            )
+                ],
+            ),
+            AIMessage(content=final_agent_text),
         ]
     )
     critic = FakeMessagesListChatModel(
@@ -103,7 +114,10 @@ def test_ui_hitl_approve_flow_resumes_same_thread() -> None:
 
 def test_ui_hitl_reject_flow_never_executes_query() -> None:
     executor_calls: list[str] = []
-    graph = _build_hitl_test_graph(executor_calls)
+    graph = _build_hitl_test_graph(
+        executor_calls,
+        final_agent_text="Query execution cancelled by user.",
+    )
 
     at = AppTest.from_file(APP_PATH, default_timeout=10)
     at.session_state["agent_graph"] = graph

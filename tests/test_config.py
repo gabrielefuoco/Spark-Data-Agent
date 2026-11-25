@@ -28,6 +28,7 @@ def test_defaults_are_local_and_free(monkeypatch) -> None:
     assert settings.openrouter_api_key is None
     assert settings.ollama_base_url == "http://localhost:11434/v1"
     assert settings.spark_master == "local[*]"
+    assert settings.max_tool_calls == 20
     assert settings.conversation_token_budget == 800_000
 
 

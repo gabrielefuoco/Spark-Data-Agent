@@ -10,7 +10,7 @@ from pyspark.sql import SparkSession
 from scripts.generate_dev_sample import generate_synthetic_sample
 from src.config import Settings
 from src.lakehouse.paths import LakehousePaths
-from src.spark import build_spark_session, stop
+from src.spark import build_spark_session
 
 
 @pytest.fixture(scope="session")
@@ -23,7 +23,7 @@ def spark() -> Iterator[SparkSession]:
     )
     session = build_spark_session(settings, shuffle_partitions=2)
     yield session
-    stop(session)
+    session.stop()
 
 
 @pytest.fixture

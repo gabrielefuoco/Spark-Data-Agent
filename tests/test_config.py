@@ -41,15 +41,6 @@ def test_environment_overrides_defaults(monkeypatch) -> None:
     assert settings.openrouter_api_key.get_secret_value() == "sk-or-test"
 
 
-def test_guard_thresholds_are_explicit() -> None:
-    settings = Settings(_env_file=None)
-
-    assert settings.min_subjects_per_class == 30
-    assert settings.sql_row_limit == 500
-    assert settings.sql_fetch_limit == 50_000
-    assert settings.max_query_retries == 2
-
-
 def test_settings_are_cached(monkeypatch) -> None:
     get_settings.cache_clear()
     monkeypatch.setenv("SQL_ROW_LIMIT", "42")

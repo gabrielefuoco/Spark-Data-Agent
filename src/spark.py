@@ -42,12 +42,6 @@ def build_spark_session(
     return spark
 
 
-def stop(spark: SparkSession | None) -> None:
-    """Stop a SparkSession cleanly if one is active."""
-    if spark is not None:
-        spark.stop()
-
-
 def write_parquet_zstd(
     df: DataFrame,
     path: str | Path,

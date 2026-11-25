@@ -2,36 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal, TypedDict
+from typing import Annotated, Any, TypedDict
 
 from langchain_core.messages import AnyMessage, HumanMessage
 from langgraph.graph.message import add_messages
-
-UserIntent = Literal[
-    "catalog_metadata",
-    "lexical_analysis",
-    "circadian_study",
-    "ad_hoc_sql",
-    "general_conversation",
-]
-AgentStatus = Literal[
-    "running",
-    "awaiting_approval",
-    "completed",
-    "cancelled",
-    "failed",
-]
-
-
-class CostEstimate(TypedDict):
-    """Computational cost summary attached before the HITL approval gate."""
-
-    estimated_cost: float
-    threshold: float
-    triggers_hitl: bool
-    method: Literal["spark_explain", "ast_heuristic", "injected"]
-    reasons: list[str]
-    explain_plan: str | None
 
 
 class DataAgentState(TypedDict):

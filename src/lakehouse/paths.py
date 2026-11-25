@@ -36,7 +36,7 @@ class LakehousePaths:
     @classmethod
     def from_settings(cls, settings: Settings | None = None) -> LakehousePaths:
         cfg = settings or get_settings()
-        return cls(storage_root=str(cfg.lakehouse_root))
+        return cls(storage_root=str(cfg.spark_storage_uri))
 
     @property
     def bronze_posts(self) -> str:

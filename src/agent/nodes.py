@@ -50,7 +50,6 @@ from src.lakehouse.paths import LakehousePaths
 
 SqlExecutor = Callable[[str, Settings], dict[str, Any] | list[dict[str, Any]]]
 JobExecutor = Callable[[str, dict[str, Any], Settings], dict[str, Any] | list[dict[str, Any]]]
-CostEstimator = Callable[[str, Settings], dict[str, Any]]
 ManifestLoader = Callable[[], DatasetManifest]
 
 SUPPORTED_SPARK_JOBS: frozenset[str] = frozenset({"circadian_features", "topic_model"})
@@ -229,7 +228,6 @@ class AgentRuntimeDeps:
     sql_executor: SqlExecutor | None = None
     job_executor: JobExecutor | None = None
     spark: SparkSession | None = None
-    cost_estimator: CostEstimator | None = None
     manifest_loader: ManifestLoader | None = None
 
     def get_router_model(self) -> BaseChatModel:
@@ -280,8 +278,6 @@ class AgentRuntimeDeps:
 
     def estimate_cost(self, query: str) -> dict[str, Any]:
         """Estimate query or Spark job execution cost."""
-        if self.cost_estimator is not None:
-            return self.cost_estimator(query, self.settings)
         job_spec = decode_spark_job(query)
         if job_spec is not None:
             job_name, job_params = job_spec

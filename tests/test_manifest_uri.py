@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import os
-import socket
 import uuid
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
 
 import pyarrow.fs as pafs
 import pytest
@@ -23,24 +21,7 @@ from src.lakehouse.manifest import (
 )
 from src.lakehouse.paths import LakehousePaths
 from src.lakehouse.storage import StorageConfigurationError
-
-
-def _minio_endpoint_from_env() -> str:
-    return os.environ.get("S3_ENDPOINT_URL", "http://minio:9000").strip() or "http://minio:9000"
-
-
-def _is_endpoint_reachable(endpoint_url: str, timeout: float = 1.0) -> bool:
-    """Return True iff a TCP connection to the S3/MinIO endpoint succeeds."""
-    parsed = urlparse(endpoint_url if "://" in endpoint_url else f"http://{endpoint_url}")
-    host = parsed.hostname
-    if not host:
-        return False
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
+from tests.test_storage import _is_endpoint_reachable, _minio_endpoint_from_env
 
 
 def test_resolve_manifest_filesystem_maps_local_and_s3a_uris(tmp_path: Path) -> None:

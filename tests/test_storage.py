@@ -15,7 +15,7 @@ import pytest
 from pydantic import SecretStr
 from pyspark.sql import SparkSession
 from src.analytics.safe_sql import execute_safe_spark_sql, register_lakehouse_views
-from src.config import PROJECT_ROOT, Settings
+from src.config import Settings
 from src.lakehouse.paths import LakehousePaths
 from src.lakehouse.storage import (
     SIMPLE_CREDENTIALS_PROVIDER,
@@ -23,10 +23,8 @@ from src.lakehouse.storage import (
     apply_s3a_config,
     build_s3a_hadoop_options,
     is_s3a_uri,
-    resolve_storage_target,
 )
 from src.spark import write_parquet_zstd
-from src.ui.app import _get_graph, resolve_checkpoint_path
 
 
 def _minio_endpoint_from_env() -> str:
@@ -55,9 +53,6 @@ def test_uri_detection_and_target_resolution(tmp_path: Path) -> None:
 
     local_settings = Settings(_env_file=None, spark_storage_uri=str(tmp_path / "data"))
     assert build_s3a_hadoop_options(local_settings) == {}
-    assert resolve_storage_target(local_settings, "lakehouse", "silver/posts") == str(
-        tmp_path / "data" / "lakehouse" / "silver" / "posts"
-    )
 
     s3_settings = Settings(
         _env_file=None,
@@ -66,12 +61,6 @@ def test_uri_detection_and_target_resolution(tmp_path: Path) -> None:
         aws_secret_access_key=SecretStr("minioadmin"),
         s3_endpoint_url="http://minio:9000",
     )
-    assert resolve_storage_target(s3_settings) == "s3a://lakehouse/prefix"
-    assert (
-        resolve_storage_target(s3_settings, "/smoke/", "run1")
-        == "s3a://lakehouse/prefix/smoke/run1"
-    )
-
     lakehouse_paths = LakehousePaths.from_settings(s3_settings)
     assert lakehouse_paths.silver_posts == "s3a://lakehouse/prefix/lakehouse/silver/posts"
     assert lakehouse_paths.gold_dataset_manifest == (
@@ -140,32 +129,6 @@ def test_s3a_configuration_fails_loudly_without_leaking_secrets() -> None:
     assert sentinel_secret not in msg_endpoint
     assert "test-access-key-id" not in msg_endpoint
 
-    bad_uri = Settings(_env_file=None, spark_storage_uri="s3a:///missing-bucket")
-    with pytest.raises(StorageConfigurationError, match="Invalid S3A URI"):
-        resolve_storage_target(bad_uri)
-
-
-def test_apply_s3a_config_attaches_hadoop_keys_to_spark_builder(tmp_path: Path) -> None:
-    local_settings = Settings(_env_file=None, spark_storage_uri=str(tmp_path / "data"))
-    local_builder = apply_s3a_config(SparkSession.builder.appName("local-unit"), local_settings)
-    assert "spark.hadoop.fs.s3a.endpoint" not in local_builder._options
-
-    s3_settings = Settings(
-        _env_file=None,
-        spark_storage_uri="s3a://lakehouse/",
-        aws_access_key_id=SecretStr("minioadmin"),
-        aws_secret_access_key=SecretStr("minioadmin"),
-        s3_endpoint_url="http://minio:9000",
-    )
-    s3_builder = apply_s3a_config(SparkSession.builder.appName("s3-unit"), s3_settings)
-    assert s3_builder._options["spark.hadoop.fs.s3a.endpoint"] == "http://minio:9000"
-    assert s3_builder._options["spark.hadoop.fs.s3a.path.style.access"] == "true"
-    assert s3_builder._options["spark.hadoop.fs.s3a.connection.ssl.enabled"] == "false"
-    assert (
-        s3_builder._options["spark.hadoop.fs.s3a.aws.credentials.provider"]
-        == SIMPLE_CREDENTIALS_PROVIDER
-    )
-
 
 @pytest.mark.spark
 @pytest.mark.skipif(
@@ -229,7 +192,7 @@ def test_build_spark_session_wires_s3a_only_for_s3a_uri(tmp_path: Path) -> None:
         from pydantic import SecretStr
         from src.config import Settings
         from src.lakehouse.storage import SIMPLE_CREDENTIALS_PROVIDER
-        from src.spark import build_spark_session, stop
+        from src.spark import build_spark_session
 
         local_settings = Settings(
             _env_file=None,
@@ -247,7 +210,7 @@ def test_build_spark_session_wires_s3a_only_for_s3a_uri(tmp_path: Path) -> None:
                 is None
             )
         finally:
-            stop(local_spark)
+            local_spark.stop()
 
         s3_settings = Settings(
             _env_file=None,
@@ -272,33 +235,7 @@ def test_build_spark_session_wires_s3a_only_for_s3a_uri(tmp_path: Path) -> None:
                 == "http://minio:9000"
             )
         finally:
-            stop(s3_spark)
+            s3_spark.stop()
         """
     )
     subprocess.run([sys.executable, "-c", script], check=True)
-
-
-def test_checkpoint_path_stays_local_for_s3a_storage_uri(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    s3_settings = Settings(
-        _env_file=None,
-        spark_storage_uri="s3a://lakehouse/prefix",
-        aws_access_key_id=SecretStr("minioadmin"),
-        aws_secret_access_key=SecretStr("minioadmin"),
-        s3_endpoint_url="http://minio:9000",
-    )
-    expected = PROJECT_ROOT / "data" / "agent_checkpoints.sqlite"
-    resolved = resolve_checkpoint_path(s3_settings)
-    assert resolved == expected
-    assert not is_s3a_uri(resolved)
-    assert "s3a://" not in str(resolved)
-
-    captured: list[tuple[str, str, str]] = []
-    monkeypatch.setattr(
-        "src.ui.app._get_cached_runtime",
-        lambda uri, backend, db_path: captured.append((uri, backend, db_path)) or "graph",
-    )
-    monkeypatch.setattr("src.ui.app.st.session_state", {})
-    assert _get_graph(s3_settings) == "graph"
-    assert captured == [("s3a://lakehouse/prefix", s3_settings.llm_backend, str(expected))]

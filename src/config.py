@@ -65,11 +65,6 @@ class Settings(BaseSettings):
     hitl_cost_threshold: float = 1.0
     max_query_retries: int = 2
 
-    @property
-    def lakehouse_root(self) -> Path | str:
-        """`spark_storage_uri` as a path when it is local, as a URI otherwise."""
-        return self.spark_storage_uri
-
     @field_validator(
         "openrouter_api_key",
         "aws_access_key_id",

@@ -8,18 +8,18 @@ S3A options without leaking credentials or hitting EC2 instance metadata.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import overload
-from urllib.parse import urlparse
+from typing import TypeVar
 
 from pyspark import SparkConf
 from pyspark.sql import SparkSession
 
 from src.config import Settings, get_settings
-from src.lakehouse.paths import join_storage_path
 
 S3A_SCHEME = "s3a://"
 S3A_FILESYSTEM_IMPL = "org.apache.hadoop.fs.s3a.S3AFileSystem"
 SIMPLE_CREDENTIALS_PROVIDER = "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider"
+
+_SparkTarget = TypeVar("_SparkTarget", bound=SparkSession.Builder | SparkConf | SparkSession)
 
 
 class StorageConfigurationError(ValueError):
@@ -29,27 +29,6 @@ class StorageConfigurationError(ValueError):
 def is_s3a_uri(uri: str | Path) -> bool:
     """Return True when ``uri`` targets the Hadoop S3A filesystem."""
     return str(uri).strip().lower().startswith(S3A_SCHEME)
-
-
-def resolve_storage_target(settings: Settings | None = None, *parts: str) -> str:
-    """Resolve a lakehouse subpath from ``Settings.spark_storage_uri``.
-
-    Supports both ``s3a://bucket/prefix`` URIs (for local MinIO or S3-compatible
-    object stores) and local filesystem paths without caller-side branching.
-    """
-    cfg = settings or get_settings()
-    raw = str(cfg.spark_storage_uri).strip()
-    if not raw:
-        raise StorageConfigurationError("SPARK_STORAGE_URI must not be empty.")
-
-    if is_s3a_uri(raw):
-        parsed = urlparse(raw)
-        if not parsed.netloc:
-            raise StorageConfigurationError(
-                f"Invalid S3A URI {raw!r}: expected 's3a://<bucket>[/prefix]'."
-            )
-
-    return join_storage_path(raw, *parts)
 
 
 def resolve_s3_connection(
@@ -114,31 +93,10 @@ def build_s3a_hadoop_options(settings: Settings | None = None) -> dict[str, str]
     }
 
 
-@overload
 def apply_s3a_config(
-    target: SparkSession.Builder,
+    target: _SparkTarget,
     settings: Settings | None = None,
-) -> SparkSession.Builder: ...
-
-
-@overload
-def apply_s3a_config(
-    target: SparkConf,
-    settings: Settings | None = None,
-) -> SparkConf: ...
-
-
-@overload
-def apply_s3a_config(
-    target: SparkSession,
-    settings: Settings | None = None,
-) -> SparkSession: ...
-
-
-def apply_s3a_config(
-    target: SparkSession.Builder | SparkConf | SparkSession,
-    settings: Settings | None = None,
-) -> SparkSession.Builder | SparkConf | SparkSession:
+) -> _SparkTarget:
     """Attach S3A Hadoop options from ``Settings`` to a Spark builder, conf, or session."""
     options = build_s3a_hadoop_options(settings)
     if not options:
@@ -146,7 +104,7 @@ def apply_s3a_config(
 
     if isinstance(target, SparkSession.Builder):
         for key, value in options.items():
-            target = target.config(f"spark.hadoop.{key}", value)
+            target.config(f"spark.hadoop.{key}", value)
         return target
 
     if isinstance(target, SparkConf):

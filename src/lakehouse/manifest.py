@@ -80,6 +80,7 @@ def build_dataset_manifest(
     output_path: str | Path,
     *,
     settings: Settings | None = None,
+    storage_volumes: dict[str, Any] | None = None,
 ) -> DatasetManifest:
     """Compute manifest statistics via Spark aggregations and write JSON."""
     class_rows = (
@@ -131,17 +132,19 @@ def build_dataset_manifest(
         max_date=max(max_dates).isoformat() if max_dates else None,
         quarantine_count=quarantine_count,
         quarantine_by_reason=quarantine_by_reason,
+        storage_volumes=dict(storage_volumes) if storage_volumes is not None else {},
         generated_at=datetime.now(UTC).isoformat(),
     )
 
-    fs, fs_path = resolve_manifest_filesystem(output_path, settings=settings)
-    if isinstance(fs, pafs.LocalFileSystem):
-        parent = str(Path(fs_path).parent)
-        if parent not in {"", "."}:
-            fs.create_dir(parent, recursive=True)
-    payload = (manifest.model_dump_json(indent=2) + "\n").encode("utf-8")
-    with fs.open_output_stream(fs_path) as stream:
-        stream.write(payload)
+    payload_text = manifest.model_dump_json(indent=2) + "\n"
+    if is_s3a_uri(output_path):
+        fs, fs_path = resolve_manifest_filesystem(output_path, settings=settings)
+        with fs.open_output_stream(fs_path) as stream:
+            stream.write(payload_text.encode("utf-8"))
+    else:
+        out_path = Path(output_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(payload_text, encoding="utf-8")
     return manifest
 
 
@@ -152,7 +155,10 @@ def load_manifest(
 ) -> DatasetManifest:
     """Load the precomputed manifest JSON without starting or touching Spark."""
     target = manifest_path or LakehousePaths.from_settings(settings).gold_dataset_manifest
-    fs, fs_path = resolve_manifest_filesystem(target, settings=settings)
-    with fs.open_input_stream(fs_path) as stream:
-        raw_json = stream.readall().decode("utf-8")
+    if is_s3a_uri(target):
+        fs, fs_path = resolve_manifest_filesystem(target, settings=settings)
+        with fs.open_input_stream(fs_path) as stream:
+            raw_json = stream.readall().decode("utf-8")
+    else:
+        raw_json = Path(target).read_text(encoding="utf-8")
     return DatasetManifest.model_validate_json(raw_json)

@@ -82,12 +82,8 @@ def get_clinical_stopwords() -> list[str]:
     """
     default_words = StopWordsRemover.loadDefaultStopWords("english")
     filtered = [w for w in default_words if w.lower() not in PRESERVED_CLINICAL_TOKENS]
-    seen = set(filtered)
-    for fragment in _CONTRACTION_FRAGMENTS:
-        if fragment not in seen and fragment not in PRESERVED_CLINICAL_TOKENS:
-            filtered.append(fragment)
-            seen.add(fragment)
-    return filtered
+    excluded = PRESERVED_CLINICAL_TOKENS | set(filtered)
+    return filtered + [f for f in _CONTRACTION_FRAGMENTS if f not in excluded]
 
 
 def build_nlp_pipeline(
@@ -141,14 +137,11 @@ def extract_topic_terms(model: PipelineModel, *, top_n: int = 10) -> DataFrame:
     cv_model = next(s for s in model.stages if isinstance(s, CountVectorizerModel))
     lda_model = next(s for s in model.stages if isinstance(s, LDAModel))
 
-    spark = lda_model.describeTopics(maxTermsPerTopic=top_n).sparkSession
-    vocab = cv_model.vocabulary
-    vocab_df = spark.createDataFrame(
-        [(idx, term) for idx, term in enumerate(vocab)],
+    topics_raw = lda_model.describeTopics(maxTermsPerTopic=top_n)
+    vocab_df = topics_raw.sparkSession.createDataFrame(
+        [(idx, term) for idx, term in enumerate(cv_model.vocabulary)],
         schema="term_index INT, term STRING",
     )
-
-    topics_raw = lda_model.describeTopics(maxTermsPerTopic=top_n)
     exploded = topics_raw.select(
         F.col("topic").cast(IntegerType()).alias("topic"),
         F.posexplode(F.arrays_zip(F.col("termIndices"), F.col("termWeights"))).alias(

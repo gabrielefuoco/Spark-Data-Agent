@@ -7,7 +7,6 @@ as ZSTD Parquet, alongside ``gold_dataset_manifest.json`` with storage volumes.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +28,7 @@ from src.lakehouse.manifest import (
     resolve_manifest_filesystem,
 )
 from src.lakehouse.paths import LakehousePaths, join_storage_path
+from src.lakehouse.storage import is_s3a_uri
 from src.spark import write_parquet_zstd
 
 
@@ -40,6 +40,14 @@ def _sibling_topics_path(lexical_output_path: str | Path) -> str:
 
 def _measure_uri_bytes(uri: str, *, settings: Settings | None = None) -> int:
     """Sum byte sizes of all files under a local path or ``s3a://`` prefix without Spark."""
+    if not is_s3a_uri(uri):
+        root = Path(uri)
+        if not root.exists():
+            return 0
+        if root.is_file():
+            return root.stat().st_size
+        return sum(p.stat().st_size for p in root.rglob("*") if p.is_file())
+
     fs, fs_path = resolve_manifest_filesystem(uri, settings=settings)
     info = fs.get_file_info(fs_path)
     if info.type == pafs.FileType.NotFound:
@@ -78,33 +86,6 @@ def compute_lakehouse_storage_volumes(
         "by_layer": by_layer,
         "by_table": by_table,
     }
-
-
-def _write_manifest_with_volumes(
-    manifest: DatasetManifest,
-    output_path: str | Path,
-    storage_volumes: dict[str, Any],
-    *,
-    settings: Settings | None = None,
-) -> DatasetManifest:
-    """Write ``gold_dataset_manifest.json`` including precomputed storage volumes.
-
-    Returns the augmented manifest rather than nothing: the object a caller gets
-    back has to equal the one a later ``load_manifest()`` reads, otherwise the
-    in-memory and on-disk versions drift apart and nothing notices.
-    """
-    payload = manifest.model_dump(mode="json")
-    payload["storage_volumes"] = storage_volumes
-    augmented = DatasetManifest.model_validate(payload)
-    raw_bytes = (json.dumps(payload, indent=2) + "\n").encode("utf-8")
-    fs, fs_path = resolve_manifest_filesystem(output_path, settings=settings)
-    if isinstance(fs, pafs.LocalFileSystem):
-        parent = str(Path(fs_path).parent)
-        if parent not in {"", "."}:
-            fs.create_dir(parent, recursive=True)
-    with fs.open_output_stream(fs_path) as stream:
-        stream.write(raw_bytes)
-    return augmented
 
 
 def build_user_longitudinal_features(
@@ -204,22 +185,16 @@ def build_gold(
             top_n_ngrams=top_n_ngrams,
             top_n_terms=top_n_terms,
         )
+        storage_volumes = compute_lakehouse_storage_volumes(resolved, settings=settings)
         manifest = build_dataset_manifest(
             silver_df,
             quarantine_df,
             resolved.gold_dataset_manifest,
             settings=settings,
+            storage_volumes=storage_volumes,
         )
     finally:
         silver_df.unpersist()
-
-    storage_volumes = compute_lakehouse_storage_volumes(resolved, settings=settings)
-    manifest = _write_manifest_with_volumes(
-        manifest,
-        resolved.gold_dataset_manifest,
-        storage_volumes,
-        settings=settings,
-    )
 
     return (
         spark.read.parquet(resolved.gold_user_longitudinal_features),

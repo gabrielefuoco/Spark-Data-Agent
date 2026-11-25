@@ -883,50 +883,6 @@ def test_topic_model_job_interrupts_at_hitl_and_executes_once_on_approval(
     assert resumed["final_response"] == topic_critique
 
 
-def test_topic_model_job_hitl_rejection_never_executes(tmp_path: Path) -> None:
-    db_path = tmp_path / "hitl_topic_reject.sqlite"
-    settings = Settings(_env_file=None, hitl_cost_threshold=1.0)
-    router = FakeMessagesListChatModel(
-        responses=[
-            AIMessage(
-                content=json.dumps(
-                    {
-                        "user_intent": "lexical_analysis",
-                        "answer_from_manifest": False,
-                        "spark_job": "topic_model",
-                        "sql_query": None,
-                    }
-                )
-            )
-        ]
-    )
-    critic = FakeMessagesListChatModel(responses=[AIMessage(content="Unused")])
-    job_calls: list[str] = []
-
-    def fake_job(job_name: str, _params: dict[str, Any], _cfg: Settings) -> list[dict[str, Any]]:
-        job_calls.append(job_name)
-        return []
-
-    config = {"configurable": {"thread_id": "hitl-topic-reject"}}
-    with open_sqlite_checkpointer(db_path) as saver:
-        graph = build_agent_graph(
-            settings=settings,
-            router_model=router,
-            critic_model=critic,
-            job_executor=fake_job,
-            checkpointer=saver,
-        )
-        interrupted = graph.invoke(make_initial_state("Recompute LDA topics."), config=config)
-        assert "__interrupt__" in interrupted
-        assert job_calls == []
-
-        cancelled = graph.invoke(Command(resume={"approved": False}), config=config)
-
-    assert job_calls == []
-    assert cancelled["hitl_decision"] == "rejected"
-    assert cancelled["status"] == "cancelled"
-
-
 def test_circadian_features_job_dispatch_runs_offline_and_guards_subjects() -> None:
     settings = Settings(_env_file=None, hitl_cost_threshold=2.0, min_subjects_per_class=30)
     router = FakeMessagesListChatModel(

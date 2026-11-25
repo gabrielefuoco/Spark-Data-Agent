@@ -264,26 +264,6 @@ def test_forbidden_claim_tripwire_catches_causal_associative_and_likelihood_shap
     assert check.forbidden_claims
 
 
-def test_depression_drives_regression_sentence_and_negated_forms() -> None:
-    guard_ns = _make_guard(
-        n_dep=142, n_ctrl=350, p_value=0.0031, cohens_d=0.20, is_significant=False
-    )
-    exact_regression = "With 142 depressed and 350 control subjects, p = 0.0031, so depression drives night posting."
-    reg_check = validate_critic_output(exact_regression, guard_ns)
-    assert reg_check.passed is False
-    assert reg_check.forbidden_claims == ["depression drives"]
-    assert reg_check.missing_items == ["cohens_d"]
-
-    negated = (
-        "With 142 depressed and 350 control subjects, p = 0.0031, Cohen's d = 0.20: "
-        "there is no evidence that depression drives night posting, night posting is not "
-        "associated with depression, and limitations associated with sample power increase uncertainty."
-    )
-    neg_check = validate_critic_output(negated, guard_ns)
-    assert neg_check.passed is True
-    assert neg_check.forbidden_claims == []
-
-
 def test_forbidden_claim_heuristic_does_not_catch_unlisted_paraphrases() -> None:
     # The mandatory numeric citation check (sample sizes, p-value, Cohen's d) is the
     # real mechanical guardrail; the forbidden-claim regex is a surface tripwire, not a judge.

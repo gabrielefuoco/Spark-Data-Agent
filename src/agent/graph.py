@@ -18,7 +18,6 @@ from pyspark.sql import SparkSession
 from src.agent.nodes import (
     SUPPORTED_SPARK_JOBS,
     AgentRuntimeDeps,
-    CostEstimator,
     JobExecutor,
     ManifestLoader,
     SqlExecutor,
@@ -34,7 +33,6 @@ from src.config import Settings, get_settings
 
 __all__ = [
     "SUPPORTED_SPARK_JOBS",
-    "CostEstimator",
     "JobExecutor",
     "ManifestLoader",
     "SqlExecutor",
@@ -77,15 +75,14 @@ def build_agent_graph(
     sql_executor: SqlExecutor | None = None,
     job_executor: JobExecutor | None = None,
     spark: SparkSession | None = None,
-    cost_estimator: CostEstimator | None = None,
     manifest_loader: ManifestLoader | None = None,
     checkpointer: BaseCheckpointSaver[Any] | None = None,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     """Compile the cyclic LangGraph ``StateGraph`` for lakehouse analytics.
 
-    Dependencies (chat models, Spark/SQL executor, Spark job executor, cost
-    estimator, manifest loader, SQLite checkpointer) are injected so offline
-    tests never touch networked LLMs or start a JVM SparkSession.
+    Dependencies (chat models, Spark/SQL executor, Spark job executor,
+    manifest loader, SQLite checkpointer) are injected so offline tests never
+    touch networked LLMs or start a JVM SparkSession.
     """
     cfg = settings or get_settings()
     deps = AgentRuntimeDeps(
@@ -95,7 +92,6 @@ def build_agent_graph(
         sql_executor=sql_executor,
         job_executor=job_executor,
         spark=spark,
-        cost_estimator=cost_estimator,
         manifest_loader=manifest_loader,
     )
     nodes = build_agent_nodes(deps)

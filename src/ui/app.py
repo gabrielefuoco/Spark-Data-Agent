@@ -6,7 +6,6 @@ Run inside the dev container bound to ``0.0.0.0:8501``:
 
 from __future__ import annotations
 
-import math
 import uuid
 from pathlib import Path
 from typing import Any
@@ -18,18 +17,11 @@ import streamlit as st
 from langgraph.types import Command
 
 from src.agent.graph import build_agent_graph, create_sqlite_checkpointer
+from src.agent.nodes import _as_finite_float
 from src.agent.state import make_initial_state
 from src.config import PROJECT_ROOT, Settings, get_settings
 from src.lakehouse.manifest import DatasetManifest, load_manifest
 from src.spark import build_spark_session
-
-
-def _is_numeric(value: Any) -> bool:
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(float(value))
-    )
 
 
 def build_result_figure(
@@ -50,7 +42,8 @@ def build_result_figure(
     numeric_cols = [
         col
         for col in df.columns
-        if col not in {"label", "year"} and any(_is_numeric(v) for v in df[col].tolist())
+        if col not in {"label", "year"}
+        and any(_as_finite_float(v) is not None for v in df[col].tolist())
     ]
 
     if "label" in df.columns and numeric_cols:

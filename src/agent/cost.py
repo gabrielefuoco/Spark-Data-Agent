@@ -17,7 +17,11 @@ from pyspark.errors import AnalysisException, ParseException
 from pyspark.sql import SparkSession
 from sqlglot import exp
 
-from src.analytics.safe_sql import SafeSQLError, map_spark_analysis_exception
+from src.analytics.safe_sql import (
+    SafeSQLError,
+    map_spark_analysis_exception,
+    register_lakehouse_views,
+)
 from src.config import Settings, get_settings
 
 _TABLE_BASE_COSTS: dict[str, float] = {
@@ -149,6 +153,11 @@ def estimate_sql_cost(
 
     buffer = io.StringIO()
     try:
+        # EXPLAIN resolves the relation too, so the lakehouse views must exist
+        # before the estimate runs. Explaining a query that names a Silver or Gold
+        # table failed here with TABLE_NOT_FOUND while the executor, which does
+        # register them, never got a chance to run.
+        register_lakehouse_views(spark, settings=cfg)
         df = spark.sql(query)
         with contextlib.redirect_stdout(buffer):
             df.explain(mode="cost")

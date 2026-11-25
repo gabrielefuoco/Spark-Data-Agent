@@ -7,13 +7,15 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+import pytest
 from langchain_core.language_models.fake_chat_models import (
     FakeMessagesListChatModel,
     GenericFakeChatModel,
 )
 from langchain_core.messages import AIMessage, BaseMessage
 from langgraph.types import Command
-from src.agent.cost import estimate_job_cost
+from pyspark.sql import SparkSession
+from src.agent.cost import estimate_job_cost, estimate_sql_cost
 from src.agent.critic_check import validate_critic_output
 from src.agent.graph import build_agent_graph, open_sqlite_checkpointer
 from src.agent.guards import CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS, StatisticalGuardResult
@@ -1224,3 +1226,30 @@ def test_nonsignificant_underpowered_and_cannot_assess_never_ship_significance_c
     check_ca = validate_critic_output(res_ca["final_response"], guard_ca)
     assert check_ca.passed is True
     assert check_ca.forbidden_claims == []
+
+
+@pytest.mark.spark
+def test_cost_estimation_registers_lakehouse_views_before_explaining(
+    spark: SparkSession,
+    lakehouse_env: tuple,
+) -> None:
+    """EXPLAIN resolves relations, so the estimate must register the views too.
+
+    Regression: a plan naming `gold_user_longitudinal_features` raised
+    TABLE_NOT_FOUND here, before the executor (which does register views) could
+    run, and the retry loop then repeated the same failure until it gave up.
+    """
+    settings, paths, _ = lakehouse_env
+    rows = [(f"subject{index:03d}", index % 2, 10 + index, 0.25) for index in range(6)]
+    spark.createDataFrame(
+        rows, "subject_id STRING, label INT, post_count INT, night_post_ratio DOUBLE"
+    ).write.mode("overwrite").parquet(str(paths.gold_user_longitudinal_features))
+
+    estimate = estimate_sql_cost(
+        "SELECT subject_id, label, night_post_ratio FROM gold_user_longitudinal_features",
+        settings=settings,
+        spark=spark,
+    )
+
+    assert estimate["method"] == "spark_explain"
+    assert estimate["estimated_cost"] >= 0.0

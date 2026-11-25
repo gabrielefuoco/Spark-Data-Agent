@@ -14,16 +14,25 @@ LAKEHOUSE_SCHEMA_GUIDE = """Available Spark SQL lakehouse views (SELECT/WITH/UNI
      first_post_at (TIMESTAMP), last_post_at (TIMESTAMP), span_days (INT),
      active_days (BIGINT), posts_per_active_day (DOUBLE),
      mean_text_length (DOUBLE), stddev_text_length (DOUBLE),
-     night_post_count (BIGINT), night_post_ratio (DOUBLE)
+     night_post_count (BIGINT), night_post_ratio (DOUBLE),
+     session_count (BIGINT), mean_inter_post_gap_seconds (DOUBLE),
+     mean_night_post_rolling_30d (DOUBLE), mean_verbosity_zscore (DOUBLE),
+     max_abs_verbosity_zscore (DOUBLE)
 2. `gold_cohort_lexical_matrix` (pre-aggregated n-grams per cohort):
    - label (INT: 1=depressed, 0=control), ngram_type (STRING: 'unigram'|'bigram'),
-     ngram (STRING), frequency (BIGINT), relative_frequency (DOUBLE)
-3. `silver_posts` (atomic posts, 1 row per post, partitioned by label and year — expensive full scan):
+     ngram (STRING), frequency (BIGINT), relative_frequency (DOUBLE),
+     idf_weight (DOUBLE), tfidf_weight (DOUBLE), tfidf_rank (INT)
+3. `gold_cohort_topic_matrix` (LDA topics per cohort):
+   - label (INT), topic (INT), mean_topic_probability (DOUBLE),
+     document_count (BIGINT), top_terms (STRING)
+4. `silver_posts` (atomic posts, 1 row per post, partitioned by label and year — expensive full scan):
    - subject_id (STRING), title (STRING), text (STRING), info (STRING),
      date (TIMESTAMP), year (INT), label (INT: 1=depressed, 0=control)
-4. `silver_quarantine` (rejected rows from ETL):
+5. `silver_quarantine` (rejected rows from ETL):
    - subject_id (STRING), title (STRING), raw_date (STRING), info (STRING),
-     text (STRING), label (INT), _rejection_reason (STRING)"""
+     text (STRING), label (INT), _rejection_reason (STRING)
+
+Only the columns listed here exist. Never invent a column name."""
 
 ROUTER_SYSTEM_PROMPT = f"""You are the Intent Router and Spark SQL Query Planner for the eRISK depression lakehouse.
 

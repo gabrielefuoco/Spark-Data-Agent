@@ -13,6 +13,7 @@ from langchain_core.language_models.fake_chat_models import (
 )
 from langchain_core.messages import AIMessage, BaseMessage
 from langgraph.types import Command
+from src.agent.cost import estimate_job_cost
 from src.agent.graph import build_agent_graph, open_sqlite_checkpointer
 from src.agent.guards import CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS
 from src.agent.state import make_initial_state
@@ -706,3 +707,247 @@ def test_pseudo_replicated_single_subject_rows_are_caught_as_underpowered_in_gra
     assert guard["is_underpowered"] is True
     assert guard["is_significant"] is False
     assert "FORBIDDEN:" in result["critic_system_prompt"]
+
+
+def test_topic_model_job_interrupts_at_hitl_and_executes_once_on_approval(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "hitl_topic_model.sqlite"
+    settings = Settings(_env_file=None, hitl_cost_threshold=1.0)
+
+    topic_cost = estimate_job_cost("topic_model", {"k": 8, "max_iter": 20}, settings=settings)
+    circadian_cost = estimate_job_cost("circadian_features", settings=settings)
+    assert topic_cost["triggers_hitl"] is True
+    assert topic_cost["estimated_cost"] > settings.hitl_cost_threshold
+    assert circadian_cost["triggers_hitl"] is True
+    assert circadian_cost["estimated_cost"] > settings.hitl_cost_threshold
+    router = FakeMessagesListChatModel(
+        responses=[
+            AIMessage(
+                content=json.dumps(
+                    {
+                        "user_intent": "lexical_analysis",
+                        "answer_from_manifest": False,
+                        "spark_job": "topic_model",
+                        "job_params": {"k": 8, "max_iter": 20},
+                        "sql_query": None,
+                        "metric_name": "mean_topic_probability",
+                    }
+                )
+            )
+        ]
+    )
+    critic = RecordingFakeChatModel(
+        responses=[AIMessage(content="LDA topic recomputation completed after approval.")]
+    )
+    sql_calls: list[str] = []
+    job_calls: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_sql(query: str, _cfg: Settings) -> list[dict[str, Any]]:
+        sql_calls.append(query)
+        return []
+
+    def fake_job(job_name: str, params: dict[str, Any], _cfg: Settings) -> list[dict[str, Any]]:
+        job_calls.append((job_name, params))
+        return [
+            {
+                "label": 1,
+                "topic": 0,
+                "mean_topic_probability": 0.42,
+                "document_count": 40,
+                "top_terms": "feel alone, cant sleep",
+            },
+            {
+                "label": 0,
+                "topic": 0,
+                "mean_topic_probability": 0.11,
+                "document_count": 40,
+                "top_terms": "morning coffee, weekend hike",
+            },
+        ]
+
+    config = {"configurable": {"thread_id": "hitl-topic-model-approve"}}
+
+    with open_sqlite_checkpointer(db_path) as saver1:
+        graph1 = build_agent_graph(
+            settings=settings,
+            router_model=router,
+            critic_model=critic,
+            sql_executor=fake_sql,
+            job_executor=fake_job,
+            checkpointer=saver1,
+        )
+        interrupted = graph1.invoke(
+            make_initial_state("Run a full LDA topic model recomputation across cohorts."),
+            config=config,
+        )
+
+    assert "__interrupt__" in interrupted
+    assert len(interrupted["__interrupt__"]) == 1
+    assert interrupted["__interrupt__"][0].value["estimated_cost"] > 1.0
+    assert job_calls == []
+    assert sql_calls == []
+
+    with open_sqlite_checkpointer(db_path) as saver2:
+        graph2 = build_agent_graph(
+            settings=settings,
+            router_model=router,
+            critic_model=critic,
+            sql_executor=fake_sql,
+            job_executor=fake_job,
+            checkpointer=saver2,
+        )
+        snapshot = graph2.get_state(config)
+        assert snapshot.next == ("hitl_gate",)
+        assert "topic_model" in snapshot.values["generated_query"]
+
+        resumed = graph2.invoke(Command(resume={"approved": True}), config=config)
+
+    assert job_calls == [("topic_model", {"k": 8, "max_iter": 20})]
+    assert sql_calls == []
+    assert resumed["hitl_decision"] == "approved"
+    assert resumed["status"] == "completed"
+    assert resumed["final_response"] == "LDA topic recomputation completed after approval."
+
+
+def test_topic_model_job_hitl_rejection_never_executes(tmp_path: Path) -> None:
+    db_path = tmp_path / "hitl_topic_reject.sqlite"
+    settings = Settings(_env_file=None, hitl_cost_threshold=1.0)
+    router = FakeMessagesListChatModel(
+        responses=[
+            AIMessage(
+                content=json.dumps(
+                    {
+                        "user_intent": "lexical_analysis",
+                        "answer_from_manifest": False,
+                        "spark_job": "topic_model",
+                        "sql_query": None,
+                    }
+                )
+            )
+        ]
+    )
+    critic = FakeMessagesListChatModel(responses=[AIMessage(content="Unused")])
+    job_calls: list[str] = []
+
+    def fake_job(job_name: str, _params: dict[str, Any], _cfg: Settings) -> list[dict[str, Any]]:
+        job_calls.append(job_name)
+        return []
+
+    config = {"configurable": {"thread_id": "hitl-topic-reject"}}
+    with open_sqlite_checkpointer(db_path) as saver:
+        graph = build_agent_graph(
+            settings=settings,
+            router_model=router,
+            critic_model=critic,
+            job_executor=fake_job,
+            checkpointer=saver,
+        )
+        interrupted = graph.invoke(make_initial_state("Recompute LDA topics."), config=config)
+        assert "__interrupt__" in interrupted
+        assert job_calls == []
+
+        cancelled = graph.invoke(Command(resume={"approved": False}), config=config)
+
+    assert job_calls == []
+    assert cancelled["hitl_decision"] == "rejected"
+    assert cancelled["status"] == "cancelled"
+
+
+def test_circadian_features_job_dispatch_runs_offline_and_guards_subjects() -> None:
+    settings = Settings(_env_file=None, hitl_cost_threshold=2.0, min_subjects_per_class=30)
+    router = FakeMessagesListChatModel(
+        responses=[
+            AIMessage(
+                content=json.dumps(
+                    {
+                        "user_intent": "circadian_study",
+                        "answer_from_manifest": False,
+                        "spark_job": "circadian_features",
+                        "job_params": {"window_days": 30},
+                        "sql_query": None,
+                        "metric_name": "night_post_ratio",
+                    }
+                )
+            )
+        ]
+    )
+    critic = RecordingFakeChatModel(
+        responses=[AIMessage(content="Circadian job completed with significant cohort shift.")]
+    )
+    sql_calls: list[str] = []
+    job_calls: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_sql(query: str, _cfg: Settings) -> list[dict[str, Any]]:
+        sql_calls.append(query)
+        return []
+
+    def fake_job(job_name: str, params: dict[str, Any], _cfg: Settings) -> list[dict[str, Any]]:
+        job_calls.append((job_name, params))
+        return _cohort_rows(35)
+
+    graph = build_agent_graph(
+        settings=settings,
+        router_model=router,
+        critic_model=critic,
+        sql_executor=fake_sql,
+        job_executor=fake_job,
+    )
+    result = graph.invoke(
+        make_initial_state("Recompute circadian window features for all subjects.")
+    )
+
+    assert sql_calls == []
+    assert job_calls == [("circadian_features", {"window_days": 30})]
+    assert result["status"] == "completed"
+    assert result["sql_cost_estimate"]["estimated_cost"] > 1.0
+    assert result["statistical_validation"]["assessment_status"] == "assessed"
+    assert result["statistical_validation"]["is_significant"] is True
+
+
+def test_unknown_spark_job_triggers_retry_and_recovers() -> None:
+    settings = Settings(_env_file=None, hitl_cost_threshold=3.0, max_query_retries=2)
+    router = RecordingFakeChatModel(
+        responses=[
+            AIMessage(
+                content=json.dumps(
+                    {
+                        "user_intent": "lexical_analysis",
+                        "answer_from_manifest": False,
+                        "spark_job": "invalid_job_name",
+                        "sql_query": None,
+                    }
+                )
+            ),
+            AIMessage(
+                content=json.dumps(
+                    {
+                        "user_intent": "circadian_study",
+                        "answer_from_manifest": False,
+                        "spark_job": "circadian_features",
+                        "sql_query": None,
+                        "metric_name": "night_post_ratio",
+                    }
+                )
+            ),
+        ]
+    )
+    critic = RecordingFakeChatModel(responses=[AIMessage(content="Recovered to valid job.")])
+    job_calls: list[str] = []
+
+    def fake_job(job_name: str, _params: dict[str, Any], _cfg: Settings) -> list[dict[str, Any]]:
+        job_calls.append(job_name)
+        return _cohort_rows(30)
+
+    graph = build_agent_graph(
+        settings=settings,
+        router_model=router,
+        critic_model=critic,
+        job_executor=fake_job,
+    )
+    result = graph.invoke(make_initial_state("Compute circadian features."))
+
+    assert job_calls == ["circadian_features"]
+    assert result["retry_count"] == 1
+    assert result["status"] == "completed"
+    assert "UNKNOWN_SPARK_JOB" in str(router.recorded_invocations[1][1].content)

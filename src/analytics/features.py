@@ -121,3 +121,56 @@ def compute_post_window_features(
     )
 
     return with_zscore.drop("_post_ts_sec")
+
+
+def summarize_user_longitudinal_features(
+    posts_df: DataFrame,
+    *,
+    window_days: int = DEFAULT_WINDOW_DAYS,
+    session_gap_seconds: int = DEFAULT_SESSION_GAP_SECONDS,
+) -> DataFrame:
+    """Aggregate circadian, session, and rolling verbosity metrics per subject."""
+    windowed = compute_post_window_features(
+        posts_df,
+        window_days=window_days,
+        session_gap_seconds=session_gap_seconds,
+    ).withColumn("post_day", F.to_date("date"))
+
+    return (
+        windowed.groupBy("subject_id", "label")
+        .agg(
+            F.count("*").cast(LongType()).alias("post_count"),
+            F.min("date").alias("first_post_at"),
+            F.max("date").alias("last_post_at"),
+            F.datediff(F.max("date"), F.min("date")).cast(IntegerType()).alias("span_days"),
+            F.countDistinct("post_day").cast(LongType()).alias("active_days"),
+            F.avg("text_length").cast(DoubleType()).alias("mean_text_length"),
+            F.coalesce(F.stddev("text_length"), F.lit(0.0))
+            .cast(DoubleType())
+            .alias("stddev_text_length"),
+            F.sum("is_night_post").cast(LongType()).alias("night_post_count"),
+            F.max("session_index").cast(LongType()).alias("session_count"),
+            F.avg("inter_post_gap_seconds")
+            .cast(DoubleType())
+            .alias("mean_inter_post_gap_seconds"),
+            F.avg("night_post_rolling_30d")
+            .cast(DoubleType())
+            .alias("mean_night_post_rolling_30d"),
+            F.avg("verbosity_zscore").cast(DoubleType()).alias("mean_verbosity_zscore"),
+            F.max(F.abs(F.col("verbosity_zscore")))
+            .cast(DoubleType())
+            .alias("max_abs_verbosity_zscore"),
+        )
+        .withColumn(
+            "posts_per_active_day",
+            (F.col("post_count") / F.greatest(F.col("active_days"), F.lit(1))).cast(
+                DoubleType()
+            ),
+        )
+        .withColumn(
+            "night_post_ratio",
+            (F.col("night_post_count") / F.greatest(F.col("post_count"), F.lit(1))).cast(
+                DoubleType()
+            ),
+        )
+    )

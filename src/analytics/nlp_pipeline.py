@@ -17,12 +17,13 @@ from pyspark.ml.feature import (
     IDF,
     CountVectorizer,
     CountVectorizerModel,
+    IDFModel,
     NGram,
     RegexTokenizer,
     StopWordsRemover,
 )
 from pyspark.ml.functions import vector_to_array
-from pyspark.sql import DataFrame
+from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
 from pyspark.sql.types import DoubleType, IntegerType, LongType, StringType
 
@@ -70,6 +71,7 @@ class TopicModelResult:
     document_topics: DataFrame
     topic_terms: DataFrame
     cohort_lexical_matrix: DataFrame | None = None
+    cohort_ngram_tfidf: DataFrame | None = None
 
 
 def get_clinical_stopwords() -> list[str]:
@@ -201,6 +203,127 @@ def build_cohort_topic_matrix(
     )
 
 
+def _idf_table_from_models(
+    spark_df: DataFrame,
+    cv_model: CountVectorizerModel,
+    idf_model: IDFModel,
+    *,
+    ngram_type: str,
+) -> DataFrame:
+    """Materialize ``(ngram_type, ngram, idf)`` from fitted Spark ML models."""
+    vocab = cv_model.vocabulary
+    idf_values = idf_model.idf.toArray().tolist()
+    rows = [
+        (ngram_type, str(term), float(weight))
+        for term, weight in zip(vocab, idf_values, strict=True)
+    ]
+    return spark_df.sparkSession.createDataFrame(
+        rows,
+        schema="ngram_type STRING, ngram STRING, idf DOUBLE",
+    )
+
+
+def build_cohort_ngram_tfidf_matrix(
+    transformed_df: DataFrame,
+    model: PipelineModel,
+    *,
+    min_df: float = 2.0,
+    max_df: float = 0.95,
+    vocab_size: int = 5000,
+    top_n_ngrams: int | None = None,
+) -> DataFrame:
+    """Compute per-cohort unigram/bigram counts, relative frequencies, and TF-IDF weights."""
+    bigram_cv = next(s for s in model.stages if isinstance(s, CountVectorizerModel))
+    bigram_idf = next(s for s in model.stages if isinstance(s, IDFModel))
+    bigram_idf_df = _idf_table_from_models(
+        transformed_df, bigram_cv, bigram_idf, ngram_type="bigram"
+    )
+
+    try:
+        uni_cv = CountVectorizer(
+            inputCol="filtered_words",
+            outputCol="uni_raw_features",
+            minDF=min_df,
+            maxDF=max_df,
+            vocabSize=vocab_size,
+        ).fit(transformed_df)
+        uni_idf = IDF(
+            inputCol="uni_raw_features", outputCol="uni_features", minDocFreq=1
+        ).fit(uni_cv.transform(transformed_df))
+        unigram_idf_df = _idf_table_from_models(
+            transformed_df, uni_cv, uni_idf, ngram_type="unigram"
+        )
+    except Exception:
+        # Empty unigram vocabulary under strict minDF/maxDF falls back to 0.0 IDF.
+        unigram_idf_df = transformed_df.sparkSession.createDataFrame(
+            [], schema="ngram_type STRING, ngram STRING, idf DOUBLE"
+        )
+
+    idf_lookup = unigram_idf_df.unionByName(bigram_idf_df)
+
+    doc_counts = transformed_df.groupBy(
+        F.col("label").cast(IntegerType()).alias("label")
+    ).agg(F.count("*").cast(LongType()).alias("cohort_doc_count"))
+
+    unigrams = transformed_df.select(
+        F.col("label").cast(IntegerType()).alias("label"),
+        F.lit("unigram").alias("ngram_type"),
+        F.explode("filtered_words").alias("ngram"),
+    )
+    bigrams = transformed_df.select(
+        F.col("label").cast(IntegerType()).alias("label"),
+        F.lit("bigram").alias("ngram_type"),
+        F.explode("ngrams").alias("ngram"),
+    )
+
+    cohort_window = Window.partitionBy("label", "ngram_type")
+    counts_df = (
+        unigrams.unionByName(bigrams)
+        .filter(F.col("ngram").isNotNull() & (F.col("ngram") != F.lit("")))
+        .groupBy("label", "ngram_type", "ngram")
+        .agg(F.count("*").cast(LongType()).alias("frequency"))
+        .withColumn(
+            "relative_frequency",
+            (F.col("frequency") / F.sum("frequency").over(cohort_window)).cast(DoubleType()),
+        )
+    )
+
+    rank_window = Window.partitionBy("label", "ngram_type").orderBy(
+        F.col("tfidf_weight").desc(),
+        F.col("frequency").desc(),
+        F.col("ngram").asc(),
+    )
+    matrix_df = (
+        counts_df.join(F.broadcast(idf_lookup), on=["ngram_type", "ngram"], how="left")
+        .join(F.broadcast(doc_counts), on="label", how="left")
+        .withColumn("idf_weight", F.coalesce(F.col("idf"), F.lit(0.0)).cast(DoubleType()))
+        .withColumn(
+            "tfidf_weight",
+            (
+                F.col("frequency").cast(DoubleType())
+                * F.col("idf_weight")
+                / F.greatest(F.col("cohort_doc_count"), F.lit(1)).cast(DoubleType())
+            ).cast(DoubleType()),
+        )
+        .withColumn("tfidf_rank", F.row_number().over(rank_window).cast(IntegerType()))
+        .select(
+            "label",
+            "ngram_type",
+            "ngram",
+            "frequency",
+            "relative_frequency",
+            "idf_weight",
+            "tfidf_weight",
+            "tfidf_rank",
+        )
+    )
+
+    if top_n_ngrams is not None:
+        matrix_df = matrix_df.filter(F.col("tfidf_rank") <= F.lit(top_n_ngrams))
+
+    return matrix_df.orderBy("label", "ngram_type", "tfidf_rank")
+
+
 def fit_topic_model(
     posts_df: DataFrame,
     *,
@@ -211,6 +334,8 @@ def fit_topic_model(
     max_df: float = 0.95,
     vocab_size: int = 5000,
     top_n_terms: int = 10,
+    top_n_ngrams: int | None = None,
+    include_ngram_tfidf: bool = False,
     seed: int = 42,
 ) -> TopicModelResult:
     """Fit the Spark ML LDA pipeline and return model, document topics, and top terms."""
@@ -248,9 +373,20 @@ def fit_topic_model(
     )
 
     topic_terms = extract_topic_terms(model, top_n=top_n_terms)
+    has_label = "label" in document_topics.columns
     cohort_matrix = (
-        build_cohort_topic_matrix(document_topics, topic_terms)
-        if "label" in document_topics.columns
+        build_cohort_topic_matrix(document_topics, topic_terms) if has_label else None
+    )
+    cohort_ngram_tfidf = (
+        build_cohort_ngram_tfidf_matrix(
+            transformed,
+            model,
+            min_df=min_df,
+            max_df=max_df,
+            vocab_size=vocab_size,
+            top_n_ngrams=top_n_ngrams,
+        )
+        if include_ngram_tfidf and has_label
         else None
     )
 
@@ -259,4 +395,5 @@ def fit_topic_model(
         document_topics=document_topics,
         topic_terms=topic_terms,
         cohort_lexical_matrix=cohort_matrix,
+        cohort_ngram_tfidf=cohort_ngram_tfidf,
     )

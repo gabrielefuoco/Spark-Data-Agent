@@ -58,11 +58,13 @@ def test_nlp_pipeline_fits_extracts_bigrams_and_valid_topic_distributions(
 
     result = fit_topic_model(
         df,
-        k=8,
-        max_iter=20,
+        k=4,
+        max_iter=5,
         min_df=2.0,
         max_df=0.95,
         top_n_terms=5,
+        top_n_ngrams=5,
+        include_ngram_tfidf=True,
         seed=42,
     )
 
@@ -92,13 +94,20 @@ def test_nlp_pipeline_fits_extracts_bigrams_and_valid_topic_distributions(
     assert len(doc_rows) == len(corpus)
     for row in doc_rows:
         probs = row["topicDistribution"].toArray().tolist()
-        assert len(probs) == 8
+        assert len(probs) == 4
         assert all(p >= 0.0 for p in probs)
         assert sum(probs) == pytest.approx(1.0, abs=1e-6)
-        assert 0 <= row["dominant_topic"] < 8
+        assert 0 <= row["dominant_topic"] < 4
 
     # Cohort matrix aggregates by label and topic for Gold consumption.
     assert result.cohort_lexical_matrix is not None
     cohort_rows = result.cohort_lexical_matrix.collect()
     assert {r["label"] for r in cohort_rows} == {0, 1}
     assert all(r["top_terms"] for r in cohort_rows)
+
+    # Cohort n-gram TF-IDF matrix captures ranked unigrams and bigrams per cohort.
+    assert result.cohort_ngram_tfidf is not None
+    tfidf_rows = result.cohort_ngram_tfidf.collect()
+    assert {r["ngram_type"] for r in tfidf_rows} == {"unigram", "bigram"}
+    assert all(1 <= r["tfidf_rank"] <= 5 for r in tfidf_rows)
+    assert any(r["tfidf_weight"] > 0.0 for r in tfidf_rows)

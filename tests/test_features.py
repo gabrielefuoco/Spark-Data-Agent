@@ -9,7 +9,10 @@ import pytest
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import IntegerType, StringType, StructField, StructType, TimestampType
-from src.analytics.features import compute_post_window_features
+from src.analytics.features import (
+    compute_post_window_features,
+    summarize_user_longitudinal_features,
+)
 from src.spark import broadcast_join
 
 _POSTS_SCHEMA = StructType(
@@ -131,3 +134,13 @@ def test_compute_post_window_features_exact_values_and_30d_range_window(
     assert s2_last["rolling_30d_text_length_mean"] == pytest.approx(208.0 / 35.0)
     assert not math.isnan(s2_last["verbosity_zscore"])
     assert not math.isinf(s2_last["verbosity_zscore"])
+
+    # Per-subject summary derives directly from compute_post_window_features.
+    summary = summarize_user_longitudinal_features(df, window_days=30, session_gap_seconds=1800)
+    s1_summary = summary.filter(F.col("subject_id") == "s1").first()
+    assert s1_summary is not None
+    assert s1_summary["post_count"] == 4
+    assert s1_summary["night_post_count"] == 3
+    assert s1_summary["night_post_ratio"] == pytest.approx(0.75)
+    assert s1_summary["session_count"] == 3
+    assert s1_summary["max_abs_verbosity_zscore"] > 0.0

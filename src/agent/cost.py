@@ -25,6 +25,12 @@ _TABLE_BASE_COSTS: dict[str, float] = {
     "silver_quarantine": 0.3,
     "gold_user_longitudinal_features": 0.2,
     "gold_cohort_lexical_matrix": 0.2,
+    "gold_cohort_topic_matrix": 0.2,
+}
+
+_SPARK_JOB_COSTS: dict[str, tuple[float, str]] = {
+    "topic_model": (2.5, "spark_ml_lda_full_recompute (+2.50)"),
+    "circadian_features": (1.5, "spark_window_circadian_features (+1.50)"),
 }
 
 _SIZE_BYTES_PATTERN = re.compile(
@@ -180,4 +186,31 @@ def estimate_sql_cost(
         "method": "spark_explain",
         "reasons": reasons,
         "explain_plan": plan_text[:2000] if plan_text else None,
+    }
+
+
+def estimate_job_cost(
+    job_name: str,
+    params: dict[str, Any] | None = None,
+    *,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    """Estimate computational cost for non-SQL Spark jobs driving the HITL gate."""
+    cfg = settings or get_settings()
+    normalized = job_name.strip().lower()
+    base_cost, reason = _SPARK_JOB_COSTS.get(
+        normalized, (1.5, f"spark_job:{normalized} (+1.50)")
+    )
+    reasons = [f"spark_job:{normalized} (base={base_cost:.2f})", reason]
+    if params:
+        reasons.append(f"params={','.join(sorted(str(k) for k in params))}")
+
+    estimated = round(base_cost, 4)
+    return {
+        "estimated_cost": estimated,
+        "threshold": cfg.hitl_cost_threshold,
+        "triggers_hitl": estimated > cfg.hitl_cost_threshold,
+        "method": "ast_heuristic",
+        "reasons": reasons,
+        "explain_plan": None,
     }

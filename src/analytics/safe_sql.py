@@ -24,6 +24,7 @@ _LAKEHOUSE_VIEW_ATTRS: tuple[str, ...] = (
     "silver_quarantine",
     "gold_user_longitudinal_features",
     "gold_cohort_lexical_matrix",
+    "gold_cohort_topic_matrix",
 )
 LAKEHOUSE_VIEW_NAMES: frozenset[str] = frozenset(_LAKEHOUSE_VIEW_ATTRS)
 

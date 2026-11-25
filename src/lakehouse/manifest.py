@@ -8,10 +8,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import pyarrow.fs as pafs
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
@@ -35,6 +36,10 @@ class DatasetManifest(BaseModel):
     max_date: str | None
     quarantine_count: int
     quarantine_by_reason: dict[str, int]
+    # Bytes on disk per layer and per table, computed at ETL time so a "how big
+    # is the lakehouse" question never wakes Spark. Optional: manifests written
+    # before this field existed still load.
+    storage_volumes: dict[str, Any] = Field(default_factory=dict)
     generated_at: str
 
 

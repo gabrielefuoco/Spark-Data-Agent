@@ -22,8 +22,9 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import interrupt
 from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 
-from src.agent.cost import estimate_sql_cost
+from src.agent.cost import estimate_job_cost, estimate_sql_cost
 from src.agent.guards import (
     StatisticalGuardResult,
     SubjectObservation,
@@ -38,14 +39,30 @@ from src.agent.prompts import (
     format_manifest_answer,
 )
 from src.agent.state import DataAgentState
+from src.analytics.features import (
+    DEFAULT_SESSION_GAP_SECONDS,
+    DEFAULT_WINDOW_DAYS,
+    summarize_user_longitudinal_features,
+)
+from src.analytics.nlp_pipeline import fit_topic_model
 from src.analytics.safe_sql import SafeSQLError, execute_safe_spark_sql, validate_and_rewrite_sql
 from src.config import Settings, get_settings
 from src.lakehouse.manifest import DatasetManifest, load_manifest
 from src.lakehouse.paths import LakehousePaths
 
 SqlExecutor = Callable[[str, Settings], dict[str, Any] | list[dict[str, Any]]]
+JobExecutor = Callable[[str, dict[str, Any], Settings], dict[str, Any] | list[dict[str, Any]]]
 CostEstimator = Callable[[str, Settings], dict[str, Any]]
 ManifestLoader = Callable[[], DatasetManifest]
+
+SUPPORTED_SPARK_JOBS: frozenset[str] = frozenset({"circadian_features", "topic_model"})
+_SPARK_JOB_PREFIX = "SPARK_JOB:"
+_ROUTER_JOB_DISPATCH_ADDENDUM = (
+    "\n\nNon-SQL Spark job dispatch:\n"
+    "- When the user explicitly asks to recompute circadian/window features or fit/recompute "
+    "the Spark ML LDA topic model from raw Silver posts, set `sql_query: null` and specify "
+    '`"spark_job": "circadian_features" | "topic_model"` with optional `"job_params": {{...}}`.'
+)
 
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
 _EXCLUDED_METRIC_COLUMNS = frozenset(
@@ -100,6 +117,102 @@ def make_spark_sql_executor(
         }
 
     return _execute
+
+
+def encode_spark_job(job_name: str, params: dict[str, Any] | None = None) -> str:
+    """Serialize a non-SQL Spark job dispatch specification into ``generated_query``."""
+    payload = {"job": job_name.strip().lower(), "params": dict(params or {})}
+    return f"{_SPARK_JOB_PREFIX}{json.dumps(payload, sort_keys=True)}"
+
+
+def decode_spark_job(generated_query: str | None) -> tuple[str, dict[str, Any]] | None:
+    """Parse a serialized Spark job dispatch spec, or return ``None`` for SQL."""
+    if not isinstance(generated_query, str):
+        return None
+    stripped = generated_query.strip()
+    if not stripped.startswith(_SPARK_JOB_PREFIX):
+        return None
+    body = stripped[len(_SPARK_JOB_PREFIX) :].strip()
+    if not body:
+        return None
+    if body.startswith("{"):
+        parsed = json.loads(body)
+        if not isinstance(parsed, dict) or not parsed.get("job"):
+            return None
+        raw_params = parsed.get("params")
+        params = dict(raw_params) if isinstance(raw_params, dict) else {}
+        return str(parsed["job"]).strip().lower(), params
+    return body.lower(), {}
+
+
+def make_spark_job_executor(
+    spark: SparkSession,
+    *,
+    settings: Settings | None = None,
+    paths: LakehousePaths | None = None,
+) -> JobExecutor:
+    """Build a runtime Spark executor for non-SQL analytics jobs (circadian & LDA)."""
+
+    def _execute_job(job_name: str, params: dict[str, Any], cfg: Settings) -> dict[str, Any]:
+        resolved_settings = settings or cfg
+        resolved_paths = paths or LakehousePaths.from_settings(resolved_settings)
+        normalized = job_name.strip().lower()
+        if normalized not in SUPPORTED_SPARK_JOBS:
+            raise SafeSQLError(
+                "UNKNOWN_SPARK_JOB",
+                f"Unsupported Spark job {job_name!r}; expected one of {sorted(SUPPORTED_SPARK_JOBS)}.",
+                query=encode_spark_job(job_name, params),
+            )
+
+        silver_df = spark.read.parquet(str(resolved_paths.silver_posts))
+        if normalized == "circadian_features":
+            result_df = summarize_user_longitudinal_features(
+                silver_df,
+                window_days=int(params.get("window_days", DEFAULT_WINDOW_DAYS)),
+                session_gap_seconds=int(
+                    params.get("session_gap_seconds", DEFAULT_SESSION_GAP_SECONDS)
+                ),
+            ).limit(resolved_settings.sql_row_limit)
+        else:
+            combined = silver_df.select(
+                "label",
+                F.concat_ws(" ", F.coalesce(F.col("title"), F.lit("")), F.col("text")).alias(
+                    "combined_text"
+                ),
+            )
+            topic_result = fit_topic_model(
+                combined,
+                input_col="combined_text",
+                k=int(params.get("k", 8)),
+                max_iter=int(params.get("max_iter", 20)),
+                min_df=float(params.get("min_df", 2.0)),
+                max_df=float(params.get("max_df", 0.95)),
+                vocab_size=int(params.get("vocab_size", 5000)),
+                top_n_terms=int(params.get("top_n_terms", 10)),
+                seed=int(params.get("seed", 42)),
+            )
+            if topic_result.cohort_lexical_matrix is None:
+                raise SafeSQLError(
+                    "SPARK_JOB_ERROR",
+                    "Topic model job requires 'label' column on silver_posts.",
+                    query=encode_spark_job(job_name, params),
+                )
+            result_df = topic_result.cohort_lexical_matrix.limit(
+                resolved_settings.sql_row_limit
+            )
+
+        raw_rows = result_df.collect()
+        rows = [
+            {str(k): _to_json_value(v) for k, v in row.asDict(recursive=True).items()}
+            for row in raw_rows
+        ]
+        return {
+            "columns": list(result_df.columns),
+            "rows": rows,
+            "row_count": len(rows),
+        }
+
+    return _execute_job
 
 
 @contextmanager
@@ -346,6 +459,7 @@ def build_agent_graph(
     router_model: BaseChatModel | None = None,
     critic_model: BaseChatModel | None = None,
     sql_executor: SqlExecutor | None = None,
+    job_executor: JobExecutor | None = None,
     spark: SparkSession | None = None,
     cost_estimator: CostEstimator | None = None,
     manifest_loader: ManifestLoader | None = None,
@@ -353,9 +467,9 @@ def build_agent_graph(
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     """Compile the cyclic LangGraph ``StateGraph`` for lakehouse analytics.
 
-    Dependencies (chat models, Spark/SQL executor, cost estimator, manifest
-    loader, SQLite checkpointer) are injected so offline tests never touch
-    networked LLMs or start a JVM SparkSession.
+    Dependencies (chat models, Spark/SQL executor, Spark job executor, cost
+    estimator, manifest loader, SQLite checkpointer) are injected so offline
+    tests never touch networked LLMs or start a JVM SparkSession.
     """
     cfg = settings or get_settings()
 
@@ -386,9 +500,30 @@ def build_agent_graph(
 
         return _missing_spark
 
+    def _get_job_executor() -> JobExecutor:
+        if job_executor is not None:
+            return job_executor
+        if spark is not None:
+            return make_spark_job_executor(spark, settings=cfg)
+
+        def _missing_spark_job(
+            job_name: str, _params: dict[str, Any], _cfg: Settings
+        ) -> dict[str, Any]:
+            raise SafeSQLError(
+                "SPARK_UNAVAILABLE",
+                "No SparkSession or job executor is configured for Spark job execution.",
+                query=job_name,
+            )
+
+        return _missing_spark_job
+
     def _estimate_cost(query: str) -> dict[str, Any]:
         if cost_estimator is not None:
             return cost_estimator(query, cfg)
+        job_spec = decode_spark_job(query)
+        if job_spec is not None:
+            job_name, job_params = job_spec
+            return estimate_job_cost(job_name, job_params, settings=cfg)
         return estimate_sql_cost(query, settings=cfg, spark=spark)
 
     def _load_manifest() -> DatasetManifest:
@@ -409,7 +544,7 @@ def build_agent_graph(
 
         llm_response = _get_router_model().invoke(
             [
-                SystemMessage(content=ROUTER_SYSTEM_PROMPT),
+                SystemMessage(content=ROUTER_SYSTEM_PROMPT + _ROUTER_JOB_DISPATCH_ADDENDUM),
                 HumanMessage(content=planner_prompt),
             ]
         )
@@ -453,7 +588,15 @@ def build_agent_graph(
                 "messages": [AIMessage(content=answer)],
             }
 
-        if not is_retry and intent == "general_conversation" and not plan.get("sql_query"):
+        raw_job = plan.get("spark_job") or plan.get("job_name")
+        has_job = isinstance(raw_job, str) and bool(raw_job.strip())
+
+        if (
+            not is_retry
+            and intent == "general_conversation"
+            and not plan.get("sql_query")
+            and not has_job
+        ):
             reply = str(
                 plan.get("direct_response")
                 or "Ask me a question about the eRISK dataset, circadian rhythms, or lexical features."
@@ -467,6 +610,30 @@ def build_agent_graph(
                 "messages": [AIMessage(content=reply)],
             }
 
+        if has_job:
+            assert isinstance(raw_job, str)
+            raw_params = plan.get("job_params")
+            if raw_params is None:
+                raw_params = plan.get("params")
+            if raw_params is not None and not isinstance(raw_params, dict):
+                return {
+                    "user_intent": intent,
+                    "generated_query": None,
+                    "last_error": {
+                        "code": "INVALID_JOB_PARAMS",
+                        "message": "Spark job parameters must be a JSON object or null.",
+                        "query": raw_job,
+                    },
+                    "status": "running",
+                }
+            return {
+                "user_intent": intent,
+                "generated_query": encode_spark_job(raw_job, raw_params),
+                "analysis_metric": plan.get("metric_name"),
+                "last_error": None,
+                "status": "running",
+            }
+
         sql_query = plan.get("sql_query")
         if not isinstance(sql_query, str) or not sql_query.strip():
             return {
@@ -474,7 +641,7 @@ def build_agent_graph(
                 "generated_query": None,
                 "last_error": {
                     "code": "NO_QUERY_GENERATED",
-                    "message": "Planner did not produce a SQL SELECT query.",
+                    "message": "Planner did not produce a SQL SELECT query or Spark job.",
                     "query": None,
                 },
                 "status": "running",
@@ -490,6 +657,31 @@ def build_agent_graph(
 
     def ast_validator_and_cost(state: DataAgentState) -> dict[str, Any]:
         raw_query = state.get("generated_query") or ""
+        job_spec = decode_spark_job(raw_query)
+        if job_spec is not None:
+            job_name, job_params = job_spec
+            if job_name not in SUPPORTED_SPARK_JOBS:
+                return {
+                    "last_error": {
+                        "code": "UNKNOWN_SPARK_JOB",
+                        "message": (
+                            f"Unsupported Spark job {job_name!r}; "
+                            f"supported jobs: {sorted(SUPPORTED_SPARK_JOBS)}."
+                        ),
+                        "query": raw_query,
+                    },
+                    "sql_cost_estimate": None,
+                    "status": "running",
+                }
+            canonical = encode_spark_job(job_name, job_params)
+            cost_info = _estimate_cost(canonical)
+            return {
+                "generated_query": canonical,
+                "sql_cost_estimate": cost_info,
+                "last_error": None,
+                "status": "awaiting_approval" if cost_info.get("triggers_hitl") else "running",
+            }
+
         try:
             safe_sql = validate_and_rewrite_sql(raw_query, row_limit=cfg.sql_row_limit)
             cost_info = _estimate_cost(safe_sql)
@@ -558,6 +750,50 @@ def build_agent_graph(
                         "Verify filter predicates (label is 0 or 1) and table selection."
                     ),
                     "query": query,
+                },
+                "status": "running",
+            }
+
+        return {
+            "query_result": normalized,
+            "last_error": None,
+            "status": "running",
+        }
+
+    def execute_job(state: DataAgentState) -> dict[str, Any]:
+        raw_query = state.get("generated_query") or ""
+        job_spec = decode_spark_job(raw_query)
+        if job_spec is None:
+            return {
+                "last_error": {
+                    "code": "INVALID_JOB_SPEC",
+                    "message": "Missing or invalid Spark job specification.",
+                    "query": raw_query,
+                },
+                "query_result": None,
+                "status": "running",
+            }
+        job_name, job_params = job_spec
+        executor = _get_job_executor()
+        try:
+            raw_result = executor(job_name, job_params, cfg)
+            normalized = _normalize_query_result(raw_result)
+        except SafeSQLError as exc:
+            return {
+                "last_error": exc.to_dict(),
+                "query_result": None,
+                "status": "running",
+            }
+
+        if normalized["row_count"] == 0:
+            return {
+                "query_result": normalized,
+                "last_error": {
+                    "code": "EMPTY_RESULT",
+                    "message": (
+                        f"Spark job {job_name!r} executed successfully but returned 0 rows."
+                    ),
+                    "query": raw_query,
                 },
                 "status": "running",
             }
@@ -679,11 +915,15 @@ def build_agent_graph(
         cost_info = state.get("sql_cost_estimate") or {}
         if cost_info.get("triggers_hitl"):
             return "hitl_gate"
+        if decode_spark_job(state.get("generated_query")) is not None:
+            return "execute_job"
         return "execute_sql"
 
     def _route_after_hitl(state: DataAgentState) -> str:
         if state.get("hitl_decision") == "rejected" or state.get("status") == "cancelled":
             return END
+        if decode_spark_job(state.get("generated_query")) is not None:
+            return "execute_job"
         return "execute_sql"
 
     def _route_after_execute(state: DataAgentState) -> str:
@@ -698,6 +938,7 @@ def build_agent_graph(
     builder.add_node("ast_validator_and_cost", ast_validator_and_cost)
     builder.add_node("hitl_gate", hitl_gate)
     builder.add_node("execute_sql", execute_sql)
+    builder.add_node("execute_job", execute_job)
     builder.add_node("query_rewriter", query_rewriter)
     builder.add_node("statistical_guard", statistical_guard)
     builder.add_node("scientific_critic", scientific_critic)
@@ -720,6 +961,7 @@ def build_agent_graph(
         {
             "hitl_gate": "hitl_gate",
             "execute_sql": "execute_sql",
+            "execute_job": "execute_job",
             "query_rewriter": "query_rewriter",
             "handle_failure": "handle_failure",
         },
@@ -729,11 +971,21 @@ def build_agent_graph(
         _route_after_hitl,
         {
             "execute_sql": "execute_sql",
+            "execute_job": "execute_job",
             END: END,
         },
     )
     builder.add_conditional_edges(
         "execute_sql",
+        _route_after_execute,
+        {
+            "statistical_guard": "statistical_guard",
+            "query_rewriter": "query_rewriter",
+            "handle_failure": "handle_failure",
+        },
+    )
+    builder.add_conditional_edges(
+        "execute_job",
         _route_after_execute,
         {
             "statistical_guard": "statistical_guard",

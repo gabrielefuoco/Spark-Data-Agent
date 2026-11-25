@@ -195,9 +195,7 @@ def make_spark_job_executor(
                     "Topic model job requires 'label' column on silver_posts.",
                     query=encode_spark_job(job_name, params),
                 )
-            result_df = topic_result.cohort_lexical_matrix.limit(
-                resolved_settings.sql_row_limit
-            )
+            result_df = topic_result.cohort_lexical_matrix.limit(resolved_settings.sql_row_limit)
 
         raw_rows = result_df.collect()
         rows = [
@@ -229,17 +227,13 @@ class AgentRuntimeDeps:
     def get_router_model(self) -> BaseChatModel:
         """Lazily build and cache the router chat model on first use."""
         if self.router_model is None:
-            self.router_model = create_chat_model(
-                "router", settings=self.settings, temperature=0.0
-            )
+            self.router_model = create_chat_model("router", settings=self.settings, temperature=0.0)
         return self.router_model
 
     def get_critic_model(self) -> BaseChatModel:
         """Lazily build and cache the critic chat model on first use."""
         if self.critic_model is None:
-            self.critic_model = create_chat_model(
-                "critic", settings=self.settings, temperature=0.0
-            )
+            self.critic_model = create_chat_model("critic", settings=self.settings, temperature=0.0)
         return self.critic_model
 
     def get_sql_executor(self) -> SqlExecutor:

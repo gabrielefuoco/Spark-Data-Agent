@@ -87,10 +87,14 @@ def test_nlp_pipeline_fits_extracts_bigrams_and_valid_topic_distributions(
     assert all(isinstance(term, str) and " " in term for term in terms)
     cv_model = result.model.stages[3]
     assert isinstance(cv_model, CountVectorizerModel)
-    assert any(bigram in cv_model.vocabulary for bigram in ("feel alone", "not worth", "cant sleep"))
+    assert any(
+        bigram in cv_model.vocabulary for bigram in ("feel alone", "not worth", "cant sleep")
+    )
 
     # Per-document topicDistribution must be a valid probability distribution summing to ~1.
-    doc_rows = result.document_topics.select("subject_id", "topicDistribution", "dominant_topic").collect()
+    doc_rows = result.document_topics.select(
+        "subject_id", "topicDistribution", "dominant_topic"
+    ).collect()
     assert len(doc_rows) == len(corpus)
     for row in doc_rows:
         probs = row["topicDistribution"].toArray().tolist()

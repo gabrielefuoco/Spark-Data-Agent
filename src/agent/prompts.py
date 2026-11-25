@@ -111,7 +111,9 @@ def format_manifest_answer(manifest: DatasetManifest, question: str) -> str:
     posts_0 = manifest.posts_per_class.get("0", 0)
     posts_1 = manifest.posts_per_class.get("1", 0)
     quarantine_breakdown = (
-        ", ".join(f"{reason}: {count}" for reason, count in sorted(manifest.quarantine_by_reason.items()))
+        ", ".join(
+            f"{reason}: {count}" for reason, count in sorted(manifest.quarantine_by_reason.items())
+        )
         or "none"
     )
     return (

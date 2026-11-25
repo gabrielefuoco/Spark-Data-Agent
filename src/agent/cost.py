@@ -59,21 +59,14 @@ def _extract_spark_size_mib(explain_text: str) -> float | None:
     matches = _SIZE_BYTES_PATTERN.findall(explain_text)
     if not matches:
         return None
-    sizes_mib = [
-        float(val) * _UNIT_TO_MIB.get(unit.lower(), 1.0)
-        for val, unit in matches
-    ]
+    sizes_mib = [float(val) * _UNIT_TO_MIB.get(unit.lower(), 1.0) for val, unit in matches]
     return max(sizes_mib)
 
 
 def estimate_ast_cost(query: str) -> tuple[float, list[str]]:
     """Compute a deterministic computational cost score from a SQL query AST."""
     tree = sqlglot.parse_one(query, read="spark")
-    cte_names = {
-        cte.alias_or_name.lower()
-        for cte in tree.find_all(exp.CTE)
-        if cte.alias_or_name
-    }
+    cte_names = {cte.alias_or_name.lower() for cte in tree.find_all(exp.CTE) if cte.alias_or_name}
 
     referenced_tables = [
         table.name.lower()
@@ -102,9 +95,7 @@ def estimate_ast_cost(query: str) -> tuple[float, list[str]]:
 
     # sqlglot accepts a tuple of node types at runtime but types `find_all` for a
     # single type, so the three text-pattern scans are asked for separately.
-    if any(
-        any(tree.find_all(node_type)) for node_type in (exp.Like, exp.ILike, exp.RegexpLike)
-    ):
+    if any(any(tree.find_all(node_type)) for node_type in (exp.Like, exp.ILike, exp.RegexpLike)):
         score += 0.25
         reasons.append("text_pattern_scan (+0.25)")
 
@@ -192,9 +183,7 @@ def estimate_job_cost(
     """Estimate computational cost for non-SQL Spark jobs driving the HITL gate."""
     cfg = settings or get_settings()
     normalized = job_name.strip().lower()
-    base_cost, reason = _SPARK_JOB_COSTS.get(
-        normalized, (1.5, f"spark_job:{normalized} (+1.50)")
-    )
+    base_cost, reason = _SPARK_JOB_COSTS.get(normalized, (1.5, f"spark_job:{normalized} (+1.50)"))
     reasons = [f"spark_job:{normalized} (base={base_cost:.2f})", reason]
     if params:
         reasons.append(f"params={','.join(sorted(str(k) for k in params))}")

@@ -67,7 +67,10 @@ def test_uri_detection_and_target_resolution(tmp_path: Path) -> None:
         s3_endpoint_url="http://minio:9000",
     )
     assert resolve_storage_target(s3_settings) == "s3a://lakehouse/prefix"
-    assert resolve_storage_target(s3_settings, "/smoke/", "run1") == "s3a://lakehouse/prefix/smoke/run1"
+    assert (
+        resolve_storage_target(s3_settings, "/smoke/", "run1")
+        == "s3a://lakehouse/prefix/smoke/run1"
+    )
 
     lakehouse_paths = LakehousePaths.from_settings(s3_settings)
     assert lakehouse_paths.silver_posts == "s3a://lakehouse/prefix/lakehouse/silver/posts"
@@ -202,15 +205,12 @@ def test_s3a_parquet_roundtrip_and_safe_sql_on_minio(spark: SparkSession) -> Non
         registered = register_lakehouse_views(spark, settings=settings, paths=paths)
         assert registered == ["silver_posts"]
 
-        sql_rows = (
-            execute_safe_spark_sql(
-                "SELECT subject_id, label FROM silver_posts WHERE label = 1",
-                spark,
-                settings=settings,
-                paths=paths,
-            )
-            .collect()
-        )
+        sql_rows = execute_safe_spark_sql(
+            "SELECT subject_id, label FROM silver_posts WHERE label = 1",
+            spark,
+            settings=settings,
+            paths=paths,
+        ).collect()
         assert [(r["subject_id"], r["label"]) for r in sql_rows] == [("subj_a", 1)]
     finally:
         jvm = spark.sparkContext._jvm

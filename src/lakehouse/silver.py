@@ -88,7 +88,10 @@ def build_silver(
     validation_error = (
         F.when(F.col("subject_id").isNull(), F.lit(REASON_MISSING_SUBJECT_ID))
         .when(F.col("date").isNull(), F.lit(REASON_MALFORMED_DATE))
-        .when(F.col("text").isNull() | (F.length(F.col("text")) == 0), F.lit(REASON_NULL_OR_BLANK_TEXT))
+        .when(
+            F.col("text").isNull() | (F.length(F.col("text")) == 0),
+            F.lit(REASON_NULL_OR_BLANK_TEXT),
+        )
         .when(F.col("label").isNull() | ~F.col("label").isin(0, 1), F.lit(REASON_ORPHAN_SUBJECT_ID))
         .otherwise(F.lit(None).cast(StringType()))
     )
@@ -97,7 +100,9 @@ def build_silver(
         F.col("_ingested_at").asc_nulls_last(),
         F.col("_source_file").asc_nulls_last(),
     )
-    dedup_rank = F.when(validation_error.isNull(), F.row_number().over(dedup_window)).otherwise(F.lit(1))
+    dedup_rank = F.when(validation_error.isNull(), F.row_number().over(dedup_window)).otherwise(
+        F.lit(1)
+    )
 
     classified = (
         joined.withColumn("_validation_error", validation_error)

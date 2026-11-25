@@ -150,11 +150,7 @@ def validate_and_rewrite_sql(
             )
 
     base_allowed = LAKEHOUSE_VIEW_NAMES if allowed_tables is None else allowed_tables
-    cte_names = {
-        cte.alias_or_name.lower()
-        for cte in tree.find_all(exp.CTE)
-        if cte.alias_or_name
-    }
+    cte_names = {cte.alias_or_name.lower() for cte in tree.find_all(exp.CTE) if cte.alias_or_name}
     effective_allowed = {name.lower() for name in base_allowed} | cte_names
 
     for table in tree.find_all(exp.Table):

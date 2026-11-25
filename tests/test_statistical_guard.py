@@ -18,7 +18,9 @@ from src.config import Settings
 
 def _obs(prefix: str, values: Sequence[float]) -> list[SubjectObservation]:
     """Build one ``SubjectObservation`` per distinct subject from a sequence of values."""
-    return [SubjectObservation(subject_id=f"{prefix}_{i}", value=val) for i, val in enumerate(values)]
+    return [
+        SubjectObservation(subject_id=f"{prefix}_{i}", value=val) for i, val in enumerate(values)
+    ]
 
 
 def test_cohens_d_matches_hand_computed_magnitude_and_sign() -> None:
@@ -142,8 +144,7 @@ def test_underpowered_sample_overrides_small_p_value() -> None:
 def test_forty_rows_from_single_subject_is_underpowered() -> None:
     # Regression test for pseudo-replication: 40 rows from 1 depressed user != 40 subjects.
     depressed_40_rows_1_subject = [
-        SubjectObservation(subject_id="dep_single", value=0.90 + (i % 4) * 0.02)
-        for i in range(40)
+        SubjectObservation(subject_id="dep_single", value=0.90 + (i % 4) * 0.02) for i in range(40)
     ]
     control_35_subjects = _obs("ctrl", [0.10 + (i % 5) * 0.01 for i in range(35)])
 

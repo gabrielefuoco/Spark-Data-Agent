@@ -161,7 +161,9 @@ def build_cohort_lexical_matrix(
     )
 
     if result.cohort_ngram_tfidf is None or result.cohort_lexical_matrix is None:
-        raise ValueError("build_cohort_lexical_matrix requires a 'label' column on silver_posts_df.")
+        raise ValueError(
+            "build_cohort_lexical_matrix requires a 'label' column on silver_posts_df."
+        )
 
     write_parquet_zstd(result.cohort_ngram_tfidf, output_path, mode="overwrite")
     topics_target = topics_output_path or _sibling_topics_path(output_path)

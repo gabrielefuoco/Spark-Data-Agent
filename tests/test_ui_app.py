@@ -98,10 +98,7 @@ def test_ui_hitl_approve_flow_resumes_same_thread() -> None:
     assert not at.exception
     assert len(executor_calls) == 1
     assert at.session_state["pending_interrupt"] is None
-    assert any(
-        "Analisi completata dopo autorizzazione HITL." in md.value
-        for md in at.markdown
-    )
+    assert any("Analisi completata dopo autorizzazione HITL." in md.value for md in at.markdown)
 
 
 def test_ui_hitl_reject_flow_never_executes_query() -> None:

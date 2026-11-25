@@ -68,9 +68,7 @@ class LakehousePaths:
 
     @property
     def gold_cohort_topic_matrix(self) -> str:
-        return join_storage_path(
-            self.storage_root, "lakehouse", "gold", "gold_cohort_topic_matrix"
-        )
+        return join_storage_path(self.storage_root, "lakehouse", "gold", "gold_cohort_topic_matrix")
 
     @property
     def gold_dataset_manifest(self) -> str:

@@ -67,7 +67,9 @@ def find_post_contract_violations(
         SchemaContractError: If required columns are missing or have wrong Spark types.
     """
     if key_col not in posts_df.columns:
-        raise ValueError(f"Key column {key_col!r} not found in DataFrame columns: {posts_df.columns}")
+        raise ValueError(
+            f"Key column {key_col!r} not found in DataFrame columns: {posts_df.columns}"
+        )
 
     # Pandera's PySpark typing only admits its own DataFrame wrapper, while the
     # backend duck-types a plain pyspark DataFrame at runtime.
@@ -107,7 +109,6 @@ def find_post_contract_violations(
         )
     )
 
-    return (
-        posts_df.select(F.col(key_col), F.concat_ws(";", reasons).alias("violation_reason"))
-        .filter(F.length(F.col("violation_reason")) > 0)
-    )
+    return posts_df.select(
+        F.col(key_col), F.concat_ws(";", reasons).alias("violation_reason")
+    ).filter(F.length(F.col("violation_reason")) > 0)

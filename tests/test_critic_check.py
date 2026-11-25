@@ -251,7 +251,9 @@ def test_assertive_claims_allowed_when_guard_is_significant() -> None:
 def test_forbidden_claim_tripwire_catches_causal_associative_and_likelihood_shapes(
     assertive_clause: str,
 ) -> None:
-    guard_ns = _make_guard(n_dep=142, n_ctrl=350, p_value=0.0031, cohens_d=0.20, is_significant=False)
+    guard_ns = _make_guard(
+        n_dep=142, n_ctrl=350, p_value=0.0031, cohens_d=0.20, is_significant=False
+    )
     text = (
         f"With 142 depressed and 350 control subjects, p = 0.0031, Cohen's d = 0.20, "
         f"so {assertive_clause}."
@@ -263,10 +265,10 @@ def test_forbidden_claim_tripwire_catches_causal_associative_and_likelihood_shap
 
 
 def test_depression_drives_regression_sentence_and_negated_forms() -> None:
-    guard_ns = _make_guard(n_dep=142, n_ctrl=350, p_value=0.0031, cohens_d=0.20, is_significant=False)
-    exact_regression = (
-        "With 142 depressed and 350 control subjects, p = 0.0031, so depression drives night posting."
+    guard_ns = _make_guard(
+        n_dep=142, n_ctrl=350, p_value=0.0031, cohens_d=0.20, is_significant=False
     )
+    exact_regression = "With 142 depressed and 350 control subjects, p = 0.0031, so depression drives night posting."
     reg_check = validate_critic_output(exact_regression, guard_ns)
     assert reg_check.passed is False
     assert reg_check.forbidden_claims == ["depression drives"]
@@ -285,7 +287,9 @@ def test_depression_drives_regression_sentence_and_negated_forms() -> None:
 def test_forbidden_claim_heuristic_does_not_catch_unlisted_paraphrases() -> None:
     # The mandatory numeric citation check (sample sizes, p-value, Cohen's d) is the
     # real mechanical guardrail; the forbidden-claim regex is a surface tripwire, not a judge.
-    guard_ns = _make_guard(n_dep=142, n_ctrl=350, p_value=0.0031, cohens_d=0.20, is_significant=False)
+    guard_ns = _make_guard(
+        n_dep=142, n_ctrl=350, p_value=0.0031, cohens_d=0.20, is_significant=False
+    )
     paraphrase = (
         "With 142 depressed and 350 control subjects, p = 0.0031, Cohen's d = 0.20, "
         "night posting characterizes the depressed cohort."

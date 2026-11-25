@@ -122,8 +122,7 @@ def _aggregate_by_subject(observations: Sequence[SubjectObservation]) -> np.ndar
         grouped[obs.subject_id].append(obs.value)
 
     subject_means = [
-        vals[0] if len(vals) == 1 else math.fsum(vals) / len(vals)
-        for vals in grouped.values()
+        vals[0] if len(vals) == 1 else math.fsum(vals) / len(vals) for vals in grouped.values()
     ]
     return np.asarray(subject_means, dtype=np.float64)
 

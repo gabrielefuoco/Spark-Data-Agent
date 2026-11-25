@@ -42,9 +42,7 @@ _INT_TOKEN_RE = re.compile(r"(?<![.\d+-])(?<![eE][+-])\b(\d+)\b(?!\.\d)")
 # Paired with clause-local negation checks so ordinary compliant disclaimers
 # (e.g. "no statistically significant difference", "not associated with depression")
 # are not flagged. A paraphrase without these explicit verbs will still pass.
-_COHORT_TARGET = (
-    r"(?:depression|depressed(?:\s+(?:users?|subjects?|cohort|group|individuals?))?)"
-)
+_COHORT_TARGET = r"(?:depression|depressed(?:\s+(?:users?|subjects?|cohort|group|individuals?))?)"
 _FORBIDDEN_CLAIM_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
         r"\bsignificantly\s+(?:more|less|higher|lower|greater|fewer|different)\b",
@@ -278,9 +276,7 @@ def format_inconclusive_critic_fallback(
     extra_reason = guard.cannot_assess_reason or guard.underpowered_reason
     extra_line = f"- Guard detail: {extra_reason}\n" if extra_reason else ""
     d_display = (
-        "0.0000"
-        if abs(guard.effect_size_cohens_d) < 1e-12
-        else f"{guard.effect_size_cohens_d:.6g}"
+        "0.0000" if abs(guard.effect_size_cohens_d) < 1e-12 else f"{guard.effect_size_cohens_d:.6g}"
     )
 
     return (

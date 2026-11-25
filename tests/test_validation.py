@@ -119,7 +119,9 @@ def test_silver_accounting_invariant_with_contract_violation_in_mix(
         first_row = df.orderBy("_row_hash").select(F.col(key_col)).limit(1)
         return first_row.withColumn("violation_reason", F.lit("synthetic_contract_breach"))
 
-    monkeypatch.setattr("src.lakehouse.silver.find_post_contract_violations", _inject_contract_violation)
+    monkeypatch.setattr(
+        "src.lakehouse.silver.find_post_contract_violations", _inject_contract_violation
+    )
 
     silver_df, quarantine_df = build_silver(spark, settings=settings, paths=paths)
     silver_count = silver_df.count()

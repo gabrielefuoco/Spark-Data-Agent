@@ -176,11 +176,12 @@ def build_cohort_topic_matrix(
     topic_summary = (
         document_topics.select(
             "label",
-            F.posexplode(vector_to_array(F.col("topicDistribution"))).alias(
-                "topic", "topic_prob"
-            ),
+            F.posexplode(vector_to_array(F.col("topicDistribution"))).alias("topic", "topic_prob"),
         )
-        .groupBy(F.col("label").cast(IntegerType()).alias("label"), F.col("topic").cast(IntegerType()).alias("topic"))
+        .groupBy(
+            F.col("label").cast(IntegerType()).alias("label"),
+            F.col("topic").cast(IntegerType()).alias("topic"),
+        )
         .agg(
             F.avg("topic_prob").cast(DoubleType()).alias("mean_topic_probability"),
             F.count("*").cast(LongType()).alias("document_count"),
@@ -247,9 +248,9 @@ def build_cohort_ngram_tfidf_matrix(
             maxDF=max_df,
             vocabSize=vocab_size,
         ).fit(transformed_df)
-        uni_idf = IDF(
-            inputCol="uni_raw_features", outputCol="uni_features", minDocFreq=1
-        ).fit(uni_cv.transform(transformed_df))
+        uni_idf = IDF(inputCol="uni_raw_features", outputCol="uni_features", minDocFreq=1).fit(
+            uni_cv.transform(transformed_df)
+        )
         unigram_idf_df = _idf_table_from_models(
             transformed_df, uni_cv, uni_idf, ngram_type="unigram"
         )
@@ -261,9 +262,9 @@ def build_cohort_ngram_tfidf_matrix(
 
     idf_lookup = unigram_idf_df.unionByName(bigram_idf_df)
 
-    doc_counts = transformed_df.groupBy(
-        F.col("label").cast(IntegerType()).alias("label")
-    ).agg(F.count("*").cast(LongType()).alias("cohort_doc_count"))
+    doc_counts = transformed_df.groupBy(F.col("label").cast(IntegerType()).alias("label")).agg(
+        F.count("*").cast(LongType()).alias("cohort_doc_count")
+    )
 
     unigrams = transformed_df.select(
         F.col("label").cast(IntegerType()).alias("label"),
@@ -359,11 +360,17 @@ def fit_topic_model(
     prob_array = vector_to_array(F.col("topicDistribution"))
 
     # Drop intermediate feature vectors/token arrays unless the caller needs raw columns.
-    drop_cols = [c for c in ("words", "filtered_words", "ngrams", "raw_features", "features") if c in transformed.columns]
+    drop_cols = [
+        c
+        for c in ("words", "filtered_words", "ngrams", "raw_features", "features")
+        if c in transformed.columns
+    ]
     document_topics = (
         transformed.drop(*drop_cols)
         .withColumn("topic_probabilities", prob_array)
-        .withColumn("dominant_topic_prob", F.array_max(F.col("topic_probabilities")).cast(DoubleType()))
+        .withColumn(
+            "dominant_topic_prob", F.array_max(F.col("topic_probabilities")).cast(DoubleType())
+        )
         .withColumn(
             "dominant_topic",
             (F.expr("array_position(topic_probabilities, dominant_topic_prob)") - F.lit(1)).cast(
@@ -374,9 +381,7 @@ def fit_topic_model(
 
     topic_terms = extract_topic_terms(model, top_n=top_n_terms)
     has_label = "label" in document_topics.columns
-    cohort_matrix = (
-        build_cohort_topic_matrix(document_topics, topic_terms) if has_label else None
-    )
+    cohort_matrix = build_cohort_topic_matrix(document_topics, topic_terms) if has_label else None
     cohort_ngram_tfidf = (
         build_cohort_ngram_tfidf_matrix(
             transformed,

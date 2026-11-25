@@ -127,11 +127,15 @@ def generate_synthetic_sample(
 
         if include_broken and idx == 1:
             writings.append(
-                _format_writing("Broken date", "not-a-valid-date", "reddit post", "Valid text with bad date.")
+                _format_writing(
+                    "Broken date", "not-a-valid-date", "reddit post", "Valid text with bad date."
+                )
             )
         if include_broken and idx == 2:
             writings.append(
-                _format_writing("Blank body", _synthetic_timestamp(rng, label), "reddit post", "   ")
+                _format_writing(
+                    "Blank body", _synthetic_timestamp(rng, label), "reddit post", "   "
+                )
             )
 
         _write_individual_xml(chunk_dir / f"{subject_id}_1.xml", writings)
@@ -139,11 +143,19 @@ def generate_synthetic_sample(
     if include_broken:
         _write_individual_xml(
             chunk_dir / "subject99999_1.xml",
-            [_format_writing("Orphan", "2015-06-15 12:00:00", "reddit post", "Orphan subject post.")],
+            [
+                _format_writing(
+                    "Orphan", "2015-06-15 12:00:00", "reddit post", "Orphan subject post."
+                )
+            ],
         )
         _write_individual_xml(
             chunk_dir / "unknown_1.xml",
-            [_format_writing("Missing id", "2015-06-16 14:30:00", "reddit post", "Post without subject id.")],
+            [
+                _format_writing(
+                    "Missing id", "2015-06-16 14:30:00", "reddit post", "Post without subject id."
+                )
+            ],
         )
 
     truth_path = out / "risk-golden-truth-test.txt"

@@ -43,7 +43,9 @@ def _resolve_xml_inputs(posts_input_path: str | Path) -> str | list[str]:
 
     candidate = Path(raw)
     if candidate.is_dir():
-        glob_dirs = sorted({str(xml_file.parent / "*.xml") for xml_file in candidate.rglob("*.xml")})
+        glob_dirs = sorted(
+            {str(xml_file.parent / "*.xml") for xml_file in candidate.rglob("*.xml")}
+        )
         if glob_dirs:
             return glob_dirs
         return str(candidate / "*.xml")
@@ -74,20 +76,17 @@ def ingest_bronze_posts(
     with_source = raw_df.withColumn("_source_file", F.input_file_name())
     extracted_id = F.regexp_extract(F.col("_source_file"), _SUBJECT_ID_REGEX, 1)
 
-    bronze_df = (
-        with_source.select(
-            F.when(F.length(extracted_id) > 0, extracted_id)
-            .otherwise(F.lit(None).cast(StringType()))
-            .alias("subject_id"),
-            F.col("TITLE").alias("title"),
-            F.col("DATE").alias("date"),
-            F.col("INFO").alias("info"),
-            F.col("TEXT").alias("text"),
-            F.col("_source_file"),
-            F.current_timestamp().alias("_ingested_at"),
-        )
-        .withColumn("_row_hash", _row_hash_expr(("subject_id", "title", "date", "info", "text")))
-    )
+    bronze_df = with_source.select(
+        F.when(F.length(extracted_id) > 0, extracted_id)
+        .otherwise(F.lit(None).cast(StringType()))
+        .alias("subject_id"),
+        F.col("TITLE").alias("title"),
+        F.col("DATE").alias("date"),
+        F.col("INFO").alias("info"),
+        F.col("TEXT").alias("text"),
+        F.col("_source_file"),
+        F.current_timestamp().alias("_ingested_at"),
+    ).withColumn("_row_hash", _row_hash_expr(("subject_id", "title", "date", "info", "text")))
 
     write_parquet_zstd(bronze_df, output_path, mode="overwrite")
     return spark.read.parquet(str(output_path))

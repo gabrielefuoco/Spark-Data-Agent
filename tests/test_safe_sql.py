@@ -74,11 +74,15 @@ def test_limit_injection_and_capping() -> None:
     injected = validate_and_rewrite_sql("SELECT subject_id FROM silver_posts", row_limit=500)
     assert injected.upper().endswith("LIMIT 500")
 
-    capped = validate_and_rewrite_sql("SELECT subject_id FROM silver_posts LIMIT 2000", row_limit=500)
+    capped = validate_and_rewrite_sql(
+        "SELECT subject_id FROM silver_posts LIMIT 2000", row_limit=500
+    )
     assert capped.upper().endswith("LIMIT 500")
     assert "2000" not in capped
 
-    preserved = validate_and_rewrite_sql("SELECT subject_id FROM silver_posts LIMIT 25", row_limit=500)
+    preserved = validate_and_rewrite_sql(
+        "SELECT subject_id FROM silver_posts LIMIT 25", row_limit=500
+    )
     assert preserved.upper().endswith("LIMIT 25")
 
     cte_query = validate_and_rewrite_sql(

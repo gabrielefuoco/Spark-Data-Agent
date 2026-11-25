@@ -150,12 +150,8 @@ def summarize_user_longitudinal_features(
             .alias("stddev_text_length"),
             F.sum("is_night_post").cast(LongType()).alias("night_post_count"),
             F.max("session_index").cast(LongType()).alias("session_count"),
-            F.avg("inter_post_gap_seconds")
-            .cast(DoubleType())
-            .alias("mean_inter_post_gap_seconds"),
-            F.avg("night_post_rolling_30d")
-            .cast(DoubleType())
-            .alias("mean_night_post_rolling_30d"),
+            F.avg("inter_post_gap_seconds").cast(DoubleType()).alias("mean_inter_post_gap_seconds"),
+            F.avg("night_post_rolling_30d").cast(DoubleType()).alias("mean_night_post_rolling_30d"),
             F.avg("verbosity_zscore").cast(DoubleType()).alias("mean_verbosity_zscore"),
             F.max(F.abs(F.col("verbosity_zscore")))
             .cast(DoubleType())
@@ -163,9 +159,7 @@ def summarize_user_longitudinal_features(
         )
         .withColumn(
             "posts_per_active_day",
-            (F.col("post_count") / F.greatest(F.col("active_days"), F.lit(1))).cast(
-                DoubleType()
-            ),
+            (F.col("post_count") / F.greatest(F.col("active_days"), F.lit(1))).cast(DoubleType()),
         )
         .withColumn(
             "night_post_ratio",

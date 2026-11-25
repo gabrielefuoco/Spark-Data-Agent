@@ -94,7 +94,9 @@ def test_manifest_only_question_never_invokes_sql_executor() -> None:
             )
         ]
     )
-    critic = GenericFakeChatModel(messages=iter(["Critic must not be called for manifest queries."]))
+    critic = GenericFakeChatModel(
+        messages=iter(["Critic must not be called for manifest queries."])
+    )
     executor_calls: list[str] = []
 
     def fake_executor(query: str, _cfg: Settings) -> list[dict[str, Any]]:
@@ -444,8 +446,7 @@ def test_successful_retry_on_second_attempt_stops_loop() -> None:
         ]
     )
     completed_critique = (
-        "Completed on retry "
-        "(depressed=30, control=30, p = 2.41976e-11, Cohen's d = 15.6425)."
+        "Completed on retry (depressed=30, control=30, p = 2.41976e-11, Cohen's d = 15.6425)."
     )
     critic = RecordingFakeChatModel(responses=[AIMessage(content=completed_critique)])
     attempts: list[str] = []
@@ -557,9 +558,7 @@ def test_hitl_interrupt_persists_across_sqlite_checkpointer_and_executes_on_appr
         "Approved expensive query completed "
         "(sample_size_depressed=0, sample_size_control=0, p = 1.0, Cohen's d = 0.0)."
     )
-    critic = FakeMessagesListChatModel(
-        responses=[AIMessage(content=approved_critique)]
-    )
+    critic = FakeMessagesListChatModel(responses=[AIMessage(content=approved_critique)])
     executor_calls: list[str] = []
 
     def fake_executor(query: str, _cfg: Settings) -> list[dict[str, Any]]:
@@ -1036,7 +1035,9 @@ def test_unknown_spark_job_triggers_retry_and_recovers() -> None:
 
 
 def _cohort_router_model(*, include_subject_id: bool = True) -> FakeMessagesListChatModel:
-    cols = "subject_id, label, night_post_ratio" if include_subject_id else "label, night_post_ratio"
+    cols = (
+        "subject_id, label, night_post_ratio" if include_subject_id else "label, night_post_ratio"
+    )
     return FakeMessagesListChatModel(
         responses=[
             AIMessage(

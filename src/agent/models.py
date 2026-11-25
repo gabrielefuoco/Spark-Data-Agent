@@ -37,12 +37,8 @@ def resolve_model_config(
 
     if cfg.llm_backend == "openrouter":
         if cfg.openrouter_api_key is None or not cfg.openrouter_api_key.get_secret_value().strip():
-            raise ValueError(
-                "OPENROUTER_API_KEY must be set when LLM_BACKEND='openrouter'."
-            )
-        model_name = (
-            cfg.remote_router_model if role == "router" else cfg.remote_reasoning_model
-        )
+            raise ValueError("OPENROUTER_API_KEY must be set when LLM_BACKEND='openrouter'.")
+        model_name = cfg.remote_router_model if role == "router" else cfg.remote_reasoning_model
         return model_name, cfg.openrouter_base_url, cfg.openrouter_api_key
 
     raise ValueError(f"Unsupported llm_backend: {cfg.llm_backend!r}")

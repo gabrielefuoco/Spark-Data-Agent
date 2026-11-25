@@ -154,7 +154,9 @@ def _extract_interrupt_payload(interrupt_obj: Any) -> dict[str, Any]:
 
 
 def _record_assistant_outcome(outcome: dict[str, Any]) -> None:
-    content = outcome.get("final_response") or outcome.get("critic_critique") or "Analisi completata."
+    content = (
+        outcome.get("final_response") or outcome.get("critic_critique") or "Analisi completata."
+    )
     st.session_state.messages.append(
         {
             "role": "assistant",
@@ -177,7 +179,9 @@ def _invoke_or_interrupt(graph: Any, payload: Any, thread_id: str) -> None:
         return
 
     st.session_state["pending_interrupt"] = None
-    _record_assistant_outcome(result if isinstance(result, dict) else {"final_response": str(result)})
+    _record_assistant_outcome(
+        result if isinstance(result, dict) else {"final_response": str(result)}
+    )
 
 
 def _render_statistical_card(stats_payload: dict[str, Any]) -> None:
@@ -190,7 +194,9 @@ def _render_statistical_card(stats_payload: dict[str, Any]) -> None:
     col4.metric("Cohen's d", f"{cohens_d:.3f}" if isinstance(cohens_d, (int, float)) else "N/A")
 
     if stats_payload.get("is_underpowered"):
-        st.warning(stats_payload.get("underpowered_reason") or "Campione sottodimensionato (underpowered).")
+        st.warning(
+            stats_payload.get("underpowered_reason") or "Campione sottodimensionato (underpowered)."
+        )
     elif not stats_payload.get("is_significant"):
         st.info("Nessuna differenza statisticamente significativa rilevata (p >= 0.05).")
     else:
@@ -216,7 +222,9 @@ def _render_assistant_message(msg: dict[str, Any]) -> None:
         fig = build_result_figure(query_result, stats_payload)
         if fig is not None:
             st.plotly_chart(fig, use_container_width=True)
-        with st.expander(f"Dati estratti ({query_result.get('row_count', 0)} righe)", expanded=False):
+        with st.expander(
+            f"Dati estratti ({query_result.get('row_count', 0)} righe)", expanded=False
+        ):
             st.dataframe(pd.DataFrame(query_result["rows"]), use_container_width=True)
 
 
@@ -292,8 +300,14 @@ def main() -> None:
         col_cost, col_thresh = st.columns(2)
         est_cost = pending.get("estimated_cost", 0.0)
         threshold = pending.get("threshold", settings.hitl_cost_threshold)
-        col_cost.metric("Costo Stimato", f"{est_cost:.2f}" if isinstance(est_cost, (int, float)) else str(est_cost))
-        col_thresh.metric("Soglia HITL", f"{threshold:.2f}" if isinstance(threshold, (int, float)) else str(threshold))
+        col_cost.metric(
+            "Costo Stimato",
+            f"{est_cost:.2f}" if isinstance(est_cost, (int, float)) else str(est_cost),
+        )
+        col_thresh.metric(
+            "Soglia HITL",
+            f"{threshold:.2f}" if isinstance(threshold, (int, float)) else str(threshold),
+        )
 
         if pending.get("query"):
             st.code(pending["query"], language="sql")

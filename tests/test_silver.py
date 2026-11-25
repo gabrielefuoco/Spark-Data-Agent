@@ -45,8 +45,7 @@ def test_silver_quarantine_reasons_partitioning_and_accounting(
     assert quarantine_count == 4
 
     reasons = {
-        row["_rejection_reason"]
-        for row in quarantine_df.select("_rejection_reason").collect()
+        row["_rejection_reason"] for row in quarantine_df.select("_rejection_reason").collect()
     }
     assert reasons == {
         REASON_MISSING_SUBJECT_ID,
@@ -128,9 +127,7 @@ def test_silver_deduplicates_exact_duplicates_only(
     assert bronze_posts.count() == 7
     assert silver_df.count() == 5
     assert quarantine_df.count() == 2
-    assert (
-        quarantine_df.filter(F.col("_rejection_reason") == REASON_DUPLICATE_POST).count() == 2
-    )
+    assert quarantine_df.filter(F.col("_rejection_reason") == REASON_DUPLICATE_POST).count() == 2
     assert silver_df.count() + quarantine_df.count() == bronze_posts.count()
 
 
@@ -162,4 +159,3 @@ def test_silver_handles_empty_quarantine(spark: SparkSession, tmp_path: Path) ->
 
     assert silver_df.count() == 12
     assert quarantine_df.count() == 0
-

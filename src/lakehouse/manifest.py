@@ -114,9 +114,7 @@ def build_dataset_manifest(
             max_dates.append(row["max_date"])
 
     quarantine_rows = (
-        quarantine_df.groupBy("_rejection_reason")
-        .agg(F.count("*").alias("row_count"))
-        .collect()
+        quarantine_df.groupBy("_rejection_reason").agg(F.count("*").alias("row_count")).collect()
     )
     quarantine_by_reason = {
         str(row["_rejection_reason"]): int(row["row_count"])

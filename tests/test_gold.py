@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from src.agent.graph import make_spark_job_executor
+from src.agent.nodes import make_spark_job_executor
 from src.analytics.safe_sql import execute_safe_spark_sql
 from src.lakehouse.bronze import run_bronze_ingestion
 from src.lakehouse.gold import build_gold

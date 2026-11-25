@@ -9,7 +9,8 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import IntegerType, TimestampType
 from scripts.generate_dev_sample import generate_synthetic_sample
-from src.lakehouse.bronze import ingest_bronze_posts, run_bronze_ingestion
+from src.lakehouse.bronze import run_bronze_ingestion
+from src.lakehouse.paths import LakehousePaths
 from src.lakehouse.silver import (
     REASON_DUPLICATE_POST,
     REASON_MALFORMED_DATE,
@@ -106,22 +107,14 @@ def test_silver_deduplicates_exact_duplicates_only(
         encoding="utf-8",
     )
 
-    bronze_posts = ingest_bronze_posts(spark, sample_dir / "chunk", tmp_path / "bronze" / "posts")
-    from src.lakehouse.bronze import ingest_bronze_subjects
-
-    ingest_bronze_subjects(
+    paths = LakehousePaths(str(tmp_path))
+    bronze_posts, _ = run_bronze_ingestion(
         spark,
+        sample_dir / "chunk",
         sample_dir / "risk-golden-truth-test.txt",
-        tmp_path / "bronze" / "subjects",
+        paths=paths,
     )
-
-    silver_df, quarantine_df = build_silver(
-        spark,
-        bronze_posts_path=tmp_path / "bronze" / "posts",
-        bronze_subjects_path=tmp_path / "bronze" / "subjects",
-        silver_posts_path=tmp_path / "silver" / "posts",
-        silver_quarantine_path=tmp_path / "silver" / "quarantine",
-    )
+    silver_df, quarantine_df = build_silver(spark, paths=paths)
 
     # 2 original subject001 + 2 subject002 + 1 distinct-text post = 5 kept; 2 exact dupes quarantined.
     assert bronze_posts.count() == 7
@@ -140,22 +133,14 @@ def test_silver_handles_empty_quarantine(spark: SparkSession, tmp_path: Path) ->
         posts_per_subject=3,
         include_broken=False,
     )
-    from src.lakehouse.bronze import ingest_bronze_subjects
-
-    ingest_bronze_posts(spark, sample_dir / "chunk", tmp_path / "bronze" / "posts")
-    ingest_bronze_subjects(
+    paths = LakehousePaths(str(tmp_path))
+    run_bronze_ingestion(
         spark,
+        sample_dir / "chunk",
         sample_dir / "risk-golden-truth-test.txt",
-        tmp_path / "bronze" / "subjects",
+        paths=paths,
     )
-
-    silver_df, quarantine_df = build_silver(
-        spark,
-        bronze_posts_path=tmp_path / "bronze" / "posts",
-        bronze_subjects_path=tmp_path / "bronze" / "subjects",
-        silver_posts_path=tmp_path / "silver" / "posts",
-        silver_quarantine_path=tmp_path / "silver" / "quarantine",
-    )
+    silver_df, quarantine_df = build_silver(spark, paths=paths)
 
     assert silver_df.count() == 12
     assert quarantine_df.count() == 0

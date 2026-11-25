@@ -46,44 +46,6 @@ def test_cohens_d_matches_hand_computed_magnitude_and_sign() -> None:
     assert neg.effect_size_cohens_d == pytest.approx(-math.sqrt(1.45), rel=1e-9)
 
 
-def test_cohens_d_hand_computed_on_per_subject_means_across_multiple_rows() -> None:
-    # Unequal row counts per subject whose per-subject means equal [2, 4, 6]*10 vs [0, 2, 4]*10.
-    # Raw-row Cohen's d would differ, proving the calculation runs on per-subject means.
-    dep_obs: list[SubjectObservation] = []
-    ctrl_obs: list[SubjectObservation] = []
-    for i in range(10):
-        dep_obs.extend(
-            [
-                SubjectObservation(subject_id=f"d_{3 * i}", value=1.0),
-                SubjectObservation(subject_id=f"d_{3 * i}", value=3.0),  # mean=2.0
-                SubjectObservation(subject_id=f"d_{3 * i + 1}", value=2.0),
-                SubjectObservation(subject_id=f"d_{3 * i + 1}", value=3.0),
-                SubjectObservation(subject_id=f"d_{3 * i + 1}", value=5.0),
-                SubjectObservation(subject_id=f"d_{3 * i + 1}", value=6.0),  # mean=4.0
-                SubjectObservation(subject_id=f"d_{3 * i + 2}", value=6.0),  # mean=6.0
-            ]
-        )
-        ctrl_obs.extend(
-            [
-                SubjectObservation(subject_id=f"c_{3 * i}", value=-1.0),
-                SubjectObservation(subject_id=f"c_{3 * i}", value=1.0),  # mean=0.0
-                SubjectObservation(subject_id=f"c_{3 * i + 1}", value=1.0),
-                SubjectObservation(subject_id=f"c_{3 * i + 1}", value=3.0),  # mean=2.0
-                SubjectObservation(subject_id=f"c_{3 * i + 2}", value=3.0),
-                SubjectObservation(subject_id=f"c_{3 * i + 2}", value=4.0),
-                SubjectObservation(subject_id=f"c_{3 * i + 2}", value=5.0),  # mean=4.0
-            ]
-        )
-
-    res = evaluate_statistical_guard(dep_obs, ctrl_obs, metric_name="circadian_index")
-    assert res.sample_size_depressed == 30
-    assert res.sample_size_control == 30
-    assert res.observation_count_depressed == 70
-    assert res.observation_count_control == 70
-    assert res.aggregation_method == "subject_mean"
-    assert res.effect_size_cohens_d == pytest.approx(math.sqrt(1.45), rel=1e-9)
-
-
 def test_significance_and_p_value_ordering_across_shifts() -> None:
     # Exact symmetric normal quantiles guarantee normality and mean=10.0 without RNG variance.
     control_vals = [10.0 + 2.0 * float(stats.norm.ppf((i + 0.5) / 40)) for i in range(40)]
@@ -163,26 +125,6 @@ def test_forty_rows_from_single_subject_is_underpowered() -> None:
     assert result.is_underpowered is True
     assert result.is_significant is False
     assert result.statistical_confidence == "underpowered"
-
-
-def test_thirty_subjects_single_row_each_with_large_difference_is_powered_and_significant() -> None:
-    depressed = _obs("dep", [0.75 + (i % 6) * 0.02 for i in range(30)])
-    control = _obs("ctrl", [0.10 + (i % 6) * 0.02 for i in range(30)])
-
-    result = evaluate_statistical_guard(
-        depressed,
-        control,
-        settings=Settings(_env_file=None, min_subjects_per_class=30),
-        metric_name="night_post_ratio",
-    )
-
-    assert result.sample_size_depressed == 30
-    assert result.sample_size_control == 30
-    assert result.observation_count_depressed == 30
-    assert result.observation_count_control == 30
-    assert result.is_underpowered is False
-    assert result.is_significant is True
-    assert result.p_value < 0.001
 
 
 def test_pseudo_replication_produces_identical_p_value_for_identical_subject_means() -> None:

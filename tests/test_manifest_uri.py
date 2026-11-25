@@ -24,12 +24,7 @@ from src.lakehouse.storage import StorageConfigurationError
 from tests.test_storage import _is_endpoint_reachable, _minio_endpoint_from_env
 
 
-def test_resolve_manifest_filesystem_maps_local_and_s3a_uris(tmp_path: Path) -> None:
-    local_target = tmp_path / "lakehouse" / "gold" / "gold_dataset_manifest.json"
-    local_fs, local_fs_path = resolve_manifest_filesystem(local_target)
-    assert isinstance(local_fs, pafs.LocalFileSystem)
-    assert local_fs_path == str(local_target)
-
+def test_resolve_manifest_filesystem_maps_s3a_uris() -> None:
     s3_settings = Settings(
         _env_file=None,
         spark_storage_uri="s3a://lakehouse/prefix",

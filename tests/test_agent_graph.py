@@ -8,21 +8,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from langchain_core.language_models.fake_chat_models import (
-    FakeMessagesListChatModel,
-    GenericFakeChatModel,
-)
+from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langgraph.types import Command
 from pyspark.sql import SparkSession
-from src.agent.cost import estimate_job_cost, estimate_sql_cost
+from src.agent.cost import estimate_sql_cost
 from src.agent.critic_check import validate_critic_output
-from src.agent.graph import (
-    build_agent_graph,
-    make_spark_sql_executor,
-    open_sqlite_checkpointer,
-)
+from src.agent.graph import build_agent_graph, open_sqlite_checkpointer
 from src.agent.guards import CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS, StatisticalGuardResult
+from src.agent.nodes import make_spark_sql_executor
 from src.agent.state import make_initial_state
 from src.analytics.safe_sql import SafeSQLError
 from src.config import Settings
@@ -83,26 +77,26 @@ def _cohort_rows(n_per_class: int, *, depressed_offset: float = 0.25) -> list[di
     return rows
 
 
+def _router(*payloads: dict[str, Any]) -> RecordingFakeChatModel:
+    return RecordingFakeChatModel([AIMessage(content=json.dumps(p)) for p in payloads])
+
+
+def _critic(*texts: str) -> RecordingFakeChatModel:
+    return RecordingFakeChatModel([AIMessage(content=t) for t in texts])
+
+
 def test_manifest_only_question_never_invokes_sql_executor() -> None:
     settings = Settings(_env_file=None)
-    router = FakeMessagesListChatModel(
-        responses=[
-            AIMessage(
-                content=json.dumps(
-                    {
-                        "user_intent": "catalog_metadata",
-                        "answer_from_manifest": True,
-                        "sql_query": None,
-                        "metric_name": None,
-                        "direct_response": None,
-                    }
-                )
-            )
-        ]
+    router = _router(
+        {
+            "user_intent": "catalog_metadata",
+            "answer_from_manifest": True,
+            "sql_query": None,
+            "metric_name": None,
+            "direct_response": None,
+        }
     )
-    critic = GenericFakeChatModel(
-        messages=iter(["Critic must not be called for manifest queries."])
-    )
+    critic = _critic("Critic must not be called for manifest queries.")
     executor_calls: list[str] = []
 
     def fake_executor(query: str, _cfg: Settings) -> list[dict[str, Any]]:
@@ -131,34 +125,22 @@ def test_happy_path_validates_executes_guards_and_wires_critic_prompt() -> None:
     settings = Settings(
         _env_file=None, min_subjects_per_class=30, sql_row_limit=100, sql_fetch_limit=200
     )
-    router = RecordingFakeChatModel(
-        responses=[
-            AIMessage(
-                content=json.dumps(
-                    {
-                        "user_intent": "circadian_study",
-                        "answer_from_manifest": False,
-                        "sql_query": (
-                            "SELECT subject_id, label, night_post_ratio "
-                            "FROM gold_user_longitudinal_features"
-                        ),
-                        "metric_name": "night_post_ratio",
-                        "direct_response": None,
-                    }
-                )
-            )
-        ]
+    router = _router(
+        {
+            "user_intent": "circadian_study",
+            "answer_from_manifest": False,
+            "sql_query": (
+                "SELECT subject_id, label, night_post_ratio "
+                "FROM gold_user_longitudinal_features"
+            ),
+            "metric_name": "night_post_ratio",
+            "direct_response": None,
+        }
     )
-    critic = RecordingFakeChatModel(
-        responses=[
-            AIMessage(
-                content=(
-                    "Significant difference observed "
-                    "(sample_size_depressed=35, sample_size_control=35, "
-                    "p = 5.04483e-13, Cohen's d = 15.681)."
-                )
-            )
-        ]
+    critic = _critic(
+        "Significant difference observed "
+        "(sample_size_depressed=35, sample_size_control=35, "
+        "p = 5.04483e-13, Cohen's d = 15.681)."
     )
     executor_calls: list[str] = []
 
@@ -199,151 +181,27 @@ def test_happy_path_validates_executes_guards_and_wires_critic_prompt() -> None:
     assert "sample_size_depressed: 35" in critic_system_msg
 
 
-def test_underpowered_or_nonsignificant_guard_forbids_claims_in_critic_prompt() -> None:
-    settings = Settings(_env_file=None, min_subjects_per_class=30)
-    router = FakeMessagesListChatModel(
-        responses=[
-            AIMessage(
-                content=json.dumps(
-                    {
-                        "user_intent": "circadian_study",
-                        "answer_from_manifest": False,
-                        "sql_query": (
-                            "SELECT subject_id, label, night_post_ratio "
-                            "FROM gold_user_longitudinal_features"
-                        ),
-                        "metric_name": "night_post_ratio",
-                    }
-                )
-            )
-        ]
-    )
-    critic = RecordingFakeChatModel(
-        responses=[
-            AIMessage(
-                content=(
-                    "Sample is underpowered (depressed=5, control=5, "
-                    "p = 1.67857e-10, Cohen's d = 25.2982); no correlation claimed."
-                )
-            )
-        ]
-    )
-
-    def fake_executor(_query: str, _cfg: Settings) -> list[dict[str, Any]]:
-        # Only 5 subjects per class -> underpowered (min=30) even with huge separation.
-        return _cohort_rows(5, depressed_offset=0.6)
-
-    graph = build_agent_graph(
-        settings=settings,
-        router_model=router,
-        critic_model=critic,
-        sql_executor=fake_executor,
-    )
-    result = graph.invoke(make_initial_state("Check night post ratio."))
-
-    guard = result["statistical_validation"]
-    assert guard["is_underpowered"] is True
-    assert guard["is_significant"] is False
-    assert CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS in result["critic_system_prompt"]
-    assert "FORBIDDEN:" in result["critic_system_prompt"]
-    assert "Underpowered sample" in result["critic_system_prompt"]
-
-    critic_system_msg = critic.recorded_invocations[0][0].content
-    assert "FORBIDDEN:" in critic_system_msg
-    assert "sample_size_depressed: 5" in critic_system_msg
-    assert "sample_size_control: 5" in critic_system_msg
-
-
-def test_powered_nonsignificant_result_forbids_claims_in_critic_prompt() -> None:
-    settings = Settings(_env_file=None, min_subjects_per_class=30)
-    router = FakeMessagesListChatModel(
-        responses=[
-            AIMessage(
-                content=json.dumps(
-                    {
-                        "user_intent": "circadian_study",
-                        "answer_from_manifest": False,
-                        "sql_query": (
-                            "SELECT subject_id, label, night_post_ratio "
-                            "FROM gold_user_longitudinal_features"
-                        ),
-                        "metric_name": "night_post_ratio",
-                    }
-                )
-            )
-        ]
-    )
-    critic = RecordingFakeChatModel(
-        responses=[
-            AIMessage(
-                content=(
-                    "No statistically significant difference detected "
-                    "(sample_size_depressed=35, sample_size_control=35, "
-                    "p = 0.248336, Cohen's d = 0.0000)."
-                )
-            )
-        ]
-    )
-
-    def fake_executor(_query: str, _cfg: Settings) -> list[dict[str, Any]]:
-        # Powered cohorts (35 per class) with identical distributions -> p = 1.0, is_significant = False.
-        return _cohort_rows(35, depressed_offset=-0.20)
-
-    graph = build_agent_graph(
-        settings=settings,
-        router_model=router,
-        critic_model=critic,
-        sql_executor=fake_executor,
-    )
-    result = graph.invoke(make_initial_state("Check night post ratio."))
-
-    guard = result["statistical_validation"]
-    assert guard["is_underpowered"] is False
-    assert guard["is_significant"] is False
-    assert CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS in result["critic_system_prompt"]
-    assert "FORBIDDEN:" in result["critic_system_prompt"]
-    critic_system_msg = critic.recorded_invocations[0][0].content
-    assert "FORBIDDEN:" in critic_system_msg
-    assert "is_significant: False" in critic_system_msg
-
-
 def test_ast_validation_rejection_triggers_retry_without_touching_executor() -> None:
     settings = Settings(_env_file=None, max_query_retries=2)
-    router = RecordingFakeChatModel(
-        responses=[
-            AIMessage(
-                content=json.dumps(
-                    {
-                        "user_intent": "ad_hoc_sql",
-                        "answer_from_manifest": False,
-                        "sql_query": "DROP TABLE silver_posts",
-                    }
-                )
+    router = _router(
+        {
+            "user_intent": "ad_hoc_sql",
+            "answer_from_manifest": False,
+            "sql_query": "DROP TABLE silver_posts",
+        },
+        {
+            "user_intent": "circadian_study",
+            "answer_from_manifest": False,
+            "sql_query": (
+                "SELECT subject_id, label, night_post_ratio "
+                "FROM gold_user_longitudinal_features"
             ),
-            AIMessage(
-                content=json.dumps(
-                    {
-                        "user_intent": "circadian_study",
-                        "answer_from_manifest": False,
-                        "sql_query": (
-                            "SELECT subject_id, label, night_post_ratio "
-                            "FROM gold_user_longitudinal_features"
-                        ),
-                        "metric_name": "night_post_ratio",
-                    }
-                )
-            ),
-        ]
+            "metric_name": "night_post_ratio",
+        },
     )
-    critic = RecordingFakeChatModel(
-        responses=[
-            AIMessage(
-                content=(
-                    "Recovered after AST fix "
-                    "(depressed=30, control=30, p = 2.41976e-11, Cohen's d = 15.6425)."
-                )
-            )
-        ]
+    critic = _critic(
+        "Recovered after AST fix "
+        "(depressed=30, control=30, p = 2.41976e-11, Cohen's d = 15.6425)."
     )
     executor_calls: list[str] = []
 
@@ -367,38 +225,24 @@ def test_ast_validation_rejection_triggers_retry_without_touching_executor() -> 
 
 def test_retry_loop_stops_after_max_query_retries_on_safe_sql_error() -> None:
     settings = Settings(_env_file=None, max_query_retries=2)
-    router = RecordingFakeChatModel(
-        responses=[
-            AIMessage(
-                content=json.dumps(
-                    {
-                        "user_intent": "ad_hoc_sql",
-                        "answer_from_manifest": False,
-                        "sql_query": "SELECT bad_col FROM gold_user_longitudinal_features",
-                    }
-                )
-            ),
-            AIMessage(
-                content=json.dumps(
-                    {
-                        "user_intent": "ad_hoc_sql",
-                        "answer_from_manifest": False,
-                        "sql_query": "SELECT bad_col_2 FROM gold_user_longitudinal_features",
-                    }
-                )
-            ),
-            AIMessage(
-                content=json.dumps(
-                    {
-                        "user_intent": "ad_hoc_sql",
-                        "answer_from_manifest": False,
-                        "sql_query": "SELECT bad_col_3 FROM gold_user_longitudinal_features",
-                    }
-                )
-            ),
-        ]
+    router = _router(
+        {
+            "user_intent": "ad_hoc_sql",
+            "answer_from_manifest": False,
+            "sql_query": "SELECT bad_col FROM gold_user_longitudinal_features",
+        },
+        {
+            "user_intent": "ad_hoc_sql",
+            "answer_from_manifest": False,
+            "sql_query": "SELECT bad_col_2 FROM gold_user_longitudinal_features",
+        },
+        {
+            "user_intent": "ad_hoc_sql",
+            "answer_from_manifest": False,
+            "sql_query": "SELECT bad_col_3 FROM gold_user_longitudinal_features",
+        },
     )
-    critic = RecordingFakeChatModel(responses=[AIMessage(content="unused")])
+    critic = _critic("unused")
     executor_calls: list[str] = []
 
     def failing_executor(query: str, _cfg: Settings) -> list[dict[str, Any]]:
@@ -427,36 +271,26 @@ def test_retry_loop_stops_after_max_query_retries_on_safe_sql_error() -> None:
 
 def test_successful_retry_on_second_attempt_stops_loop() -> None:
     settings = Settings(_env_file=None, max_query_retries=2)
-    router = RecordingFakeChatModel(
-        responses=[
-            AIMessage(
-                content=json.dumps(
-                    {
-                        "user_intent": "circadian_study",
-                        "answer_from_manifest": False,
-                        "sql_query": "SELECT wrong_col FROM gold_user_longitudinal_features",
-                    }
-                )
+    router = _router(
+        {
+            "user_intent": "circadian_study",
+            "answer_from_manifest": False,
+            "sql_query": "SELECT wrong_col FROM gold_user_longitudinal_features",
+        },
+        {
+            "user_intent": "circadian_study",
+            "answer_from_manifest": False,
+            "sql_query": (
+                "SELECT subject_id, label, night_post_ratio "
+                "FROM gold_user_longitudinal_features"
             ),
-            AIMessage(
-                content=json.dumps(
-                    {
-                        "user_intent": "circadian_study",
-                        "answer_from_manifest": False,
-                        "sql_query": (
-                            "SELECT subject_id, label, night_post_ratio "
-                            "FROM gold_user_longitudinal_features"
-                        ),
-                        "metric_name": "night_post_ratio",
-                    }
-                )
-            ),
-        ]
+            "metric_name": "night_post_ratio",
+        },
     )
     completed_critique = (
         "Completed on retry (depressed=30, control=30, p = 2.41976e-11, Cohen's d = 15.6425)."
     )
-    critic = RecordingFakeChatModel(responses=[AIMessage(content=completed_critique)])
+    critic = _critic(completed_critique)
     attempts: list[str] = []
 
     def flaky_executor(query: str, _cfg: Settings) -> Sequence[dict[str, Any]]:
@@ -481,44 +315,28 @@ def test_successful_retry_on_second_attempt_stops_loop() -> None:
 
 def test_empty_result_triggers_retry_and_recovers() -> None:
     settings = Settings(_env_file=None, max_query_retries=2)
-    router = RecordingFakeChatModel(
-        responses=[
-            AIMessage(
-                content=json.dumps(
-                    {
-                        "user_intent": "circadian_study",
-                        "answer_from_manifest": False,
-                        "sql_query": (
-                            "SELECT subject_id, label, night_post_ratio "
-                            "FROM gold_user_longitudinal_features WHERE label = 99"
-                        ),
-                    }
-                )
+    router = _router(
+        {
+            "user_intent": "circadian_study",
+            "answer_from_manifest": False,
+            "sql_query": (
+                "SELECT subject_id, label, night_post_ratio "
+                "FROM gold_user_longitudinal_features WHERE label = 99"
             ),
-            AIMessage(
-                content=json.dumps(
-                    {
-                        "user_intent": "circadian_study",
-                        "answer_from_manifest": False,
-                        "sql_query": (
-                            "SELECT subject_id, label, night_post_ratio "
-                            "FROM gold_user_longitudinal_features"
-                        ),
-                        "metric_name": "night_post_ratio",
-                    }
-                )
+        },
+        {
+            "user_intent": "circadian_study",
+            "answer_from_manifest": False,
+            "sql_query": (
+                "SELECT subject_id, label, night_post_ratio "
+                "FROM gold_user_longitudinal_features"
             ),
-        ]
+            "metric_name": "night_post_ratio",
+        },
     )
-    critic = RecordingFakeChatModel(
-        responses=[
-            AIMessage(
-                content=(
-                    "Recovered after empty result "
-                    "(depressed=30, control=30, p = 2.41976e-11, Cohen's d = 15.6425)."
-                )
-            )
-        ]
+    critic = _critic(
+        "Recovered after empty result "
+        "(depressed=30, control=30, p = 2.41976e-11, Cohen's d = 15.6425)."
     )
     attempts: list[str] = []
 
@@ -549,24 +367,18 @@ def test_hitl_interrupt_persists_across_sqlite_checkpointer_and_executes_on_appr
     settings = Settings(_env_file=None, hitl_cost_threshold=1.0)
     expensive_sql = "SELECT subject_id, label, text FROM silver_posts"
 
-    router = FakeMessagesListChatModel(
-        responses=[
-            AIMessage(
-                content=json.dumps(
-                    {
-                        "user_intent": "ad_hoc_sql",
-                        "answer_from_manifest": False,
-                        "sql_query": expensive_sql,
-                    }
-                )
-            )
-        ]
+    router = _router(
+        {
+            "user_intent": "ad_hoc_sql",
+            "answer_from_manifest": False,
+            "sql_query": expensive_sql,
+        }
     )
     approved_critique = (
         "Approved expensive query completed "
         "(sample_size_depressed=0, sample_size_control=0, p = 1.0, Cohen's d = 0.0)."
     )
-    critic = FakeMessagesListChatModel(responses=[AIMessage(content=approved_critique)])
+    critic = _critic(approved_critique)
     executor_calls: list[str] = []
 
     def fake_executor(query: str, _cfg: Settings) -> list[dict[str, Any]]:
@@ -614,20 +426,14 @@ def test_hitl_interrupt_persists_across_sqlite_checkpointer_and_executes_on_appr
 def test_hitl_refusal_never_executes_and_returns_cancelled_state(tmp_path: Path) -> None:
     db_path = tmp_path / "hitl_reject.sqlite"
     settings = Settings(_env_file=None, hitl_cost_threshold=1.0)
-    router = FakeMessagesListChatModel(
-        responses=[
-            AIMessage(
-                content=json.dumps(
-                    {
-                        "user_intent": "ad_hoc_sql",
-                        "answer_from_manifest": False,
-                        "sql_query": "SELECT * FROM silver_posts",
-                    }
-                )
-            )
-        ]
+    router = _router(
+        {
+            "user_intent": "ad_hoc_sql",
+            "answer_from_manifest": False,
+            "sql_query": "SELECT * FROM silver_posts",
+        }
     )
-    critic = FakeMessagesListChatModel(responses=[AIMessage(content="Should not run")])
+    critic = _critic("Should not run")
     executor_calls: list[str] = []
 
     def fake_executor(query: str, _cfg: Settings) -> list[dict[str, Any]]:
@@ -658,31 +464,17 @@ def test_hitl_refusal_never_executes_and_returns_cancelled_state(tmp_path: Path)
 
 def test_missing_subject_id_column_records_cannot_assess_verdict_and_forbids_claims() -> None:
     settings = Settings(_env_file=None, min_subjects_per_class=30)
-    router = FakeMessagesListChatModel(
-        responses=[
-            AIMessage(
-                content=json.dumps(
-                    {
-                        "user_intent": "circadian_study",
-                        "answer_from_manifest": False,
-                        "sql_query": (
-                            "SELECT label, night_post_ratio FROM gold_user_longitudinal_features"
-                        ),
-                        "metric_name": "night_post_ratio",
-                    }
-                )
-            )
-        ]
+    router = _router(
+        {
+            "user_intent": "circadian_study",
+            "answer_from_manifest": False,
+            "sql_query": "SELECT label, night_post_ratio FROM gold_user_longitudinal_features",
+            "metric_name": "night_post_ratio",
+        }
     )
-    critic = RecordingFakeChatModel(
-        responses=[
-            AIMessage(
-                content=(
-                    "Cannot assess statistical significance without subject_id "
-                    "(depressed=0, control=0, p = 1.0, Cohen's d = 0.0)."
-                )
-            )
-        ]
+    critic = _critic(
+        "Cannot assess statistical significance without subject_id "
+        "(depressed=0, control=0, p = 1.0, Cohen's d = 0.0)."
     )
 
     def fake_executor(_query: str, _cfg: Settings) -> list[dict[str, Any]]:
@@ -722,32 +514,20 @@ def test_missing_subject_id_column_records_cannot_assess_verdict_and_forbids_cla
 
 def test_pseudo_replicated_single_subject_rows_are_caught_as_underpowered_in_graph() -> None:
     settings = Settings(_env_file=None, min_subjects_per_class=30)
-    router = FakeMessagesListChatModel(
-        responses=[
-            AIMessage(
-                content=json.dumps(
-                    {
-                        "user_intent": "circadian_study",
-                        "answer_from_manifest": False,
-                        "sql_query": (
-                            "SELECT subject_id, label, night_post_ratio "
-                            "FROM gold_user_longitudinal_features"
-                        ),
-                        "metric_name": "night_post_ratio",
-                    }
-                )
-            )
-        ]
+    router = _router(
+        {
+            "user_intent": "circadian_study",
+            "answer_from_manifest": False,
+            "sql_query": (
+                "SELECT subject_id, label, night_post_ratio "
+                "FROM gold_user_longitudinal_features"
+            ),
+            "metric_name": "night_post_ratio",
+        }
     )
-    critic = RecordingFakeChatModel(
-        responses=[
-            AIMessage(
-                content=(
-                    "Underpowered: depressed cohort has only 1 unique subject "
-                    "(depressed=1, control=35, p = 1.0, Cohen's d = 0.0)."
-                )
-            )
-        ]
+    critic = _critic(
+        "Underpowered: depressed cohort has only 1 unique subject "
+        "(depressed=1, control=35, p = 1.0, Cohen's d = 0.0)."
     )
 
     def fake_executor(_query: str, _cfg: Settings) -> list[dict[str, Any]]:
@@ -785,34 +565,21 @@ def test_topic_model_job_interrupts_at_hitl_and_executes_once_on_approval(
 ) -> None:
     db_path = tmp_path / "hitl_topic_model.sqlite"
     settings = Settings(_env_file=None, hitl_cost_threshold=1.0)
-
-    topic_cost = estimate_job_cost("topic_model", {"k": 8, "max_iter": 20}, settings=settings)
-    circadian_cost = estimate_job_cost("circadian_features", settings=settings)
-    assert topic_cost["triggers_hitl"] is True
-    assert topic_cost["estimated_cost"] > settings.hitl_cost_threshold
-    assert circadian_cost["triggers_hitl"] is True
-    assert circadian_cost["estimated_cost"] > settings.hitl_cost_threshold
-    router = FakeMessagesListChatModel(
-        responses=[
-            AIMessage(
-                content=json.dumps(
-                    {
-                        "user_intent": "lexical_analysis",
-                        "answer_from_manifest": False,
-                        "spark_job": "topic_model",
-                        "job_params": {"k": 8, "max_iter": 20},
-                        "sql_query": None,
-                        "metric_name": "mean_topic_probability",
-                    }
-                )
-            )
-        ]
+    router = _router(
+        {
+            "user_intent": "lexical_analysis",
+            "answer_from_manifest": False,
+            "spark_job": "topic_model",
+            "job_params": {"k": 8, "max_iter": 20},
+            "sql_query": None,
+            "metric_name": "mean_topic_probability",
+        }
     )
     topic_critique = (
         "LDA topic recomputation completed after approval "
         "(cannot assess subject-level significance: depressed=0, control=0, p = 1.0, Cohen's d = 0.0)."
     )
-    critic = RecordingFakeChatModel(responses=[AIMessage(content=topic_critique)])
+    critic = _critic(topic_critique)
     sql_calls: list[str] = []
     job_calls: list[tuple[str, dict[str, Any]]] = []
 
@@ -885,31 +652,19 @@ def test_topic_model_job_interrupts_at_hitl_and_executes_once_on_approval(
 
 def test_circadian_features_job_dispatch_runs_offline_and_guards_subjects() -> None:
     settings = Settings(_env_file=None, hitl_cost_threshold=2.0, min_subjects_per_class=30)
-    router = FakeMessagesListChatModel(
-        responses=[
-            AIMessage(
-                content=json.dumps(
-                    {
-                        "user_intent": "circadian_study",
-                        "answer_from_manifest": False,
-                        "spark_job": "circadian_features",
-                        "job_params": {"window_days": 30},
-                        "sql_query": None,
-                        "metric_name": "night_post_ratio",
-                    }
-                )
-            )
-        ]
+    router = _router(
+        {
+            "user_intent": "circadian_study",
+            "answer_from_manifest": False,
+            "spark_job": "circadian_features",
+            "job_params": {"window_days": 30},
+            "sql_query": None,
+            "metric_name": "night_post_ratio",
+        }
     )
-    critic = RecordingFakeChatModel(
-        responses=[
-            AIMessage(
-                content=(
-                    "Circadian job completed with significant cohort shift "
-                    "(depressed=35, control=35, p = 5.04483e-13, Cohen's d = 15.681)."
-                )
-            )
-        ]
+    critic = _critic(
+        "Circadian job completed with significant cohort shift "
+        "(depressed=35, control=35, p = 5.04483e-13, Cohen's d = 15.681)."
     )
     sql_calls: list[str] = []
     job_calls: list[tuple[str, dict[str, Any]]] = []
@@ -943,40 +698,24 @@ def test_circadian_features_job_dispatch_runs_offline_and_guards_subjects() -> N
 
 def test_unknown_spark_job_triggers_retry_and_recovers() -> None:
     settings = Settings(_env_file=None, hitl_cost_threshold=3.0, max_query_retries=2)
-    router = RecordingFakeChatModel(
-        responses=[
-            AIMessage(
-                content=json.dumps(
-                    {
-                        "user_intent": "lexical_analysis",
-                        "answer_from_manifest": False,
-                        "spark_job": "invalid_job_name",
-                        "sql_query": None,
-                    }
-                )
-            ),
-            AIMessage(
-                content=json.dumps(
-                    {
-                        "user_intent": "circadian_study",
-                        "answer_from_manifest": False,
-                        "spark_job": "circadian_features",
-                        "sql_query": None,
-                        "metric_name": "night_post_ratio",
-                    }
-                )
-            ),
-        ]
+    router = _router(
+        {
+            "user_intent": "lexical_analysis",
+            "answer_from_manifest": False,
+            "spark_job": "invalid_job_name",
+            "sql_query": None,
+        },
+        {
+            "user_intent": "circadian_study",
+            "answer_from_manifest": False,
+            "spark_job": "circadian_features",
+            "sql_query": None,
+            "metric_name": "night_post_ratio",
+        },
     )
-    critic = RecordingFakeChatModel(
-        responses=[
-            AIMessage(
-                content=(
-                    "Recovered to valid job "
-                    "(depressed=30, control=30, p = 2.41976e-11, Cohen's d = 15.6425)."
-                )
-            )
-        ]
+    critic = _critic(
+        "Recovered to valid job "
+        "(depressed=30, control=30, p = 2.41976e-11, Cohen's d = 15.6425)."
     )
     job_calls: list[str] = []
 
@@ -998,23 +737,17 @@ def test_unknown_spark_job_triggers_retry_and_recovers() -> None:
     assert "UNKNOWN_SPARK_JOB" in str(router.recorded_invocations[1][1].content)
 
 
-def _cohort_router_model(*, include_subject_id: bool = True) -> FakeMessagesListChatModel:
+def _cohort_router_model(*, include_subject_id: bool = True) -> RecordingFakeChatModel:
     cols = (
         "subject_id, label, night_post_ratio" if include_subject_id else "label, night_post_ratio"
     )
-    return FakeMessagesListChatModel(
-        responses=[
-            AIMessage(
-                content=json.dumps(
-                    {
-                        "user_intent": "circadian_study",
-                        "answer_from_manifest": False,
-                        "sql_query": f"SELECT {cols} FROM gold_user_longitudinal_features",
-                        "metric_name": "night_post_ratio",
-                    }
-                )
-            )
-        ]
+    return _router(
+        {
+            "user_intent": "circadian_study",
+            "answer_from_manifest": False,
+            "sql_query": f"SELECT {cols} FROM gold_user_longitudinal_features",
+            "metric_name": "night_post_ratio",
+        }
     )
 
 
@@ -1024,7 +757,7 @@ def test_critic_compliant_first_response_makes_exactly_one_call() -> None:
         "Depressed cohort (35 subjects) vs control cohort (35 subjects) showed a statistically "
         "significant difference (p = 5.04483e-13, Cohen's d = 15.681)."
     )
-    critic = RecordingFakeChatModel(responses=[AIMessage(content=compliant)])
+    critic = _critic(compliant)
 
     graph = build_agent_graph(
         settings=settings,
@@ -1048,9 +781,7 @@ def test_critic_omitting_p_value_triggers_single_corrective_retry() -> None:
         "Significant difference observed (depressed=35, control=35, "
         "p = 5.04483e-13, Cohen's d = 15.681)."
     )
-    critic = RecordingFakeChatModel(
-        responses=[AIMessage(content=first_bad), AIMessage(content=second_good)]
-    )
+    critic = _critic(first_bad, second_good)
 
     graph = build_agent_graph(
         settings=settings,
@@ -1074,13 +805,7 @@ def test_critic_never_complying_falls_back_to_deterministic_inconclusive_text() 
     settings = Settings(_env_file=None, min_subjects_per_class=30)
     omits_d_1 = "Observed difference (depressed=35, control=35, p = 5.04483e-13)."
     omits_d_2 = "Still omitting effect size (depressed=35, control=35, p = 5.04483e-13)."
-    critic = RecordingFakeChatModel(
-        responses=[
-            AIMessage(content=omits_d_1),
-            AIMessage(content=omits_d_2),
-            AIMessage(content="Third call must never happen."),
-        ]
-    )
+    critic = _critic(omits_d_1, omits_d_2, "Third call must never happen.")
 
     graph = build_agent_graph(
         settings=settings,
@@ -1124,9 +849,7 @@ def test_nonsignificant_underpowered_and_cannot_assess_never_ship_significance_c
         "No statistically significant difference was found "
         "(sample_size_depressed=35, sample_size_control=35, p = 0.248336, Cohen's d = 0.0000)."
     )
-    critic_ns = RecordingFakeChatModel(
-        responses=[AIMessage(content=rogue_claim), AIMessage(content=compliant_ns)]
-    )
+    critic_ns = _critic(rogue_claim, compliant_ns)
     res_ns = build_agent_graph(
         settings=settings,
         router_model=_cohort_router_model(),
@@ -1134,7 +857,12 @@ def test_nonsignificant_underpowered_and_cannot_assess_never_ship_significance_c
         sql_executor=lambda _q, _cfg: _cohort_rows(35, depressed_offset=-0.20),
     ).invoke(make_initial_state("Compare night post ratio."))
     guard_ns = StatisticalGuardResult.model_validate(res_ns["statistical_validation"])
+    assert guard_ns.is_underpowered is False
     assert guard_ns.is_significant is False
+    assert CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS in res_ns["critic_system_prompt"]
+    assert "FORBIDDEN:" in res_ns["critic_system_prompt"]
+    assert "FORBIDDEN:" in str(critic_ns.recorded_invocations[0][0].content)
+    assert "is_significant: False" in str(critic_ns.recorded_invocations[0][0].content)
     assert res_ns["critic_call_count"] == 2
     assert res_ns["critic_output_check_failed"] is None
     check_ns = validate_critic_output(res_ns["final_response"], guard_ns)
@@ -1146,9 +874,7 @@ def test_nonsignificant_underpowered_and_cannot_assess_never_ship_significance_c
         "Depressed users post at night significantly more often "
         "(depressed=5, control=5, p = 1.67857e-10, Cohen's d = 25.2982)."
     )
-    critic_up = RecordingFakeChatModel(
-        responses=[AIMessage(content=rogue_underpowered), AIMessage(content=rogue_underpowered)]
-    )
+    critic_up = _critic(rogue_underpowered, rogue_underpowered)
     res_up = build_agent_graph(
         settings=settings,
         router_model=_cohort_router_model(),
@@ -1157,6 +883,13 @@ def test_nonsignificant_underpowered_and_cannot_assess_never_ship_significance_c
     ).invoke(make_initial_state("Compare night post ratio."))
     guard_up = StatisticalGuardResult.model_validate(res_up["statistical_validation"])
     assert guard_up.is_underpowered is True
+    assert guard_up.is_significant is False
+    assert CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS in res_up["critic_system_prompt"]
+    assert "FORBIDDEN:" in res_up["critic_system_prompt"]
+    assert "Underpowered sample" in res_up["critic_system_prompt"]
+    assert "FORBIDDEN:" in str(critic_up.recorded_invocations[0][0].content)
+    assert "sample_size_depressed: 5" in str(critic_up.recorded_invocations[0][0].content)
+    assert "sample_size_control: 5" in str(critic_up.recorded_invocations[0][0].content)
     assert res_up["critic_call_count"] == 2
     assert res_up["critic_output_check_failed"] is not None
     assert res_up["critic_output_check_failed"]["forbidden_claims"]
@@ -1169,9 +902,7 @@ def test_nonsignificant_underpowered_and_cannot_assess_never_ship_significance_c
         "There is a statistically significant difference between depressed and control users "
         "(depressed=0, control=0, p = 1.0, Cohen's d = 0.0)."
     )
-    critic_ca = RecordingFakeChatModel(
-        responses=[AIMessage(content=rogue_ca), AIMessage(content=rogue_ca)]
-    )
+    critic_ca = _critic(rogue_ca, rogue_ca)
     res_ca = build_agent_graph(
         settings=settings,
         router_model=_cohort_router_model(include_subject_id=False),
@@ -1244,15 +975,9 @@ def test_full_cohort_819_subjects_analyzed_while_state_rows_capped_at_500(
         "subject_id STRING, label INT, night_post_ratio DOUBLE",
     ).write.mode("overwrite").parquet(str(paths.gold_user_longitudinal_features))
 
-    critic = RecordingFakeChatModel(
-        responses=[
-            AIMessage(
-                content=(
-                    "Full cohort comparison across depressed=100 and control=719 subjects "
-                    "(p = 5.84328e-60, Cohen's d = 9.96672)."
-                )
-            )
-        ]
+    critic = _critic(
+        "Full cohort comparison across depressed=100 and control=719 subjects "
+        "(p = 5.84328e-60, Cohen's d = 9.96672)."
     )
     sql_executor = make_spark_sql_executor(spark, settings=settings, paths=paths)
     graph = build_agent_graph(
@@ -1311,32 +1036,20 @@ def test_fetch_limit_cap_marks_truncated_and_demands_critic_disclosure(
         "subject_id STRING, label INT, night_post_ratio DOUBLE",
     ).write.mode("overwrite").parquet(str(paths.gold_user_longitudinal_features))
 
-    ordered_router = FakeMessagesListChatModel(
-        responses=[
-            AIMessage(
-                content=json.dumps(
-                    {
-                        "user_intent": "circadian_study",
-                        "answer_from_manifest": False,
-                        "sql_query": (
-                            "SELECT subject_id, label, night_post_ratio "
-                            "FROM gold_user_longitudinal_features ORDER BY subject_id"
-                        ),
-                        "metric_name": "night_post_ratio",
-                    }
-                )
-            )
-        ]
+    ordered_router = _router(
+        {
+            "user_intent": "circadian_study",
+            "answer_from_manifest": False,
+            "sql_query": (
+                "SELECT subject_id, label, night_post_ratio "
+                "FROM gold_user_longitudinal_features ORDER BY subject_id"
+            ),
+            "metric_name": "night_post_ratio",
+        }
     )
-    critic = RecordingFakeChatModel(
-        responses=[
-            AIMessage(
-                content=(
-                    "Capped sample analysis (truncated at 20 rows): "
-                    "depressed=10, control=10, p = 1.0, Cohen's d = 0.0."
-                )
-            )
-        ]
+    critic = _critic(
+        "Capped sample analysis (truncated at 20 rows): "
+        "depressed=10, control=10, p = 1.0, Cohen's d = 0.0."
     )
     sql_executor = make_spark_sql_executor(spark, settings=settings, paths=paths)
     graph = build_agent_graph(

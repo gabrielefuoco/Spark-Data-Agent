@@ -7,7 +7,6 @@ Run inside the dev container bound to ``0.0.0.0:8501``:
 from __future__ import annotations
 
 import uuid
-from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -106,25 +105,14 @@ def _get_cached_runtime(
     )
 
 
-def resolve_checkpoint_path(settings: Settings | None = None) -> Path:
-    """Return the local filesystem path for the LangGraph SQLite checkpointer.
-
-    SQLite requires a local filesystem for file locking and random writes and
-    cannot reside on ``s3a://`` object storage. Checkpoint persistence is
-    therefore explicitly pinned to ``PROJECT_ROOT / "data"`` rather than
-    derived from ``Settings.spark_storage_uri``.
-    """
-    _ = settings
-    return PROJECT_ROOT / "data" / "agent_checkpoints.sqlite"
-
-
 def _get_graph(settings: Settings) -> Any:
     """Return an injected test graph from session_state or build the live runtime graph."""
     injected = st.session_state.get("agent_graph")
     if injected is not None:
         return injected
 
-    checkpoint_path = str(resolve_checkpoint_path(settings))
+    # SQLite requires a local filesystem for file locking and cannot reside on s3a://.
+    checkpoint_path = str(PROJECT_ROOT / "data" / "agent_checkpoints.sqlite")
     return _get_cached_runtime(
         settings.spark_storage_uri,
         settings.llm_backend,

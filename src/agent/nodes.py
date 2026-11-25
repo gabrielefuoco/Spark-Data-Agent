@@ -14,7 +14,7 @@ from typing import Any, Protocol
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langgraph.types import interrupt
-from pyspark.sql import SparkSession
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
 from src.agent.cost import estimate_job_cost, estimate_sql_cost
@@ -54,12 +54,6 @@ ManifestLoader = Callable[[], DatasetManifest]
 
 SUPPORTED_SPARK_JOBS: frozenset[str] = frozenset({"circadian_features", "topic_model"})
 _SPARK_JOB_PREFIX = "SPARK_JOB:"
-_ROUTER_JOB_DISPATCH_ADDENDUM = (
-    "\n\nNon-SQL Spark job dispatch:\n"
-    "- When the user explicitly asks to recompute circadian/window features or fit/recompute "
-    "the Spark ML LDA topic model from raw Silver posts, set `sql_query: null` and specify "
-    '`"spark_job": "circadian_features" | "topic_model"` with optional `"job_params": {{...}}`.'
-)
 
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
 _EXCLUDED_METRIC_COLUMNS = frozenset(
@@ -86,6 +80,21 @@ def _to_json_value(value: Any) -> Any:
     return str(value)
 
 
+def _collect_spark_result(df: DataFrame, fetch_limit: int) -> dict[str, Any]:
+    rows = [
+        {str(k): _to_json_value(v) for k, v in row.asDict(recursive=True).items()}
+        for row in df.collect()
+    ]
+    rows_returned = len(rows)
+    return {
+        "columns": list(df.columns),
+        "rows": rows,
+        "row_count": rows_returned,
+        "rows_returned": rows_returned,
+        "truncated": rows_returned >= fetch_limit,
+    }
+
+
 def make_spark_sql_executor(
     spark: SparkSession,
     *,
@@ -102,19 +111,7 @@ def make_spark_sql_executor(
             settings=resolved_settings,
             paths=paths,
         )
-        raw_rows = df.collect()
-        rows = [
-            {str(k): _to_json_value(v) for k, v in row.asDict(recursive=True).items()}
-            for row in raw_rows
-        ]
-        rows_returned = len(rows)
-        return {
-            "columns": list(df.columns),
-            "rows": rows,
-            "row_count": rows_returned,
-            "rows_returned": rows_returned,
-            "truncated": rows_returned >= resolved_settings.sql_fetch_limit,
-        }
+        return _collect_spark_result(df, resolved_settings.sql_fetch_limit)
 
     return _execute
 
@@ -133,16 +130,14 @@ def decode_spark_job(generated_query: str | None) -> tuple[str, dict[str, Any]] 
     if not stripped.startswith(_SPARK_JOB_PREFIX):
         return None
     body = stripped[len(_SPARK_JOB_PREFIX) :].strip()
-    if not body:
+    if not body.startswith("{"):
         return None
-    if body.startswith("{"):
-        parsed = json.loads(body)
-        if not isinstance(parsed, dict) or not parsed.get("job"):
-            return None
-        raw_params = parsed.get("params")
-        params = dict(raw_params) if isinstance(raw_params, dict) else {}
-        return str(parsed["job"]).strip().lower(), params
-    return body.lower(), {}
+    parsed = json.loads(body)
+    if not isinstance(parsed, dict) or not parsed.get("job"):
+        return None
+    raw_params = parsed.get("params")
+    params = dict(raw_params) if isinstance(raw_params, dict) else {}
+    return str(parsed["job"]).strip().lower(), params
 
 
 def make_spark_job_executor(
@@ -201,19 +196,7 @@ def make_spark_job_executor(
                 resolved_settings.sql_fetch_limit
             )
 
-        raw_rows = result_df.collect()
-        rows = [
-            {str(k): _to_json_value(v) for k, v in row.asDict(recursive=True).items()}
-            for row in raw_rows
-        ]
-        rows_returned = len(rows)
-        return {
-            "columns": list(result_df.columns),
-            "rows": rows,
-            "row_count": rows_returned,
-            "rows_returned": rows_returned,
-            "truncated": rows_returned >= resolved_settings.sql_fetch_limit,
-        }
+        return _collect_spark_result(result_df, resolved_settings.sql_fetch_limit)
 
     return _execute_job
 
@@ -419,30 +402,23 @@ def _extract_group_metrics(
     label_col = _find_column_key(candidate_cols, "label")
     has_subject_col = subject_col is not None
 
-    if not rows or label_col is None:
-        return _ExtractedGroupMetrics(
-            depressed_observations=[],
-            control_observations=[],
-            metric_name=metric_label,
-            has_subject_dimension=has_subject_col,
-            raw_observation_count_depressed=0,
-            raw_observation_count_control=0,
-        )
-
     metric_col: str | None = None
-    if preferred_metric:
-        preferred_key = _find_column_key(candidate_cols, preferred_metric.lower())
-        if preferred_key and any(_as_finite_float(r.get(preferred_key)) is not None for r in rows):
-            metric_col = preferred_key
-    if metric_col is None:
-        for col in candidate_cols:
-            if col.lower() in _EXCLUDED_METRIC_COLUMNS:
-                continue
-            if any(_as_finite_float(r.get(col)) is not None for r in rows):
-                metric_col = col
-                break
+    if rows and label_col is not None:
+        if preferred_metric:
+            preferred_key = _find_column_key(candidate_cols, preferred_metric.lower())
+            if preferred_key and any(
+                _as_finite_float(r.get(preferred_key)) is not None for r in rows
+            ):
+                metric_col = preferred_key
+        if metric_col is None:
+            for col in candidate_cols:
+                if col.lower() in _EXCLUDED_METRIC_COLUMNS:
+                    continue
+                if any(_as_finite_float(r.get(col)) is not None for r in rows):
+                    metric_col = col
+                    break
 
-    if metric_col is None:
+    if metric_col is None or label_col is None:
         return _ExtractedGroupMetrics(
             depressed_observations=[],
             control_observations=[],
@@ -595,7 +571,7 @@ def intent_router_planner(state: DataAgentState, deps: AgentRuntimeDeps) -> dict
 
     llm_response = deps.get_router_model().invoke(
         [
-            SystemMessage(content=ROUTER_SYSTEM_PROMPT + _ROUTER_JOB_DISPATCH_ADDENDUM),
+            SystemMessage(content=ROUTER_SYSTEM_PROMPT),
             HumanMessage(content=planner_prompt),
         ]
     )

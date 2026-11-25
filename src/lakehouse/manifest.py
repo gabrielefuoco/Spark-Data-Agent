@@ -47,15 +47,12 @@ def resolve_manifest_filesystem(
     manifest_path: str | Path,
     settings: Settings | None = None,
 ) -> tuple[pafs.FileSystem, str]:
-    """Return the PyArrow filesystem and normalized path for a manifest path or ``s3a://`` URI."""
+    """Return the PyArrow S3 filesystem and ``bucket/key`` path for an ``s3a://`` manifest URI."""
     raw = str(manifest_path).strip()
-    if not is_s3a_uri(raw):
-        return pafs.LocalFileSystem(), str(manifest_path)
-
     parsed = urlparse(raw)
     bucket = parsed.netloc
     key = parsed.path.lstrip("/")
-    if not bucket or not key:
+    if not is_s3a_uri(raw) or not bucket or not key:
         raise StorageConfigurationError(
             f"Invalid S3A manifest URI {raw!r}: expected 's3a://<bucket>/<key>'."
         )

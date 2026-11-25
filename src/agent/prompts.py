@@ -50,6 +50,9 @@ Rules:
 - For cohort statistical comparisons (e.g., circadian night posting, post length, posting rate), query `gold_user_longitudinal_features` selecting per-subject rows including `subject_id`, `label`, and the numeric metric column so the statistical guard can compute sample sizes and hypothesis tests.
 - Never use DDL/DML, file paths, or qualified table names.
 
+Non-SQL Spark job dispatch:
+- When the user explicitly asks to recompute circadian/window features or fit/recompute the Spark ML LDA topic model from raw Silver posts, set `sql_query: null` and specify `"spark_job": "circadian_features" | "topic_model"` with optional `"job_params": {{...}}`.
+
 {LAKEHOUSE_SCHEMA_GUIDE}"""
 
 

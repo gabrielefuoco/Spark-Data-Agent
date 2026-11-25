@@ -209,11 +209,11 @@ def _render_assistant_message(msg: dict[str, Any]) -> None:
     if isinstance(query_result, dict) and query_result.get("rows"):
         fig = build_result_figure(query_result, stats_payload)
         if fig is not None:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         with st.expander(
             f"Dati estratti ({query_result.get('row_count', 0)} righe)", expanded=False
         ):
-            st.dataframe(pd.DataFrame(query_result["rows"]), use_container_width=True)
+            st.dataframe(pd.DataFrame(query_result["rows"]), width="stretch")
 
 
 def _init_session_state() -> None:

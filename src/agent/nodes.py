@@ -26,16 +26,21 @@ from src.agent.guards import (
     StatisticalGuardResult,
     evaluate_query_result_guard,
 )
-from src.agent.memory import build_conversation_window
+from src.agent.memory import (
+    ConversationWindow,
+    build_conversation_window,
+    extract_message_text,
+)
 from src.agent.models import create_chat_model
 from src.agent.prompts import (
     AGENT_SYSTEM_PROMPT,
     build_critic_system_prompt,
     build_critic_user_prompt,
-    extract_message_text,
+    format_manifest_digest,
     format_statistical_appendix,
     format_tool_results_summary,
 )
+from src.agent.routing import find_pending_tool_calls
 from src.agent.state import DataAgentState, ToolResultEntry, ToolTraceEntry
 from src.agent.tools import AGENT_TOOLS, canonical_tool_signature
 from src.analytics.features import (
@@ -48,6 +53,7 @@ from src.analytics.safe_sql import SafeSQLError, execute_safe_spark_sql, validat
 from src.config import Settings
 from src.lakehouse.manifest import DatasetManifest, load_manifest
 from src.lakehouse.paths import LakehousePaths
+from src.lakehouse.storage import StorageConfigurationError
 
 SqlExecutor = Callable[[str, Settings], dict[str, Any] | list[dict[str, Any]]]
 JobExecutor = Callable[[str, dict[str, Any], Settings], dict[str, Any] | list[dict[str, Any]]]
@@ -118,24 +124,6 @@ def encode_spark_job(job_name: str, params: dict[str, Any] | None = None) -> str
     """Serialize a non-SQL Spark job dispatch specification into a readable string."""
     payload = {"job": job_name.strip().lower(), "params": dict(params or {})}
     return f"{_SPARK_JOB_PREFIX}{json.dumps(payload, sort_keys=True)}"
-
-
-def decode_spark_job(generated_query: str | None) -> tuple[str, dict[str, Any]] | None:
-    """Parse a serialized Spark job dispatch spec, or return ``None`` for SQL."""
-    if not isinstance(generated_query, str):
-        return None
-    stripped = generated_query.strip()
-    if not stripped.startswith(_SPARK_JOB_PREFIX):
-        return None
-    body = stripped[len(_SPARK_JOB_PREFIX) :].strip()
-    if not body.startswith("{"):
-        return None
-    parsed = json.loads(body)
-    if not isinstance(parsed, dict) or not parsed.get("job"):
-        return None
-    raw_params = parsed.get("params")
-    params = dict(raw_params) if isinstance(raw_params, dict) else {}
-    return str(parsed["job"]).strip().lower(), params
 
 
 def make_spark_job_executor(
@@ -257,14 +245,6 @@ class AgentRuntimeDeps:
 
         return _missing_spark_job
 
-    def estimate_cost(self, query: str) -> dict[str, Any]:
-        """Estimate query or Spark job execution cost."""
-        job_spec = decode_spark_job(query)
-        if job_spec is not None:
-            job_name, job_params = job_spec
-            return estimate_job_cost(job_name, job_params, settings=self.settings)
-        return estimate_sql_cost(query, settings=self.settings, spark=self.spark)
-
     def load_manifest(self) -> DatasetManifest:
         """Load the Gold dataset manifest using the injected loader or settings."""
         if self.manifest_loader is not None:
@@ -308,6 +288,8 @@ def _normalize_query_result(raw: dict[str, Any] | list[dict[str, Any]]) -> dict[
         }
 
     if isinstance(raw, dict):
+        if "columns" in raw and "row_count" in raw and "rows_returned" in raw:
+            return raw
         rows_raw = raw.get("rows", [])
         rows = [{str(k): _to_json_value(v) for k, v in row.items()} for row in rows_raw]
         columns = list(raw.get("columns") or (rows[0].keys() if rows else []))
@@ -429,9 +411,22 @@ def _format_tool_error_message(
     return json.dumps({"status": status, "error": error}, ensure_ascii=False, default=str)
 
 
-def agent(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str, Any]:
-    """Invoke the tool-bound model with system prompt, history window, and tool summary."""
-    question, prior_messages, current_turn_messages = _split_turn_messages(state.get("messages", []))
+def _build_manifest_digest(deps: AgentRuntimeDeps) -> str:
+    """Load the static Gold manifest once and format a compact digest for the system prompt."""
+    try:
+        manifest = deps.load_manifest()
+    except (FileNotFoundError, StorageConfigurationError, OSError, ValueError):
+        manifest = None
+    return format_manifest_digest(manifest)
+
+
+def _prepare_turn_context(
+    state: DataAgentState,
+    deps: AgentRuntimeDeps,
+) -> tuple[str, ConversationWindow | None, list[BaseMessage]]:
+    question, prior_messages, current_turn_messages = _split_turn_messages(
+        state.get("messages", [])
+    )
     history_window = (
         build_conversation_window(
             prior_messages,
@@ -440,13 +435,39 @@ def agent(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str, Any]:
         if prior_messages
         else None
     )
+    return question, history_window, current_turn_messages
+
+
+def _append_budget_exhausted_note(
+    text: str,
+    *,
+    budget_exhausted: bool,
+    max_tool_calls: int,
+    note: str,
+) -> str:
+    if budget_exhausted and (
+        "budget" not in text.lower() and str(max_tool_calls) not in text
+    ):
+        return f"{text}\n\n{note}"
+    return text
+
+
+def agent(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str, Any]:
+    """Invoke the tool-bound model with system prompt, manifest digest, history, and tool summary."""
+    question, history_window, current_turn_messages = _prepare_turn_context(state, deps)
 
     tool_trace = state.get("tool_trace", [])
     tool_results = state.get("tool_results", [])
     tool_call_count = state.get("tool_call_count", 0)
     budget_exhausted = bool(state.get("budget_exhausted", False))
 
-    system_parts = [AGENT_SYSTEM_PROMPT]
+    manifest_digest = state.get("manifest_digest")
+    state_updates: dict[str, Any] = {}
+    if manifest_digest is None:
+        manifest_digest = _build_manifest_digest(deps)
+        state_updates["manifest_digest"] = manifest_digest
+
+    system_parts = [AGENT_SYSTEM_PROMPT, manifest_digest]
     if tool_trace or budget_exhausted:
         system_parts.append(
             format_tool_results_summary(
@@ -483,117 +504,101 @@ def agent(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str, Any]:
     tool_calls = getattr(response, "tool_calls", None) or []
     if tool_calls:
         if budget_exhausted:
-            return {"status": "failing"}
-        return {"messages": [response], "status": "running"}
+            return {**state_updates, "status": "failing"}
+        return {**state_updates, "messages": [response], "status": "running"}
 
     text = extract_message_text(response).strip()
     if budget_exhausted and not text:
-        return {"status": "failing"}
+        return {**state_updates, "status": "failing"}
 
     if tool_results:
-        return {"agent_draft_response": text, "status": "running"}
+        return {**state_updates, "agent_draft_response": text, "status": "running"}
 
-    if budget_exhausted and (
-        "budget" not in text.lower() and str(deps.settings.max_tool_calls) not in text
-    ):
-        text = (
-            f"{text}\n\n"
-            f"(Tool call budget exhausted: max_tool_calls={deps.settings.max_tool_calls}.)"
-        )
+    text = _append_budget_exhausted_note(
+        text,
+        budget_exhausted=budget_exhausted,
+        max_tool_calls=deps.settings.max_tool_calls,
+        note=f"(Tool call budget exhausted: max_tool_calls={deps.settings.max_tool_calls}.)",
+    )
 
     final_status = "cancelled" if state.get("hitl_decision") == "rejected" else "completed"
     return {
+        **state_updates,
         "final_response": text,
         "status": final_status,
         "messages": [AIMessage(content=text)],
     }
 
 
-def _find_pending_tool_calls(messages: Sequence[BaseMessage]) -> list[dict[str, Any]]:
-    for idx in range(len(messages) - 1, -1, -1):
-        msg = messages[idx]
-        if isinstance(msg, AIMessage) and msg.tool_calls:
-            answered_ids = {
-                m.tool_call_id
-                for m in messages[idx + 1 :]
-                if isinstance(m, ToolMessage) and m.tool_call_id
-            }
-            return [dict(tc) for tc in msg.tool_calls if tc.get("id") not in answered_ids]
-    return []
+_ToolExecOutcome = tuple[
+    str,
+    str | None,
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+    str,
+    dict[str, Any],
+]
 
 
-def _execute_sql_tool(
-    args: dict[str, Any],
-    deps: AgentRuntimeDeps,
-) -> tuple[str, str | None, dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None, str, dict[str, Any]]:
-    """Validate, cost-gate (HITL), execute, and guard a ``run_safe_sql`` call."""
-    raw_query = args.get("query")
-    if not isinstance(raw_query, str):
-        err = SafeSQLError("EMPTY_QUERY", "Argument 'query' must be a SQL string.").to_dict()
-        return "error", None, None, None, err, "not_required", _empty_guard_payload(deps.settings)
-
-    try:
-        safe_sql = validate_and_rewrite_sql(raw_query, row_limit=deps.settings.sql_fetch_limit)
-        cost_info = deps.estimate_cost(safe_sql)
-    except SafeSQLError as exc:
-        err = exc.to_dict()
-        return (
-            "error",
-            raw_query,
-            None,
-            None,
-            err,
-            "not_required",
-            _empty_guard_payload(deps.settings),
-        )
-
+def _run_gated_tool(
+    *,
+    query_label: str,
+    cost_info: dict[str, Any],
+    runner: Callable[[], dict[str, Any] | list[dict[str, Any]]],
+    settings: Settings,
+    hitl_noun: str,
+) -> _ToolExecOutcome:
+    """Enforce HITL cost gate, execute ``runner``, and evaluate the statistical guard."""
     hitl_decision = "not_required"
     if cost_info.get("triggers_hitl"):
         decision = interrupt(
             {
                 "type": "hitl_approval_required",
-                "query": safe_sql,
+                "query": query_label,
                 "estimated_cost": cost_info.get("estimated_cost"),
-                "threshold": cost_info.get("threshold", deps.settings.hitl_cost_threshold),
+                "threshold": cost_info.get("threshold", settings.hitl_cost_threshold),
                 "reasons": cost_info.get("reasons", []),
-                "message": "Estimated query cost exceeds threshold; human authorization required.",
+                "message": f"Estimated {hitl_noun} cost exceeds threshold; human authorization required.",
             }
         )
         if not _normalize_hitl_decision(decision):
             err = {
                 "code": "HITL_REJECTED",
-                "message": "Query execution cancelled/rejected by user at the human-in-the-loop approval gate.",
-                "query": safe_sql,
+                "message": (
+                    f"{hitl_noun.capitalize()} execution cancelled/rejected by user at the "
+                    "human-in-the-loop approval gate."
+                ),
+                "query": query_label,
             }
             return (
                 "hitl_rejected",
-                safe_sql,
+                query_label,
                 cost_info,
                 None,
                 err,
                 "rejected",
-                _empty_guard_payload(deps.settings),
+                _empty_guard_payload(settings),
             )
         hitl_decision = "approved"
 
     try:
-        raw_result = deps.get_sql_executor()(safe_sql, deps.settings)
+        raw_result = runner()
     except SafeSQLError as exc:
-        err = exc.to_dict()
         return (
             "error",
-            safe_sql,
+            query_label,
             cost_info,
             None,
-            err,
+            exc.to_dict(),
             hitl_decision,
-            _empty_guard_payload(deps.settings),
+            _empty_guard_payload(settings),
         )
 
-    display_payload, guard_payload = _build_guard_and_display(raw_result, settings=deps.settings)
+    display_payload, guard_payload = _build_guard_and_display(raw_result, settings=settings)
     return (
         "executed",
-        safe_sql,
+        query_label,
         cost_info,
         display_payload,
         None,
@@ -602,50 +607,37 @@ def _execute_sql_tool(
     )
 
 
-def _execute_manifest_tool(
-    deps: AgentRuntimeDeps,
-) -> tuple[str, str | None, dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None, dict[str, Any]]:
-    """Load the static Gold manifest without Spark and tag it strictly ``descriptive``."""
+def _execute_sql_tool(args: dict[str, Any], deps: AgentRuntimeDeps) -> _ToolExecOutcome:
+    """Validate, cost-gate (HITL), execute, and guard a ``run_safe_sql`` call."""
+    raw_query = args.get("query")
+    if not isinstance(raw_query, str):
+        err = SafeSQLError("EMPTY_QUERY", "Argument 'query' must be a SQL string.").to_dict()
+        return "error", None, None, None, err, "not_required", _empty_guard_payload(deps.settings)
+
     try:
-        manifest = deps.load_manifest()
-    except FileNotFoundError:
-        err = {
-            "code": "MANIFEST_NOT_FOUND",
-            "message": (
-                "The Gold dataset manifest (gold_dataset_manifest.json) is not available yet. "
-                "Run the Medallion ETL pipeline first."
-            ),
-            "query": "read_dataset_manifest()",
-        }
+        safe_sql = validate_and_rewrite_sql(raw_query, row_limit=deps.settings.sql_fetch_limit)
+        cost_info = estimate_sql_cost(safe_sql, settings=deps.settings, spark=deps.spark)
+    except SafeSQLError as exc:
         return (
             "error",
-            "read_dataset_manifest()",
+            raw_query,
             None,
             None,
-            err,
-            _empty_guard_payload(deps.settings, "catalog_manifest"),
+            exc.to_dict(),
+            "not_required",
+            _empty_guard_payload(deps.settings),
         )
 
-    manifest_row = manifest.model_dump(mode="json")
-    display_payload, guard_payload = _build_guard_and_display(
-        [manifest_row],
+    return _run_gated_tool(
+        query_label=safe_sql,
+        cost_info=cost_info,
+        runner=lambda: deps.get_sql_executor()(safe_sql, deps.settings),
         settings=deps.settings,
-        preferred_metric="total_posts",
-    )
-    return (
-        "executed",
-        "read_dataset_manifest()",
-        None,
-        display_payload,
-        None,
-        guard_payload,
+        hitl_noun="query",
     )
 
 
-def _execute_spark_job_tool(
-    args: dict[str, Any],
-    deps: AgentRuntimeDeps,
-) -> tuple[str, str | None, dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None, str, dict[str, Any]]:
+def _execute_spark_job_tool(args: dict[str, Any], deps: AgentRuntimeDeps) -> _ToolExecOutcome:
     """Validate, cost-gate (HITL), execute, and guard a ``run_spark_job`` call."""
     raw_job = args.get("job")
     raw_params = args.get("params")
@@ -682,64 +674,49 @@ def _execute_spark_job_tool(
         )
 
     cost_info = estimate_job_cost(job_name, clean_params, settings=deps.settings)
-    hitl_decision = "not_required"
-    if cost_info.get("triggers_hitl"):
-        decision = interrupt(
-            {
-                "type": "hitl_approval_required",
-                "query": canonical,
-                "estimated_cost": cost_info.get("estimated_cost"),
-                "threshold": cost_info.get("threshold", deps.settings.hitl_cost_threshold),
-                "reasons": cost_info.get("reasons", []),
-                "message": "Estimated Spark job cost exceeds threshold; human authorization required.",
-            }
-        )
-        if not _normalize_hitl_decision(decision):
-            err = {
-                "code": "HITL_REJECTED",
-                "message": "Spark job execution cancelled/rejected by user at the human-in-the-loop approval gate.",
-                "query": canonical,
-            }
-            return (
-                "hitl_rejected",
-                canonical,
-                cost_info,
-                None,
-                err,
-                "rejected",
-                _empty_guard_payload(deps.settings),
-            )
-        hitl_decision = "approved"
-
-    try:
-        raw_result = deps.get_job_executor()(job_name, clean_params, deps.settings)
-    except SafeSQLError as exc:
-        err = exc.to_dict()
-        return (
-            "error",
-            canonical,
-            cost_info,
-            None,
-            err,
-            hitl_decision,
-            _empty_guard_payload(deps.settings),
-        )
-
-    display_payload, guard_payload = _build_guard_and_display(raw_result, settings=deps.settings)
-    return (
-        "executed",
-        canonical,
-        cost_info,
-        display_payload,
-        None,
-        hitl_decision,
-        guard_payload,
+    return _run_gated_tool(
+        query_label=canonical,
+        cost_info=cost_info,
+        runner=lambda: deps.get_job_executor()(job_name, clean_params, deps.settings),
+        settings=deps.settings,
+        hitl_noun="Spark job",
     )
+
+
+def _reject_pending_tools(
+    pending_items: Sequence[dict[str, Any]],
+    trace: list[ToolTraceEntry],
+    *,
+    status: str,
+    error: dict[str, Any],
+    settings: Settings,
+) -> list[ToolMessage]:
+    messages: list[ToolMessage] = []
+    guard_payload = _empty_guard_payload(settings)
+    content = _format_tool_error_message(status=status, error=error)
+    for item in pending_items:
+        item_id = str(item.get("id") or f"call_{len(trace) + 1}")
+        item_name = str(item.get("name") or "")
+        item_args = dict(item.get("args") or {})
+        trace.append(
+            ToolTraceEntry(
+                tool_call_id=item_id,
+                name=item_name,
+                arguments=item_args,
+                rows_returned=0,
+                guard_payload=dict(guard_payload),
+                status=status,
+                cost_estimate=None,
+                error=error,
+            )
+        )
+        messages.append(ToolMessage(content=content, tool_call_id=item_id, name=item_name))
+    return messages
 
 
 def execute_tools(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str, Any]:
     """Execute one pending tool call per step with budget, repeat-cap, HITL, and guard."""
-    pending = _find_pending_tool_calls(state.get("messages", []))
+    pending = find_pending_tool_calls(state.get("messages", []))
     if not pending:
         return {"status": "running"}
 
@@ -752,7 +729,6 @@ def execute_tools(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str, An
     hitl_decision = state.get("hitl_decision")
 
     if tool_call_count >= deps.settings.max_tool_calls:
-        new_messages: list[ToolMessage] = []
         budget_err = {
             "code": "TOOL_BUDGET_EXHAUSTED",
             "message": (
@@ -761,33 +737,13 @@ def execute_tools(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str, An
                 "the results gathered so far."
             ),
         }
-        for tc in pending:
-            call_id = str(tc.get("id") or f"call_{len(trace) + 1}")
-            name = str(tc.get("name") or "")
-            args = dict(tc.get("args") or {})
-            guard_payload = _empty_guard_payload(deps.settings)
-            trace.append(
-                ToolTraceEntry(
-                    tool_call_id=call_id,
-                    name=name,
-                    arguments=args,
-                    rows_returned=0,
-                    guard_payload=guard_payload,
-                    status="budget_exhausted",
-                    cost_estimate=None,
-                    error=budget_err,
-                )
-            )
-            new_messages.append(
-                ToolMessage(
-                    content=_format_tool_error_message(
-                        status="budget_exhausted",
-                        error=budget_err,
-                    ),
-                    tool_call_id=call_id,
-                    name=name,
-                )
-            )
+        new_messages = _reject_pending_tools(
+            pending,
+            trace,
+            status="budget_exhausted",
+            error=budget_err,
+            settings=deps.settings,
+        )
         return {
             "messages": new_messages,
             "tool_trace": trace,
@@ -810,70 +766,22 @@ def execute_tools(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str, An
                 "or provide your final answer from the data already gathered."
             ),
         }
-        guard_payload = _empty_guard_payload(deps.settings)
-        if repeat_triggered:
-            halted_messages: list[ToolMessage] = []
-            for item in pending:
-                item_id = str(item.get("id") or f"call_{len(trace) + 1}")
-                item_name = str(item.get("name") or "")
-                item_args = dict(item.get("args") or {})
-                trace.append(
-                    ToolTraceEntry(
-                        tool_call_id=item_id,
-                        name=item_name,
-                        arguments=item_args,
-                        rows_returned=0,
-                        guard_payload=_empty_guard_payload(deps.settings),
-                        status="repeat_blocked",
-                        cost_estimate=None,
-                        error=repeat_err,
-                    )
-                )
-                halted_messages.append(
-                    ToolMessage(
-                        content=_format_tool_error_message(
-                            status="repeat_blocked",
-                            error=repeat_err,
-                        ),
-                        tool_call_id=item_id,
-                        name=item_name,
-                    )
-                )
-            return {
-                "messages": halted_messages,
-                "tool_trace": trace,
-                "repeat_cap_triggered": True,
-                "repeat_loop_halted": True,
-                "status": "running",
-            }
-
-        trace.append(
-            ToolTraceEntry(
-                tool_call_id=call_id,
-                name=name,
-                arguments=args,
-                rows_returned=0,
-                guard_payload=guard_payload,
-                status="repeat_blocked",
-                cost_estimate=None,
-                error=repeat_err,
-            )
+        rejected = _reject_pending_tools(
+            pending if repeat_triggered else [tc],
+            trace,
+            status="repeat_blocked",
+            error=repeat_err,
+            settings=deps.settings,
         )
-        return {
-            "messages": [
-                ToolMessage(
-                    content=_format_tool_error_message(
-                        status="repeat_blocked",
-                        error=repeat_err,
-                    ),
-                    tool_call_id=call_id,
-                    name=name,
-                )
-            ],
+        repeat_updates: dict[str, Any] = {
+            "messages": rejected,
             "tool_trace": trace,
             "repeat_cap_triggered": True,
             "status": "running",
         }
+        if repeat_triggered:
+            repeat_updates["repeat_loop_halted"] = True
+        return repeat_updates
 
     next_count = tool_call_count + 1
     next_repeat = (repeat_count + 1) if sig == last_sig else 1
@@ -884,10 +792,6 @@ def execute_tools(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str, An
         )
         if call_hitl != "not_required":
             hitl_decision = call_hitl
-    elif name == "read_dataset_manifest":
-        status, query_label, cost_info, display_payload, err, guard_payload = (
-            _execute_manifest_tool(deps)
-        )
     elif name == "run_spark_job":
         status, query_label, cost_info, display_payload, err, call_hitl, guard_payload = (
             _execute_spark_job_tool(args, deps)
@@ -901,7 +805,7 @@ def execute_tools(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str, An
         display_payload = None
         err = {
             "code": "UNKNOWN_TOOL",
-            "message": f"Unsupported tool {name!r}; expected run_safe_sql, read_dataset_manifest, or run_spark_job.",
+            "message": f"Unsupported tool {name!r}; expected run_safe_sql or run_spark_job.",
         }
         guard_payload = _empty_guard_payload(deps.settings)
 
@@ -955,7 +859,6 @@ def execute_tools(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str, An
     }
     if primary_entry is not None:
         updates["generated_query"] = primary_entry["query"]
-        updates["sql_cost_estimate"] = primary_entry["cost_estimate"]
         updates["query_result"] = primary_entry["result"]
         updates["statistical_validation"] = primary_entry["guard_payload"]
     return updates
@@ -976,15 +879,7 @@ def scientific_critic(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str
     recollection and the fallback fires only on genuine claim violations (for example, prose
     asserting a difference where the appendix table reports ``non significativo``).
     """
-    question, prior_messages, _ = _split_turn_messages(state.get("messages", []))
-    history_window = (
-        build_conversation_window(
-            prior_messages,
-            token_budget=deps.settings.conversation_token_budget,
-        )
-        if prior_messages
-        else None
-    )
+    question, history_window, _ = _prepare_turn_context(state, deps)
 
     tool_results = state.get("tool_results", [])
     guard_results: list[StatisticalGuardResult] = [
@@ -1060,23 +955,19 @@ def scientific_critic(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str
                 "forbidden_claims": list(check.forbidden_claims),
             }
 
-    if budget_exhausted and (
-        "budget" not in critique_text.lower()
-        and str(deps.settings.max_tool_calls) not in critique_text
-    ):
-        critique_text = (
-            f"{critique_text}\n\n"
-            f"(Nota: raggiunto il budget massimo di chiamate agli strumenti: "
+    critique_text = _append_budget_exhausted_note(
+        critique_text,
+        budget_exhausted=budget_exhausted,
+        max_tool_calls=deps.settings.max_tool_calls,
+        note=(
+            "(Nota: raggiunto il budget massimo di chiamate agli strumenti: "
             f"max_tool_calls={deps.settings.max_tool_calls}.)"
-        )
+        ),
+    )
 
     executed_query = state.get("generated_query")
     ai_kwargs = {"generated_query": executed_query} if executed_query else {}
     return {
-        "critic_system_prompt": system_prompt,
-        "critic_critique": critique_text,
-        "critic_call_count": critic_calls,
-        "critic_retry_count": critic_retries,
         "critic_output_check_failed": check_failed,
         "final_response": critique_text,
         "status": "completed",

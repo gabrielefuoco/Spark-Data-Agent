@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from src.agent.memory import TRUNCATION_MARKER, build_conversation_window, count_tokens
-from src.agent.prompts import build_planner_user_prompt
+from src.agent.prompts import build_critic_user_prompt
 
 
 def test_count_tokens_monotonic_and_empty() -> None:
@@ -51,7 +51,7 @@ def test_window_keeps_newest_and_reports_dropped_under_small_budget() -> None:
     assert window.messages[-1].content == messages[-1].content
     assert window.messages[0].content != messages[0].content
 
-    prompt = build_planner_user_prompt("e per il 2015?", history=window)
+    prompt = build_critic_user_prompt("e per il 2015?", history=window)
     assert f"[{window.dropped_messages} earlier " in prompt
     assert "omitted due to token budget" in prompt
     assert "Turn 3 answer" in prompt
@@ -74,7 +74,7 @@ def test_five_turn_conversation_under_generous_budget_keeps_oldest_question() ->
     assert len(window.messages) == 10
     assert 0 < window.used_tokens < 800_000
 
-    prompt = build_planner_user_prompt("e per il 2015?", history=window)
+    prompt = build_critic_user_prompt("e per il 2015?", history=window)
     assert "Turn 0 unique question about metric_0" in prompt
     assert "SELECT metric_0 FROM gold_user_longitudinal_features" in prompt
     assert "omitted due to token budget" not in prompt

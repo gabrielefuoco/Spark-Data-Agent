@@ -135,18 +135,14 @@ def _extract_interrupt_payload(interrupt_obj: Any) -> dict[str, Any]:
 
 
 def _record_assistant_outcome(outcome: dict[str, Any]) -> None:
-    content = (
-        outcome.get("final_response") or outcome.get("critic_critique") or "Analisi completata."
-    )
+    content = outcome.get("final_response") or "Analisi completata."
     st.session_state.messages.append(
         {
             "role": "assistant",
             "content": content,
             "generated_query": outcome.get("generated_query"),
-            "sql_cost_estimate": outcome.get("sql_cost_estimate"),
             "query_result": outcome.get("query_result"),
             "statistical_validation": outcome.get("statistical_validation"),
-            "status": outcome.get("status"),
         }
     )
 
@@ -259,7 +255,6 @@ def main() -> None:
         st.markdown(f"- **Backend LLM**: `{settings.llm_backend}`")
         st.markdown(f"- **Modelli**: `{model_label}`")
         st.markdown(f"- **Soglia HITL**: `{settings.hitl_cost_threshold}`")
-        st.markdown(f"- **Max Retry SQL**: `{settings.max_query_retries}`")
         st.markdown(f"- **Thread ID**: `{st.session_state.thread_id}`")
 
         if st.button("Nuova Conversazione"):

@@ -45,16 +45,12 @@ class DataAgentState(TypedDict):
     repeat_cap_triggered: bool
     repeat_loop_halted: bool
     budget_exhausted: bool
+    manifest_digest: str | None
     agent_draft_response: str | None
     generated_query: str | None
-    sql_cost_estimate: dict[str, Any] | None
     query_result: dict[str, Any] | None
     statistical_validation: dict[str, Any] | None
     hitl_decision: str | None
-    critic_system_prompt: str | None
-    critic_critique: str | None
-    critic_call_count: int
-    critic_retry_count: int
     critic_output_check_failed: dict[str, Any] | None
     final_response: str | None
     status: str
@@ -72,16 +68,12 @@ def make_initial_state(question: str) -> DataAgentState:
         repeat_cap_triggered=False,
         repeat_loop_halted=False,
         budget_exhausted=False,
+        manifest_digest=None,
         agent_draft_response=None,
         generated_query=None,
-        sql_cost_estimate=None,
         query_result=None,
         statistical_validation=None,
         hitl_decision=None,
-        critic_system_prompt=None,
-        critic_critique=None,
-        critic_call_count=0,
-        critic_retry_count=0,
         critic_output_check_failed=None,
         final_response=None,
         status="running",

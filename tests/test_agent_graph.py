@@ -20,8 +20,9 @@ from src.agent.guards import (
     StatisticalGuardResult,
     evaluate_query_result_guard,
 )
+from src.agent.memory import count_tokens
 from src.agent.nodes import make_spark_sql_executor
-from src.agent.prompts import format_statistical_appendix
+from src.agent.prompts import format_manifest_digest, format_statistical_appendix
 from src.agent.state import make_initial_state
 from src.config import Settings
 from src.lakehouse.manifest import DatasetManifest
@@ -116,7 +117,16 @@ def test_three_query_investigation_collects_three_guards_and_one_critic_call() -
 
     agent_model = RecordingFakeChatModel(
         [
-            _tool_msg("read_dataset_manifest", {}, "c1"),
+            _tool_msg(
+                "run_safe_sql",
+                {
+                    "query": (
+                        "SELECT label, topic, mean_topic_probability, document_count, top_terms "
+                        "FROM gold_cohort_topic_matrix"
+                    )
+                },
+                "c1",
+            ),
             _tool_msg(
                 "run_safe_sql",
                 {
@@ -137,19 +147,36 @@ def test_three_query_investigation_collects_three_guards_and_one_critic_call() -
                 },
                 "c3",
             ),
-            AIMessage(content="Gathered corpus manifest, lexical bigrams, and circadian comparison."),
+            AIMessage(content="Gathered topic distribution, lexical bigrams, and circadian comparison."),
         ]
     )
     critic = _critic(
-        "Corpus has 5000 posts (descriptive). Top bigram 'feel alone' (descriptive). "
+        "Corpus has 5000 posts (descriptive). Topic 0 covers sleep (descriptive). "
+        "Top bigram 'feel alone' (descriptive). "
         "Night posting ratio differed significantly across cohorts "
         f"(depressed=35, control=35, p = {expected_guard.p_value:.6g}, "
         f"Cohen's d = {expected_guard.effect_size_cohens_d:.6g})."
     )
     sql_calls: list[str] = []
+    manifest_calls = 0
+
+    def counting_manifest() -> DatasetManifest:
+        nonlocal manifest_calls
+        manifest_calls += 1
+        return _make_manifest()
 
     def fake_sql(query: str, _cfg: Settings) -> list[dict[str, Any]]:
         sql_calls.append(query)
+        if "gold_cohort_topic_matrix" in query:
+            return [
+                {
+                    "label": 1,
+                    "topic": 0,
+                    "mean_topic_probability": 0.41,
+                    "document_count": 50,
+                    "top_terms": "cant sleep, alone",
+                }
+            ]
         if "gold_cohort_lexical_matrix" in query:
             return [
                 {"label": 1, "ngram": "feel alone", "frequency": 42, "tfidf_weight": 0.14},
@@ -162,17 +189,17 @@ def test_three_query_investigation_collects_three_guards_and_one_critic_call() -
         router_model=agent_model,
         critic_model=critic,
         sql_executor=fake_sql,
-        manifest_loader=_make_manifest,
+        manifest_loader=counting_manifest,
     )
     result = graph.invoke(make_initial_state("Give me a picture of how the two cohorts differ."))
 
     assert result["status"] == "completed"
     assert [t.name for t in agent_model.bound_tools] == [
         "run_safe_sql",
-        "read_dataset_manifest",
         "run_spark_job",
     ]
-    assert len(sql_calls) == 2
+    assert manifest_calls == 1
+    assert len(sql_calls) == 3
     assert result["tool_call_count"] == 3
     assert len(result["tool_results"]) == 3
     assert [r["guard_payload"]["assessment_status"] for r in result["tool_results"]] == [
@@ -181,14 +208,13 @@ def test_three_query_investigation_collects_three_guards_and_one_critic_call() -
         "assessed",
     ]
     assert len(critic.recorded_invocations) == 1
-    assert result["critic_call_count"] == 1
     assert result["critic_output_check_failed"] is None
 
     # Every call appears in the auditable trace with name, arguments, rows_returned, guard_payload.
     trace = result["tool_trace"]
     assert len(trace) == 3
-    assert trace[0]["name"] == "read_dataset_manifest"
-    assert trace[0]["arguments"] == {}
+    assert trace[0]["name"] == "run_safe_sql"
+    assert "gold_cohort_topic_matrix" in trace[0]["arguments"]["query"]
     assert trace[0]["rows_returned"] == 1
     assert trace[0]["guard_payload"]["assessment_status"] == "descriptive"
     assert trace[1]["name"] == "run_safe_sql"
@@ -198,41 +224,92 @@ def test_three_query_investigation_collects_three_guards_and_one_critic_call() -
     assert trace[2]["rows_returned"] == 70
     assert trace[2]["guard_payload"]["assessment_status"] == "assessed"
 
+    # System prompt embeds the precomputed manifest digest without calling a manifest tool.
+    first_system_msg = str(agent_model.recorded_invocations[0][0].content)
+    assert "Precomputed Dataset Catalog" in first_system_msg
+    assert "5000" in first_system_msg
+    assert "read_dataset_manifest" not in first_system_msg
+
     # Critic received all three results and their guard verdicts.
     critic_user_payload = json.loads(
         str(critic.recorded_invocations[0][1].content).split("\n", 1)[1]
     )
     assert critic_user_payload["result_count"] == 3
     assert len(critic_user_payload["results"]) == 3
-    assert CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS in result["critic_system_prompt"]
+    assert CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS in str(critic.recorded_invocations[0][0].content)
 
 
-def test_read_dataset_manifest_is_strictly_descriptive_and_never_runs_spark() -> None:
+def test_manifest_digest_answers_catalog_without_tools_and_handles_missing_manifest() -> None:
     settings = Settings(_env_file=None)
+    digest = format_manifest_digest(_make_manifest())
+    assert count_tokens(digest) < 100
+    assert "5000" in digest
+    assert "depressed=1: 2600" in digest
+    assert "control=0: 2400" in digest
+    assert "100" in digest
+    assert "2015-01-01T00:00:00" in digest
+    assert "2016-12-31T23:59:59" in digest
+    assert "12" in digest
+    assert "not instructions" in digest.lower()
+
+    # Case 1: Present manifest -> agent answers catalog question directly with zero tools/Spark/critic.
+    manifest_calls = 0
+
+    def counting_manifest() -> DatasetManifest:
+        nonlocal manifest_calls
+        manifest_calls += 1
+        return _make_manifest()
+
     agent_model = RecordingFakeChatModel(
-        [
-            _tool_msg("read_dataset_manifest", {}, "m1"),
-            AIMessage(content="Catalog shows 5000 posts across 100 subjects."),
-        ]
+        [AIMessage(content="The dataset has 5000 posts across 100 subjects (50 depressed, 50 control).")]
     )
-    critic = _critic("Il catalogo contiene 5000 post e 100 soggetti (statistiche descrittive).")
+    critic = _critic("Critic should not run.")
     sql_calls: list[str] = []
 
-    graph = build_agent_graph(
+    res = build_agent_graph(
         settings=settings,
         router_model=agent_model,
         critic_model=critic,
         sql_executor=lambda q, _cfg: sql_calls.append(q) or [],
-        manifest_loader=_make_manifest,
-    )
-    result = graph.invoke(make_initial_state("How many posts and subjects are in the dataset?"))
+        manifest_loader=counting_manifest,
+    ).invoke(make_initial_state("How many posts and subjects are in the dataset?"))
 
+    assert manifest_calls == 1
     assert sql_calls == []
-    assert result["status"] == "completed"
-    assert result["tool_results"][0]["guard_payload"]["assessment_status"] == "descriptive"
-    assert result["tool_results"][0]["guard_payload"]["p_value"] is None
-    assert "DESCRIPTIVE_ONLY:" in result["critic_system_prompt"]
-    assert "5000" in result["final_response"]
+    assert res["status"] == "completed"
+    assert res["tool_call_count"] == 0
+    assert res["tool_trace"] == []
+    assert critic.recorded_invocations == []
+    assert "5000" in res["final_response"]
+    system_prompt = str(agent_model.recorded_invocations[0][0].content)
+    assert "Precomputed Dataset Catalog" in system_prompt
+    assert "no query needed" in system_prompt.lower()
+
+    # Case 2: Missing manifest -> one-line fallback in prompt, SQL tools answer, deleted tool rejected.
+    def missing_manifest() -> DatasetManifest:
+        raise FileNotFoundError("gold_dataset_manifest.json not found")
+
+    fallback_agent = RecordingFakeChatModel(
+        [
+            _tool_msg("read_dataset_manifest", {}, "legacy1"),
+            _tool_msg("run_safe_sql", {"query": "SELECT COUNT(*) AS total_posts FROM silver_posts WHERE year = 2015"}, "q1"),
+            AIMessage(content="Counted 2500 posts in 2015 via SQL."),
+        ]
+    )
+    fallback_res = build_agent_graph(
+        settings=settings,
+        router_model=fallback_agent,
+        critic_model=_critic("Sono presenti 2500 post nel 2015 (statistica descrittiva)."),
+        sql_executor=lambda _q, _cfg: [{"total_posts": 2500}],
+        manifest_loader=missing_manifest,
+    ).invoke(make_initial_state("How many posts in 2015?"))
+
+    assert fallback_res["status"] == "completed"
+    assert fallback_res["tool_trace"][0]["status"] == "error"
+    assert fallback_res["tool_trace"][0]["error"]["code"] == "UNKNOWN_TOOL"
+    assert fallback_res["tool_trace"][1]["status"] == "executed"
+    missing_sys_prompt = str(fallback_agent.recorded_invocations[0][0].content)
+    assert "Manifest unavailable" in missing_sys_prompt
 
 
 def test_budget_stops_21st_tool_call_and_synthesizes_or_fails_transparently() -> None:
@@ -539,7 +616,11 @@ def test_significant_comparison_among_descriptive_results_requires_citations_and
     def _build_mixed_agent() -> RecordingFakeChatModel:
         return RecordingFakeChatModel(
             [
-                _tool_msg("read_dataset_manifest", {}, "m1"),
+                _tool_msg(
+                    "run_safe_sql",
+                    {"query": "SELECT COUNT(*) AS total_posts FROM silver_posts WHERE year = 2015"},
+                    "m1",
+                ),
                 _tool_msg(
                     "run_safe_sql",
                     {"query": "SELECT label, ngram, frequency FROM gold_cohort_lexical_matrix"},
@@ -560,6 +641,8 @@ def test_significant_comparison_among_descriptive_results_requires_citations_and
         )
 
     def _mixed_sql(query: str, _cfg: Settings) -> list[dict[str, Any]]:
+        if "silver_posts" in query:
+            return [{"total_posts": 1200}]
         if "gold_cohort_lexical_matrix" in query:
             return [{"label": 1, "ngram": "feel alone", "frequency": 42}]
         return cohort_rows
@@ -569,16 +652,16 @@ def test_significant_comparison_among_descriptive_results_requires_citations_and
         "Catalog has 5000 posts (descriptive). Top bigram 'feel alone' (descriptive). "
         "Night post ratio differed significantly across cohorts."
     )
+    critic_ok = _critic(prose_no_numbers)
     res_with_appendix = build_agent_graph(
         settings=settings,
         router_model=_build_mixed_agent(),
-        critic_model=_critic(prose_no_numbers),
+        critic_model=critic_ok,
         sql_executor=_mixed_sql,
         manifest_loader=_make_manifest,
     ).invoke(make_initial_state("How do the cohorts differ?"))
 
-    assert res_with_appendix["critic_call_count"] == 1
-    assert res_with_appendix["critic_retry_count"] == 0
+    assert len(critic_ok.recorded_invocations) == 1
     assert res_with_appendix["critic_output_check_failed"] is None
     final_with_appendix = res_with_appendix["final_response"]
     assert final_with_appendix.startswith(prose_no_numbers)
@@ -611,20 +694,23 @@ def test_significant_comparison_among_descriptive_results_requires_citations_and
     ]
 
     def _mixed_ns_sql(query: str, _cfg: Settings) -> list[dict[str, Any]]:
+        if "silver_posts" in query:
+            return [{"total_posts": 1200}]
         if "gold_cohort_lexical_matrix" in query:
             return [{"label": 1, "ngram": "feel alone", "frequency": 42}]
         return ns_rows
 
     rogue_claim = "Depressed users post at night significantly more often than controls."
+    critic_fallback = _critic(rogue_claim, rogue_claim)
     res_fallback = build_agent_graph(
         settings=settings,
         router_model=_build_mixed_agent(),
-        critic_model=_critic(rogue_claim, rogue_claim),
+        critic_model=critic_fallback,
         sql_executor=_mixed_ns_sql,
         manifest_loader=_make_manifest,
     ).invoke(make_initial_state("How do the cohorts differ?"))
 
-    assert res_fallback["critic_call_count"] == 2
+    assert len(critic_fallback.recorded_invocations) == 2
     assert res_fallback["critic_output_check_failed"] is not None
     assert res_fallback["critic_output_check_failed"]["forbidden_claims"]
     fallback_text = res_fallback["final_response"]
@@ -664,7 +750,11 @@ def test_statistical_appendix_is_deterministic_and_omitted_for_all_descriptive()
     # End-to-end all-descriptive graph run never appends the statistical appendix.
     agent_model = RecordingFakeChatModel(
         [
-            _tool_msg("read_dataset_manifest", {}, "d1"),
+            _tool_msg(
+                "run_safe_sql",
+                {"query": "SELECT label, topic, top_terms FROM gold_cohort_topic_matrix"},
+                "d1",
+            ),
             _tool_msg(
                 "run_safe_sql",
                 {"query": "SELECT label, ngram, frequency FROM gold_cohort_lexical_matrix"},
@@ -674,16 +764,21 @@ def test_statistical_appendix_is_deterministic_and_omitted_for_all_descriptive()
         ]
     )
     prose = "Il dataset contiene 5000 post e i bigrammi principali sono elencati a titolo descrittivo."
+    desc_critic = _critic(prose)
     res = build_agent_graph(
         settings=settings,
         router_model=agent_model,
-        critic_model=_critic(prose),
-        sql_executor=lambda _q, _cfg: [{"label": 1, "ngram": "feel alone", "frequency": 42}],
+        critic_model=desc_critic,
+        sql_executor=lambda q, _cfg: (
+            [{"label": 1, "topic": 0, "top_terms": "feel alone"}]
+            if "gold_cohort_topic_matrix" in q
+            else [{"label": 1, "ngram": "feel alone", "frequency": 42}]
+        ),
         manifest_loader=_make_manifest,
-    ).invoke(make_initial_state("Mostrami il catalogo e i bigrammi principali."))
+    ).invoke(make_initial_state("Mostrami i topic e i bigrammi principali."))
 
     assert res["status"] == "completed"
-    assert res["critic_call_count"] == 1
+    assert len(desc_critic.recorded_invocations) == 1
     assert res["final_response"] == prose
     assert "Appendice statistica" not in res["final_response"]
 
@@ -714,19 +809,19 @@ def test_prose_claiming_significance_when_appendix_is_nonsignificant_still_fails
     )
     # Attempt 1 asserts a significant difference (contradicts appendix's "non significativo");
     # Attempt 2 drops the forbidden claim and omits numbers, passing with the appendix.
+    retry_critic = _critic(
+        "Depressed users post significantly more at night.",
+        "Non si osserva alcuna differenza statisticamente significativa tra le coorti.",
+    )
     res = build_agent_graph(
         settings=settings,
         router_model=agent_model,
-        critic_model=_critic(
-            "Depressed users post significantly more at night.",
-            "Non si osserva alcuna differenza statisticamente significativa tra le coorti.",
-        ),
+        critic_model=retry_critic,
         sql_executor=lambda _q, _cfg: ns_rows,
     ).invoke(make_initial_state("I soggetti depressi postano più di notte?"))
 
     assert res["status"] == "completed"
-    assert res["critic_call_count"] == 2
-    assert res["critic_retry_count"] == 1
+    assert len(retry_critic.recorded_invocations) == 2
     assert res["critic_output_check_failed"] is None
     assert "## Appendice statistica (generata dal sistema)" in res["final_response"]
     assert "non significativo" in res["final_response"]
@@ -758,6 +853,7 @@ def test_cannot_assess_and_underpowered_never_ship_significance_claims() -> None
     ).invoke(make_initial_state("Confronta i post notturni per coorte."))
 
     assert ca_res["statistical_validation"]["assessment_status"] == "cannot_assess"
+    assert ca_res["critic_output_check_failed"] is not None
     assert "impossibile valutare" in ca_res["final_response"].lower()
     assert "p_value =" not in ca_res["final_response"]
 
@@ -797,6 +893,7 @@ def test_cannot_assess_and_underpowered_never_ship_significance_claims() -> None
 
     assert up_res["statistical_validation"]["is_underpowered"] is True
     assert up_res["statistical_validation"]["is_significant"] is False
+    assert up_res["critic_output_check_failed"] is not None
     assert "risultato non conclusivo" in up_res["final_response"].lower()
 
 
@@ -921,7 +1018,7 @@ def test_full_cohort_819_subjects_analyzed_while_state_rows_capped_at_500(
     result = graph.invoke(make_initial_state("Compare night_post_ratio across cohorts."))
 
     assert result["status"] == "completed"
-    assert result["critic_call_count"] == 1
+    assert len(critic.recorded_invocations) == 1
     assert result["critic_output_check_failed"] is None
     assert "LIMIT 50000" in result["generated_query"].upper()
 
@@ -995,7 +1092,7 @@ def test_multi_tool_call_batch_with_hitl_does_not_reexecute_prior_tool(tmp_path:
 def test_direct_conversational_reply_skips_critic() -> None:
     settings = Settings(_env_file=None)
     agent_model = RecordingFakeChatModel(
-        [AIMessage(content="I can query the eRISK lakehouse using SQL, manifest, or Spark jobs.")]
+        [AIMessage(content="I can query the eRISK lakehouse using SQL or Spark jobs.")]
     )
     critic = _critic("Critic should not be called.")
     res = build_agent_graph(
@@ -1064,5 +1161,6 @@ def test_fetch_limit_cap_marks_truncated_and_demands_critic_disclosure(
     assert result["status"] == "completed"
     assert result["query_result"]["truncated"] is True
     assert result["statistical_validation"]["truncated"] is True
-    assert "truncated=true" in result["critic_system_prompt"].lower()
-    assert "sql_fetch_limit=20" in result["critic_system_prompt"]
+    critic_sys = str(critic.recorded_invocations[0][0].content)
+    assert "truncated=true" in critic_sys.lower()
+    assert "sql_fetch_limit=20" in critic_sys

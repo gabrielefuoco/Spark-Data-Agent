@@ -709,28 +709,27 @@ def _format_guard_verdict_body(
     )
 
 
-def format_critic_guard_instructions(result: StatisticalGuardResult) -> str:
-    """Format the guard verdict and mandatory constraints for the scientific critic prompt."""
-    return f"{CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS}\n\n{_format_guard_verdict_body(result)}"
-
-
-def format_multi_critic_guard_instructions(results: Sequence[StatisticalGuardResult]) -> str:
+def format_critic_guard_instructions(
+    results: StatisticalGuardResult | Sequence[StatisticalGuardResult],
+) -> str:
     """Format one shared guardrail header followed by every tool result's guard verdict."""
-    if not results:
-        empty = _make_non_assessed_result(
-            status="descriptive",
-            reason="descriptive: empty_result",
-            metric_name="descriptive_metric",
-        )
-        return format_critic_guard_instructions(empty)
-    if len(results) == 1:
-        return format_critic_guard_instructions(results[0])
+    items = [results] if isinstance(results, StatisticalGuardResult) else list(results)
+    if not items:
+        items = [
+            _make_non_assessed_result(
+                status="descriptive",
+                reason="descriptive: empty_result",
+                metric_name="descriptive_metric",
+            )
+        ]
+    if len(items) == 1:
+        return f"{CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS}\n\n{_format_guard_verdict_body(items[0])}"
 
     sections = [
         _format_guard_verdict_body(
             result,
             heading=f"STATISTICAL GUARD VERDICT #{idx} ({result.metric_name}):",
         )
-        for idx, result in enumerate(results, start=1)
+        for idx, result in enumerate(items, start=1)
     ]
     return f"{CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS}\n\n" + "\n\n".join(sections)

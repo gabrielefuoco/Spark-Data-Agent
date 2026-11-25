@@ -2,10 +2,27 @@
 
 from __future__ import annotations
 
-from langchain_core.messages import AIMessage, ToolMessage
+from collections.abc import Sequence
+from typing import Any
+
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 from langgraph.graph import END
 
 from src.agent.state import DataAgentState
+
+
+def find_pending_tool_calls(messages: Sequence[BaseMessage]) -> list[dict[str, Any]]:
+    """Return unanswered tool calls from the latest ``AIMessage`` that requested tools."""
+    for idx in range(len(messages) - 1, -1, -1):
+        msg = messages[idx]
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            answered_ids = {
+                m.tool_call_id
+                for m in messages[idx + 1 :]
+                if isinstance(m, ToolMessage) and m.tool_call_id
+            }
+            return [dict(tc) for tc in msg.tool_calls if tc.get("id") not in answered_ids]
+    return []
 
 
 def route_after_agent(state: DataAgentState) -> str:
@@ -25,16 +42,6 @@ def route_after_tools(state: DataAgentState) -> str:
     """Route after ``execute_tools``: halt repeat loops, drain pending tool calls, or return to ``agent``."""
     if state.get("repeat_loop_halted"):
         return "handle_failure"
-    messages = state.get("messages", [])
-    for idx in range(len(messages) - 1, -1, -1):
-        msg = messages[idx]
-        if isinstance(msg, AIMessage) and msg.tool_calls:
-            answered_ids = {
-                m.tool_call_id
-                for m in messages[idx + 1 :]
-                if isinstance(m, ToolMessage) and m.tool_call_id
-            }
-            if any(tc.get("id") not in answered_ids for tc in msg.tool_calls):
-                return "execute_tools"
-            break
+    if find_pending_tool_calls(state.get("messages", [])):
+        return "execute_tools"
     return "agent"

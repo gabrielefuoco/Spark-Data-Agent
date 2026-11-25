@@ -15,12 +15,6 @@ def run_safe_sql(query: str) -> str:
 
 
 @tool
-def read_dataset_manifest() -> str:
-    """Read precomputed global corpus counts, date range, and quarantine totals from gold_dataset_manifest.json without starting Spark."""
-    return "read_dataset_manifest"
-
-
-@tool
 def run_spark_job(job: str, params: dict[str, Any] | None = None) -> str:
     """Run a non-SQL Spark analytics job ('circadian_features' or 'topic_model') over silver_posts."""
     return json.dumps({"job": job, "params": params or {}}, sort_keys=True)
@@ -28,7 +22,6 @@ def run_spark_job(job: str, params: dict[str, Any] | None = None) -> str:
 
 AGENT_TOOLS: tuple[BaseTool, ...] = (
     run_safe_sql,
-    read_dataset_manifest,
     run_spark_job,
 )
 

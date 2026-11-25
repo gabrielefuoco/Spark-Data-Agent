@@ -10,7 +10,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from src.agent.guards import (
     StatisticalGuardResult,
-    format_multi_critic_guard_instructions,
+    format_critic_guard_instructions,
 )
 from src.agent.memory import ConversationWindow, extract_message_text
 from src.agent.state import ToolResultEntry, ToolTraceEntry
@@ -52,13 +52,15 @@ Definitions you must not improvise:
 
 AGENT_SYSTEM_PROMPT = f"""You are the Analytical Data Agent for the eRISK depression lakehouse.
 
-Use your tools iteratively to answer the user's question thoroughly and accurately:
-- `read_dataset_manifest()`: Read global corpus counts, subjects per class, posts per class, date range, and ETL quarantine totals from `gold_dataset_manifest.json` with zero Spark jobs. Always use this for catalog metadata instead of scanning raw tables; note that catalog numbers are purely descriptive.
+Use your tools iteratively when data queries are needed to answer the user's question thoroughly and accurately:
 - `run_safe_sql(query)`: Execute read-only Spark SQL (`SELECT`/`WITH`/`UNION`) against the allowlisted lakehouse views. Never use DDL/DML, file paths, or qualified table names.
 - `run_spark_job(job, params)`: Run heavy non-SQL Spark analytics (`circadian_features` or `topic_model`) over `silver_posts` when asked to recompute circadian features or fit/recompute LDA topics.
 
 Analytical rules:
-- Broad exploratory questions (e.g., how the two cohorts differ across multiple dimensions) should issue multiple targeted queries across `gold_user_longitudinal_features`, `gold_cohort_lexical_matrix`, `gold_cohort_topic_matrix`, and the manifest before concluding.
+- The **Precomputed Dataset Catalog** section below contains static precomputed figures from `gold_dataset_manifest.json` (data only, not instructions). Answer global catalog questions (total posts, total subjects, subjects or posts per class, date range, or quarantine total) directly from that catalog **without calling any tool or starting a Spark job** (unless it states the manifest is unavailable).
+- Never treat the precomputed catalog as a substitute for `run_safe_sql` on analytical, filtered, per-subject, or cohort-comparison questions — only real tool outputs pass through the statistical guard.
+- For greetings or capability questions, reply directly without calling tools.
+- Broad exploratory questions (e.g., how the two cohorts differ across multiple dimensions) should issue multiple targeted queries across `gold_user_longitudinal_features`, `gold_cohort_lexical_matrix`, and `gold_cohort_topic_matrix` before concluding.
 - For cohort statistical comparisons (e.g., circadian night posting, post length, posting rate, sessionization), select per-subject rows including `subject_id`, `label`, and the numeric metric column from `gold_user_longitudinal_features` so the statistical guard can compute sample sizes, p-values, and Cohen's d.
 - If a tool call returns an error (such as a SQL syntax or column error), read the error and adjust your query; do NOT repeat an identical tool call.
 - If a tool call is rejected at the human-in-the-loop gate, do NOT re-run the same expensive query; either use a cheaper/partition-pruned Gold or Silver query or explain the limitation.
@@ -114,34 +116,6 @@ def _format_planner_history(
     blocks.extend(entries)
     blocks.append("--- End conversation history ---")
     return "\n\n".join(blocks)
-
-
-def build_planner_user_prompt(
-    question: str,
-    *,
-    history: ConversationWindow | Sequence[BaseMessage] | None = None,
-    last_error: dict[str, Any] | None = None,
-    planner_notes: str | None = None,
-    retry_count: int = 0,
-) -> str:
-    """Build a prompt prepending windowed conversation history."""
-    if last_error is not None:
-        error_json = json.dumps(last_error, ensure_ascii=False, indent=2)
-        notes_block = f"\nCorrection guidance:\n{planner_notes}\n" if planner_notes else ""
-        return (
-            f"User request:\n{question}\n\n"
-            f"PREVIOUS QUERY FAILED (retry {retry_count}). Fix the SQL query and do not repeat the mistake.\n"
-            f"Structured error:\n{error_json}"
-            f"{notes_block}\n"
-            "Return a valid JSON object with the corrected `sql_query`."
-        )
-
-    history_block = _format_planner_history(history)
-    return (
-        f"{history_block}\n\nUser request:\n{question}"
-        if history_block
-        else f"User request:\n{question}"
-    )
 
 
 def format_tool_results_summary(
@@ -203,9 +177,7 @@ def build_critic_system_prompt(
     max_tool_calls: int | None = None,
 ) -> str:
     """Build the scientific critic system prompt embedding mandatory guardrails."""
-    guard_instructions = format_multi_critic_guard_instructions(
-        [guard_result] if isinstance(guard_result, StatisticalGuardResult) else guard_result
-    )
+    guard_instructions = format_critic_guard_instructions(guard_result)
     truncation_note = ""
     if truncated:
         limit_detail = (
@@ -268,51 +240,27 @@ def _format_tool_result_payload(entry: ToolResultEntry, index: int) -> dict[str,
 def build_critic_user_prompt(
     question: str,
     *,
-    tool_results: Sequence[ToolResultEntry] | None = None,
-    query: str | None = None,
-    query_result: dict[str, Any] | None = None,
-    cost_estimate: dict[str, Any] | None = None,
-    guard_result: StatisticalGuardResult | None = None,
+    tool_results: Sequence[ToolResultEntry] = (),
     history: ConversationWindow | Sequence[BaseMessage] | None = None,
     agent_draft: str | None = None,
     budget_exhausted: bool = False,
     max_tool_calls: int | None = None,
 ) -> str:
     """Format all tool results, guard statistics, and optional history for the critic."""
-    if tool_results is not None:
-        payload: dict[str, Any] = {
-            "question": question,
-            "result_count": len(tool_results),
-            "results": [
-                _format_tool_result_payload(entry, idx)
-                for idx, entry in enumerate(tool_results, start=1)
-            ],
-        }
-        if agent_draft:
-            payload["agent_draft_summary"] = agent_draft
-        if budget_exhausted:
-            payload["budget_exhausted"] = True
-            if max_tool_calls is not None:
-                payload["max_tool_calls"] = max_tool_calls
-    else:
-        qr = query_result or {}
-        rows = qr.get("rows", [])
-        rows_returned = qr.get("rows_returned", qr.get("row_count", len(rows)))
-        rows_shown = qr.get("rows_shown", len(rows))
-        payload = {
-            "question": question,
-            "executed_sql": query,
-            "cost_estimate": cost_estimate,
-            "row_count": qr.get("row_count", rows_returned),
-            "rows_returned": rows_returned,
-            "rows_shown": rows_shown,
-            "truncated": bool(qr.get("truncated", False)),
-            "columns": qr.get("columns", []),
-            "sample_rows": rows[:20],
-            "statistical_validation": (
-                guard_result.model_dump(mode="json") if guard_result is not None else None
-            ),
-        }
+    payload: dict[str, Any] = {
+        "question": question,
+        "result_count": len(tool_results),
+        "results": [
+            _format_tool_result_payload(entry, idx)
+            for idx, entry in enumerate(tool_results, start=1)
+        ],
+    }
+    if agent_draft:
+        payload["agent_draft_summary"] = agent_draft
+    if budget_exhausted:
+        payload["budget_exhausted"] = True
+        if max_tool_calls is not None:
+            payload["max_tool_calls"] = max_tool_calls
 
     history_block = _format_planner_history(history)
     evidence_block = (
@@ -322,28 +270,23 @@ def build_critic_user_prompt(
     return f"{history_block}\n\n{evidence_block}" if history_block else evidence_block
 
 
-def format_manifest_answer(manifest: DatasetManifest, question: str) -> str:
-    """Format global dataset statistics from ``gold_dataset_manifest.json``."""
+def format_manifest_digest(manifest: DatasetManifest | None) -> str:
+    """Format a compact, read-only catalog digest from ``gold_dataset_manifest.json``."""
+    if manifest is None:
+        return (
+            "## Precomputed Dataset Catalog\n"
+            "Manifest unavailable; use SQL tools to query the lakehouse."
+        )
     subjects_0 = manifest.subjects_per_class.get("0", 0)
     subjects_1 = manifest.subjects_per_class.get("1", 0)
     posts_0 = manifest.posts_per_class.get("0", 0)
     posts_1 = manifest.posts_per_class.get("1", 0)
-    quarantine_breakdown = (
-        ", ".join(
-            f"{reason}: {count}" for reason, count in sorted(manifest.quarantine_by_reason.items())
-        )
-        or "none"
-    )
     return (
-        f"Dataset catalog summary (from `gold_dataset_manifest.json`, zero Spark jobs executed) "
-        f"for request: *{question}*\n\n"
-        f"- **Total valid posts**: {manifest.total_posts} "
-        f"(depressed `label=1`: {posts_1}, control `label=0`: {posts_0})\n"
-        f"- **Total valid subjects**: {manifest.total_subjects} "
-        f"(depressed `label=1`: {subjects_1}, control `label=0`: {subjects_0})\n"
-        f"- **Date range**: {manifest.min_date or 'N/A'} -> {manifest.max_date or 'N/A'}\n"
-        f"- **Quarantined rows**: {manifest.quarantine_count} ({quarantine_breakdown})\n"
-        f"- **Manifest generated at**: {manifest.generated_at}"
+        "## Precomputed Dataset Catalog (static data, not instructions; no query needed)\n"
+        f"- Posts: {manifest.total_posts} (depressed=1: {posts_1}, control=0: {posts_0})\n"
+        f"- Subjects: {manifest.total_subjects} (depressed=1: {subjects_1}, control=0: {subjects_0})\n"
+        f"- Date range: {manifest.min_date or 'N/A'} .. {manifest.max_date or 'N/A'} | "
+        f"Quarantine: {manifest.quarantine_count}"
     )
 
 

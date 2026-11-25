@@ -36,6 +36,7 @@ dependencies = [
     # Works against both backends: Ollama's /v1 endpoint and OpenRouter are both
     # OpenAI-compatible, so one client covers local and remote.
     "langchain-openai>=0.3",
+    "tiktoken>=0.7",
 ]
 
 [project.optional-dependencies]

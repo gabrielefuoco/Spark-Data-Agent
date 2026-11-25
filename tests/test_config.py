@@ -28,17 +28,20 @@ def test_defaults_are_local_and_free(monkeypatch) -> None:
     assert settings.openrouter_api_key is None
     assert settings.ollama_base_url == "http://localhost:11434/v1"
     assert settings.spark_master == "local[*]"
+    assert settings.conversation_token_budget == 800_000
 
 
 def test_environment_overrides_defaults(monkeypatch) -> None:
     monkeypatch.setenv("LLM_BACKEND", "openrouter")
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setenv("CONVERSATION_TOKEN_BUDGET", "123456")
 
     settings = Settings(_env_file=None)
 
     assert settings.llm_backend == "openrouter"
     assert settings.openrouter_api_key is not None
     assert settings.openrouter_api_key.get_secret_value() == "sk-or-test"
+    assert settings.conversation_token_budget == 123_456
 
 
 def test_settings_are_cached(monkeypatch) -> None:

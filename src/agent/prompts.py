@@ -9,12 +9,8 @@ from typing import Any
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from src.agent.guards import StatisticalGuardResult, format_critic_guard_instructions
+from src.agent.memory import ConversationWindow, extract_message_text
 from src.lakehouse.manifest import DatasetManifest
-
-MAX_PLANNER_HISTORY_EXCHANGES = 3
-MAX_PLANNER_HISTORY_QUESTION_CHARS = 160
-MAX_PLANNER_HISTORY_QUERY_CHARS = 200
-MAX_PLANNER_HISTORY_ANSWER_CHARS = 160
 
 LAKEHOUSE_SCHEMA_GUIDE = """Available Spark SQL lakehouse views (SELECT/WITH/UNION only, no qualified names):
 1. `gold_user_longitudinal_features` (pre-aggregated per subject — prefer for user/cohort comparisons):
@@ -40,7 +36,15 @@ LAKEHOUSE_SCHEMA_GUIDE = """Available Spark SQL lakehouse views (SELECT/WITH/UNI
    - subject_id (STRING), title (STRING), raw_date (STRING), info (STRING),
      text (STRING), label (INT), _rejection_reason (STRING)
 
-Only the columns listed here exist. Never invent a column name."""
+Only the columns listed here exist. Never invent a column name.
+
+Definitions you must not improvise:
+- **Night post** means `HOUR(date) >= 0 AND HOUR(date) < 5` (00:00–05:00).
+  `night_post_count` and `night_post_ratio` use exactly this window, so any
+  ad-hoc SQL that counts night posts must use it too — otherwise two answers to
+  the same question disagree.
+- **Night post ratio** is `night_post_count / post_count` per subject, a 0–1
+  share, not a percentage."""
 
 ROUTER_SYSTEM_PROMPT = f"""You are the Intent Router and Spark SQL Query Planner for the eRISK depression lakehouse.
 
@@ -66,104 +70,80 @@ Non-SQL Spark job dispatch:
 {LAKEHOUSE_SCHEMA_GUIDE}"""
 
 
-def extract_message_text(message: BaseMessage) -> str:
-    """Extract plain text from a LangChain message across string or block payloads."""
-    content = message.content
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict) and "text" in item:
-                parts.append(str(item["text"]))
-        return "\n".join(parts)
-    return str(content)
+def _format_planner_history(
+    history: ConversationWindow | Sequence[BaseMessage] | None,
+) -> str:
+    """Render every kept message at full fidelity with clear block delimiters."""
+    if history is None:
+        return ""
+    if isinstance(history, ConversationWindow):
+        messages: Sequence[BaseMessage] = history.messages
+        dropped_messages = history.dropped_messages
+    else:
+        messages = history
+        dropped_messages = 0
 
-
-def _collapse_and_truncate(text: str, max_chars: int) -> str:
-    collapsed = " ".join(text.split())
-    if len(collapsed) <= max_chars:
-        return collapsed
-    return collapsed[: max_chars - 3].rstrip() + "..."
-
-
-def _answer_headline(text: str) -> str:
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped:
-            return _collapse_and_truncate(stripped, MAX_PLANNER_HISTORY_ANSWER_CHARS)
-    return ""
-
-
-def _format_planner_history(history: Sequence[BaseMessage] | None) -> str:
-    """Format the most recent exchanges as compact one-line summaries."""
-    if not history:
+    if not messages and dropped_messages <= 0:
         return ""
 
-    exchanges: list[tuple[str, str | None, str | None]] = []
-    pending_question: str | None = None
-    for msg in history:
+    entries: list[str] = []
+    for msg in messages:
+        text = extract_message_text(msg)
         if isinstance(msg, HumanMessage):
-            if pending_question is not None:
-                exchanges.append((pending_question, None, None))
-            q_text = _collapse_and_truncate(
-                extract_message_text(msg), MAX_PLANNER_HISTORY_QUESTION_CHARS
-            )
-            pending_question = q_text if q_text else None
-        elif isinstance(msg, AIMessage) and pending_question is not None:
+            if text.strip():
+                entries.append(f"User:\n{text}")
+        elif isinstance(msg, AIMessage):
             raw_query = msg.additional_kwargs.get("generated_query")
-            query_summary = (
-                _collapse_and_truncate(raw_query, MAX_PLANNER_HISTORY_QUERY_CHARS)
-                if isinstance(raw_query, str) and raw_query.strip()
-                else None
+            query_text = (
+                raw_query.strip() if isinstance(raw_query, str) and raw_query.strip() else ""
             )
-            answer_summary = _answer_headline(extract_message_text(msg)) or None
-            exchanges.append((pending_question, query_summary, answer_summary))
-            pending_question = None
+            parts: list[str] = []
+            if query_text:
+                parts.append(f"Generated query:\n{query_text}")
+            if text.strip():
+                parts.append(f"Answer:\n{text}")
+            if parts:
+                entries.append("Assistant:\n" + "\n".join(parts))
+        elif text.strip():
+            entries.append(f"{msg.type.capitalize()}:\n{text}")
 
-    if pending_question is not None:
-        exchanges.append((pending_question, None, None))
-
-    if not exchanges:
+    if not entries and dropped_messages <= 0:
         return ""
 
-    recent = exchanges[-MAX_PLANNER_HISTORY_EXCHANGES:]
-    lines = ["Recent conversation history (oldest to newest):"]
-    for idx, (user_q, query_text, answer_text) in enumerate(recent, start=1):
-        parts = [f"{idx}. User: {user_q}"]
-        if query_text:
-            parts.append(f"Query: {query_text}")
-        if answer_text:
-            parts.append(f"Answer: {answer_text}")
-        lines.append(" | ".join(parts))
-    return "\n".join(lines)
+    blocks = ["--- Conversation history (oldest to newest) ---"]
+    if dropped_messages > 0:
+        noun = "message" if dropped_messages == 1 else "messages"
+        blocks.append(f"[{dropped_messages} earlier {noun} omitted due to token budget]")
+    blocks.extend(entries)
+    blocks.append("--- End conversation history ---")
+    return "\n\n".join(blocks)
 
 
 def build_planner_user_prompt(
     question: str,
     *,
-    history: Sequence[BaseMessage] | None = None,
+    history: ConversationWindow | Sequence[BaseMessage] | None = None,
     last_error: dict[str, Any] | None = None,
     planner_notes: str | None = None,
     retry_count: int = 0,
 ) -> str:
-    """Build the planner prompt, optionally prepending bounded conversation history."""
+    """Build the planner prompt, prepending windowed history on non-retry turns."""
+    if last_error is not None:
+        error_json = json.dumps(last_error, ensure_ascii=False, indent=2)
+        notes_block = f"\nCorrection guidance:\n{planner_notes}\n" if planner_notes else ""
+        return (
+            f"User request:\n{question}\n\n"
+            f"PREVIOUS QUERY FAILED (retry {retry_count}). Fix the SQL query and do not repeat the mistake.\n"
+            f"Structured error:\n{error_json}"
+            f"{notes_block}\n"
+            "Return a valid JSON object with the corrected `sql_query`."
+        )
+
     history_block = _format_planner_history(history)
-    request_block = f"{history_block}\n\nUser request:\n{question}" if history_block else f"User request:\n{question}"
-
-    if last_error is None:
-        return request_block
-
-    error_json = json.dumps(last_error, ensure_ascii=False, indent=2)
-    notes_block = f"\nCorrection guidance:\n{planner_notes}\n" if planner_notes else ""
     return (
-        f"{request_block}\n\n"
-        f"PREVIOUS QUERY FAILED (retry {retry_count}). Fix the SQL query and do not repeat the mistake.\n"
-        f"Structured error:\n{error_json}"
-        f"{notes_block}\n"
-        "Return a valid JSON object with the corrected `sql_query`."
+        f"{history_block}\n\nUser request:\n{question}"
+        if history_block
+        else f"User request:\n{question}"
     )
 
 
@@ -211,8 +191,9 @@ def build_critic_user_prompt(
     query_result: dict[str, Any] | None,
     cost_estimate: dict[str, Any] | None,
     guard_result: StatisticalGuardResult,
+    history: ConversationWindow | Sequence[BaseMessage] | None = None,
 ) -> str:
-    """Format executed SQL evidence and guard statistics for the critic model."""
+    """Format executed SQL evidence, guard statistics, and optional history for the critic."""
     qr = query_result or {}
     rows = qr.get("rows", [])
     rows_returned = qr.get("rows_returned", qr.get("row_count", len(rows)))
@@ -231,10 +212,12 @@ def build_critic_user_prompt(
         "sample_rows": preview_rows,
         "statistical_validation": guard_result.model_dump(mode="json"),
     }
-    return (
+    history_block = _format_planner_history(history)
+    evidence_block = (
         "Interpret the following Spark SQL results strictly within the mandatory statistical guardrails:\n"
         f"{json.dumps(payload, ensure_ascii=False, indent=2, default=str)}"
     )
+    return f"{history_block}\n\n{evidence_block}" if history_block else evidence_block
 
 
 def format_manifest_answer(manifest: DatasetManifest, question: str) -> str:

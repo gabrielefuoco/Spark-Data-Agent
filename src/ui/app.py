@@ -176,7 +176,8 @@ def _render_statistical_card(stats_payload: dict[str, Any]) -> None:
 
     if stats_payload.get("assessment_status") == "descriptive":
         st.info("Analisi descrittiva: nessun test di significatività statistica applicato.")
-    elif stats_payload.get("assessment_status") == "cannot_assess":        st.warning(
+    elif stats_payload.get("assessment_status") == "cannot_assess":
+        st.warning(
             stats_payload.get("cannot_assess_reason")
             or "Impossibile valutare la significatività statistica senza dimensione `subject_id`."
         )

@@ -21,13 +21,7 @@ from src.agent.guards import (
     evaluate_query_result_guard,
 )
 from src.agent.nodes import make_spark_sql_executor
-from src.agent.prompts import (
-    MAX_PLANNER_HISTORY_ANSWER_CHARS,
-    MAX_PLANNER_HISTORY_EXCHANGES,
-    MAX_PLANNER_HISTORY_QUERY_CHARS,
-    MAX_PLANNER_HISTORY_QUESTION_CHARS,
-    build_planner_user_prompt,
-)
+from src.agent.prompts import build_planner_user_prompt
 from src.agent.state import make_initial_state
 from src.analytics.safe_sql import SafeSQLError
 from src.config import Settings
@@ -1381,44 +1375,34 @@ def test_hitl_cost_scale_separates_a_pruned_partition_from_a_full_scan() -> None
     assert full["triggers_hitl"] is True
 
 
-def test_planner_prompt_first_turn_byte_identical_and_long_history_capped() -> None:
+def test_planner_prompt_first_turn_byte_identical_and_five_turn_full_fidelity() -> None:
     first_turn = build_planner_user_prompt("Quanti post ci sono nel 2014?")
     assert first_turn == "User request:\nQuanti post ci sono nel 2014?"
     assert build_planner_user_prompt("Quanti post ci sono nel 2014?", history=[]) == first_turn
 
     long_q = "Q_LONG " + ("x" * 300)
     long_sql = "SELECT " + (", ".join(f"col_{i}" for i in range(40))) + " FROM silver_posts"
-    long_a = "Headline " + ("y" * 300) + "\nSecond line that must not be included."
+    long_a = "Headline " + ("y" * 300) + "\nSecond line that must now be preserved in full."
 
     history: list[BaseMessage] = []
-    for idx in range(MAX_PLANNER_HISTORY_EXCHANGES + 2):
-        q_text = long_q if idx == MAX_PLANNER_HISTORY_EXCHANGES + 1 else f"Domanda turno {idx}"
-        sql_text = long_sql if idx == MAX_PLANNER_HISTORY_EXCHANGES + 1 else f"SELECT {idx}"
-        a_text = long_a if idx == MAX_PLANNER_HISTORY_EXCHANGES + 1 else f"Risposta turno {idx}"
+    for idx in range(5):
+        q_text = long_q if idx == 4 else f"Domanda turno {idx}"
+        sql_text = long_sql if idx == 4 else f"SELECT {idx}"
+        a_text = long_a if idx == 4 else f"Risposta turno {idx}"
         history.append(HumanMessage(content=q_text))
         history.append(AIMessage(content=a_text, additional_kwargs={"generated_query": sql_text}))
 
     prompt = build_planner_user_prompt("e per il 2015?", history=history)
-    # Earlier exchanges beyond the cap are dropped.
-    assert "Domanda turno 0" not in prompt
-    assert "Domanda turno 1" not in prompt
-    # Most recent exchanges up to the cap are retained.
-    assert "Domanda turno 2" in prompt
+    # All 5 prior turns (including 5 turns back) and full long fields survive without 160/200 caps.
+    assert "Domanda turno 0" in prompt
     assert "Domanda turno 3" in prompt
-    assert "Q_LONG" in prompt
-    assert "Second line that must not be included." not in prompt
-    # Each component of the oversized exchange is bounded by its named constant.
-    last_history_line = [line for line in prompt.splitlines() if "Q_LONG" in line][0]
-    user_part, query_part, answer_part = last_history_line.split(" | ")
-    assert len(user_part.removeprefix(f"{MAX_PLANNER_HISTORY_EXCHANGES}. User: ")) <= (
-        MAX_PLANNER_HISTORY_QUESTION_CHARS
-    )
-    assert len(query_part.removeprefix("Query: ")) <= MAX_PLANNER_HISTORY_QUERY_CHARS
-    assert len(answer_part.removeprefix("Answer: ")) <= MAX_PLANNER_HISTORY_ANSWER_CHARS
+    assert long_q in prompt
+    assert long_sql in prompt
+    assert long_a in prompt
     assert prompt.endswith("User request:\ne per il 2015?")
 
 
-def test_followup_turn_planner_receives_prior_question_query_and_headline(tmp_path: Path) -> None:
+def test_followup_turn_planner_and_critic_receive_full_prior_turn(tmp_path: Path) -> None:
     db_path = tmp_path / "multi_turn.sqlite"
     settings = Settings(_env_file=None, hitl_cost_threshold=1.0)
     router = _router(
@@ -1434,7 +1418,7 @@ def test_followup_turn_planner_receives_prior_question_query_and_headline(tmp_pa
         },
     )
     critic = _critic(
-        "Nel 2014 sono presenti 1250 post.\nDettaglio tecnico non necessario nel riassunto.",
+        "Nel 2014 sono presenti 1250 post.\nDettaglio tecnico completo da conservare.",
         "Nel 2015 sono presenti 980 post.",
     )
     config = {"configurable": {"thread_id": "followup-thread"}}
@@ -1459,13 +1443,76 @@ def test_followup_turn_planner_receives_prior_question_query_and_headline(tmp_pa
         str(router.recorded_invocations[0][1].content)
         == "User request:\nQuanti post ci sono nel 2014?"
     )
-    # Follow-up turn prompt contains the prior question, executed query, and answer headline.
+    # Follow-up planner prompt contains the full prior question, query, and multi-line answer.
     followup_prompt = str(router.recorded_invocations[1][1].content)
     assert "Quanti post ci sono nel 2014?" in followup_prompt
     assert "WHERE year = 2014" in followup_prompt
     assert "Nel 2014 sono presenti 1250 post." in followup_prompt
-    assert "Dettaglio tecnico" not in followup_prompt
+    assert "Dettaglio tecnico completo da conservare." in followup_prompt
     assert followup_prompt.endswith("User request:\ne per il 2015?")
+
+    # Critic on follow-up turn also receives the windowed prior turn.
+    critic_followup_prompt = str(critic.recorded_invocations[1][1].content)
+    assert "Quanti post ci sono nel 2014?" in critic_followup_prompt
+    assert "WHERE year = 2014" in critic_followup_prompt
+    assert "Nel 2014 sono presenti 1250 post." in critic_followup_prompt
+
+
+def test_followup_retry_omits_conversation_history_from_router_prompt(tmp_path: Path) -> None:
+    db_path = tmp_path / "followup_retry.sqlite"
+    settings = Settings(_env_file=None, hitl_cost_threshold=1.0, max_query_retries=1)
+    router = _router(
+        {
+            "user_intent": "ad_hoc_sql",
+            "answer_from_manifest": False,
+            "sql_query": "SELECT COUNT(*) AS post_count FROM silver_posts WHERE year = 2014",
+        },
+        {
+            "user_intent": "ad_hoc_sql",
+            "answer_from_manifest": False,
+            "sql_query": "SELECT bad_col FROM silver_posts WHERE year = 2015",
+        },
+        {
+            "user_intent": "ad_hoc_sql",
+            "answer_from_manifest": False,
+            "sql_query": "SELECT COUNT(*) AS post_count FROM silver_posts WHERE year = 2015",
+        },
+    )
+    critic = _critic(
+        "Nel 2014 sono presenti 1250 post.",
+        "Nel 2015 sono presenti 980 post.",
+    )
+    attempts: list[str] = []
+
+    def executor(query: str, _cfg: Settings) -> list[dict[str, Any]]:
+        attempts.append(query)
+        if "bad_col" in query:
+            raise SafeSQLError("SPARK_ANALYSIS_ERROR", "UNRESOLVED_COLUMN: bad_col", query=query)
+        return [{"post_count": 1250 if "2014" in query else 980}]
+
+    config = {"configurable": {"thread_id": "followup-retry-thread"}}
+    with open_sqlite_checkpointer(db_path) as saver:
+        graph = build_agent_graph(
+            settings=settings,
+            router_model=router,
+            critic_model=critic,
+            sql_executor=executor,
+            checkpointer=saver,
+        )
+        graph.invoke(make_initial_state("Quanti post ci sono nel 2014?"), config=config)
+        res = graph.invoke(make_initial_state("e per il 2015?"), config=config)
+
+    assert res["status"] == "completed"
+    assert res["retry_count"] == 1
+    assert len(router.recorded_invocations) == 3
+    # Initial turn-2 call receives history; retry turn-2 call omits history and carries error.
+    assert "Quanti post ci sono nel 2014?" in str(router.recorded_invocations[1][1].content)
+    retry_prompt = str(router.recorded_invocations[2][1].content)
+    assert "PREVIOUS QUERY FAILED (retry 1)" in retry_prompt
+    assert "Quanti post ci sono nel 2014?" not in retry_prompt
+    assert "Conversation history" not in retry_prompt
+    # Critic on recovered turn 2 still gets prior turn history.
+    assert "Quanti post ci sono nel 2014?" in str(critic.recorded_invocations[1][1].content)
 
 
 def test_imbalanced_cohort_surfaces_in_payload_and_prompt_without_blocking_valid_prose() -> None:

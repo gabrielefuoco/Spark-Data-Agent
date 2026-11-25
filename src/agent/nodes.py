@@ -28,6 +28,7 @@ from src.agent.guards import (
     evaluate_query_result_guard,
     evaluate_statistical_guard,
 )
+from src.agent.memory import build_conversation_window
 from src.agent.models import create_chat_model
 from src.agent.prompts import (
     ROUTER_SYSTEM_PROMPT,
@@ -435,9 +436,18 @@ def intent_router_planner(state: DataAgentState, deps: AgentRuntimeDeps) -> dict
     question, prior_messages = _split_conversation_messages(state.get("messages", []))
     last_error = state.get("last_error")
     retry_count = state.get("retry_count", 0)
+    # Skip history on retries: the correction prompt already carries the failed query and error.
+    history_window = (
+        build_conversation_window(
+            prior_messages,
+            token_budget=deps.settings.conversation_token_budget,
+        )
+        if last_error is None and prior_messages
+        else None
+    )
     planner_prompt = build_planner_user_prompt(
         question,
-        history=prior_messages,
+        history=history_window,
         last_error=last_error,
         planner_notes=state.get("planner_notes"),
         retry_count=retry_count,
@@ -724,7 +734,15 @@ def statistical_guard(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str
 
 def scientific_critic(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str, Any]:
     """Synthesize the final analytical narrative constrained by the statistical guard."""
-    question, _ = _split_conversation_messages(state.get("messages", []))
+    question, prior_messages = _split_conversation_messages(state.get("messages", []))
+    history_window = (
+        build_conversation_window(
+            prior_messages,
+            token_budget=deps.settings.conversation_token_budget,
+        )
+        if prior_messages
+        else None
+    )
     raw_guard = state.get("statistical_validation")
     guard_result = (
         StatisticalGuardResult.model_validate(raw_guard)
@@ -752,6 +770,7 @@ def scientific_critic(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str
         query_result=state.get("query_result"),
         cost_estimate=state.get("sql_cost_estimate"),
         guard_result=guard_result,
+        history=history_window,
     )
 
     critic_model = deps.get_critic_model()

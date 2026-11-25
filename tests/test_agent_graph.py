@@ -827,8 +827,8 @@ def test_critic_never_complying_falls_back_to_deterministic_inconclusive_text() 
     assert "cohens_d" in failure["missing_items"]
 
     final_text = result["final_response"]
-    assert "risultato non conclusivo" in final_text.lower()
-    assert "non viene affermata alcuna differenza" in final_text.lower()
+    assert "non conclusivo" not in final_text.lower()
+    assert "non viene affermata alcuna differenza" not in final_text.lower()
     assert "35" in final_text
     assert "5.04483e-13" in final_text
     assert "15.681" in final_text
@@ -836,6 +836,20 @@ def test_critic_never_complying_falls_back_to_deterministic_inconclusive_text() 
 
     guard = StatisticalGuardResult.model_validate(result["statistical_validation"])
     assert validate_critic_output(final_text, guard).passed is True
+
+    # Non-significant guard failing citation check still falls back to inconclusive no-claim text.
+    ns_critic = _critic(omits_d_1, omits_d_2, "Third call must never happen.")
+    ns_result = build_agent_graph(
+        settings=settings,
+        router_model=_cohort_router_model(),
+        critic_model=ns_critic,
+        sql_executor=lambda _q, _cfg: _cohort_rows(35, depressed_offset=-0.20),
+    ).invoke(make_initial_state("Compare night posting ratio."))
+    ns_final = ns_result["final_response"]
+    assert "risultato non conclusivo" in ns_final.lower()
+    assert "non viene affermata alcuna differenza" in ns_final.lower()
+    ns_guard = StatisticalGuardResult.model_validate(ns_result["statistical_validation"])
+    assert validate_critic_output(ns_final, ns_guard).passed is True
 
 
 def test_nonsignificant_underpowered_and_cannot_assess_never_ship_significance_claims() -> None:

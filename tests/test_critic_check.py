@@ -79,23 +79,37 @@ def test_validate_accepts_scientific_notation_p_value() -> None:
 
 
 @pytest.mark.parametrize(
-    "bad_p_phrase",
+    ("p_target", "bad_p_phrase"),
     [
-        "p < 0.05",
-        "p <= 0.0312",
-        "p-value < 0.001",
-        "p = 0.01",
-        "p = 0.05",
-        "p-value was small",
+        (0.0031, "p < 0.05"),
+        (0.0312, "p-value < 0.001"),
+        (0.0312, "p < 0.0312"),
+        (0.0312, "p > 0.05"),
+        (0.0312, "p = 0.01"),
+        (0.0312, "p = 0.05"),
+        (0.0312, "p-value was small"),
     ],
 )
-def test_validate_rejects_missing_or_threshold_or_wrong_p_value(bad_p_phrase: str) -> None:
-    guard = _make_guard(p_value=0.0312)
+def test_validate_rejects_missing_or_loose_or_wrong_p_value(
+    p_target: float,
+    bad_p_phrase: str,
+) -> None:
+    guard = _make_guard(p_value=p_target)
     text = f"Depressed=35, control=40, {bad_p_phrase}, Cohen's d = 0.54."
     check = validate_critic_output(text, guard)
     assert check.has_p_value is False
     assert check.passed is False
-    assert "p_value" in check.missing_items
+    assert check.missing_items == ["p_value"]
+
+
+def test_validate_accepts_tight_true_p_value_inequalities_and_rounded_assignments() -> None:
+    guard = _make_guard(n_dep=79, n_ctrl=740, p_value=0.0005936535745210291, cohens_d=0.68)
+    for phrase in ("p < 0.001", "p-value <= 0.001", "p = 0.0006"):
+        text = f"Depressed=79, control=740, {phrase}, Cohen's d = 0.68."
+        check = validate_critic_output(text, guard)
+        assert check.has_p_value is True
+        assert check.passed is True
+        assert check.missing_items == []
 
 
 def test_validate_rejects_rounding_nonzero_p_value_to_zero() -> None:
@@ -113,6 +127,9 @@ def test_validate_rejects_rounding_nonzero_p_value_to_zero() -> None:
         (0.54, "Cohen’s d: 0.54"),
         (0.54, "effect_size_cohens_d = 0.54"),
         (0.54, "d = 0.54"),
+        (0.68, "d > 0.5"),
+        (0.68, "Cohen's d >= 0.5"),
+        (-0.68, "d < -0.5"),
         (-0.423, "Cohen's d of -0.42"),
         (0.0, "Cohen's d = 0.0000"),
     ],
@@ -128,7 +145,9 @@ def test_validate_accepts_valid_cohens_d_phrasings(d_target: float, d_phrase: st
 @pytest.mark.parametrize(
     ("d_target", "bad_d_phrase"),
     [
-        (0.54, "d > 0.5"),
+        (0.68, "d > 0.8"),
+        (0.68, "d > 0.05"),
+        (-0.68, "d > 0.5"),
         (0.54, "Cohen's d is medium"),
         (0.54, "sd = 0.54"),
         (0.54, "Cohen's d = 0.90"),
@@ -312,13 +331,62 @@ def test_correction_prompt_and_deterministic_fallback_always_comply() -> None:
             assert item in correction
 
         fallback = format_inconclusive_critic_fallback(guard, failed)
-        assert "non viene affermata alcuna differenza" in fallback.lower()
         if guard.assessment_status in {"cannot_assess", "descriptive"}:
+            assert "non viene affermata alcuna differenza" in fallback.lower()
             assert "p_value =" not in fallback
             assert "cohen's d =" not in fallback.lower()
+        elif guard.is_significant and not guard.is_underpowered:
+            assert "non conclusivo" not in fallback.lower()
+            assert "inconclusiv" not in fallback.lower()
+            assert "non viene affermata alcuna differenza" not in fallback.lower()
+            assert str(guard.sample_size_depressed) in fallback
+            assert str(guard.sample_size_control) in fallback
+            assert guard.p_value is not None
+            assert f"{guard.p_value:.6g}" in fallback
+            assert guard.effect_size_cohens_d is not None
+            assert f"{guard.effect_size_cohens_d:.6g}" in fallback
+        else:
+            assert "risultato non conclusivo" in fallback.lower()
+            assert "non viene affermata alcuna differenza" in fallback.lower()
         recheck = validate_critic_output(fallback, guard)
         assert recheck.passed is True
         assert recheck.forbidden_claims == []
+
+
+def test_fallback_preserves_significant_finding_and_keeps_inconclusive_for_nonsignificant() -> None:
+    sig_guard = _make_guard(
+        n_dep=79,
+        n_ctrl=740,
+        p_value=0.0005936535745210291,
+        cohens_d=0.68,
+        is_significant=True,
+        is_underpowered=False,
+    )
+    sig_failed = validate_critic_output("Differenza significativa senza numeri.", sig_guard)
+    assert sig_failed.passed is False
+    sig_fallback = format_inconclusive_critic_fallback(sig_guard, sig_failed)
+    assert "79" in sig_fallback
+    assert "740" in sig_fallback
+    assert f"{sig_guard.p_value:.6g}" in sig_fallback
+    assert "0.68" in sig_fallback
+    assert "non conclusivo" not in sig_fallback.lower()
+    assert "non viene affermata alcuna differenza" not in sig_fallback.lower()
+    assert validate_critic_output(sig_fallback, sig_guard).passed is True
+
+    ns_guard = _make_guard(
+        n_dep=79,
+        n_ctrl=740,
+        p_value=0.31,
+        cohens_d=0.08,
+        is_significant=False,
+        is_underpowered=False,
+    )
+    ns_failed = validate_critic_output("Depressed users differ significantly.", ns_guard)
+    assert ns_failed.passed is False
+    ns_fallback = format_inconclusive_critic_fallback(ns_guard, ns_failed)
+    assert "risultato non conclusivo" in ns_fallback.lower()
+    assert "non viene affermata alcuna differenza" in ns_fallback.lower()
+    assert validate_critic_output(ns_fallback, ns_guard).passed is True
 
 
 def test_descriptive_mode_allows_italian_presentation_and_blocks_significance_claims() -> None:
@@ -340,3 +408,53 @@ def test_descriptive_mode_allows_italian_presentation_and_blocks_significance_cl
     bad_check = validate_critic_output(rogue_it, guard)
     assert bad_check.passed is False
     assert bad_check.forbidden_claims
+
+
+def test_italian_decimal_commas_are_read_as_numbers() -> None:
+    """The critic answers in the question's language, so it writes 0,5587.
+
+    Regression: the citation regexes only understood dots, so a correct Italian
+    answer was rejected twice and replaced by the fallback.
+    """
+    guard = _make_guard(p_value=0.5587, cohens_d=0.068, is_significant=False)
+
+    check = validate_critic_output(
+        "Il test non è significativo: p = 0,5587, d = 0,068, su 35 e 40 soggetti.",
+        guard,
+    )
+
+    assert check.missing_items == []
+
+
+def test_italian_bare_comparative_counts_as_a_forbidden_claim() -> None:
+    """'postano più di notte' asserts a difference without the adverb."""
+    guard = _make_guard(is_significant=False)
+
+    flagged = validate_critic_output(
+        "I depressi postano più di notte dei controlli (p = 0.0312, d = 0.54, 35 e 40 soggetti).",
+        guard,
+    )
+    negated = validate_critic_output(
+        "I depressi non postano più di notte dei controlli (p = 0.0312, d = 0.54, 35 e 40 soggetti).",
+        guard,
+    )
+
+    assert flagged.forbidden_claims
+    assert negated.forbidden_claims == []
+
+
+def test_restating_the_question_is_not_a_forbidden_claim() -> None:
+    """The critic opens by echoing the question; that is not an assertion.
+
+    Regression: "**Domanda:** ... pubblicano più di notte rispetto ai controlli?"
+    was flagged, the check failed twice, and a correct answer became a fallback.
+    """
+    guard = _make_guard(is_significant=False)
+
+    check = validate_critic_output(
+        "**Domanda:** i soggetti depressi pubblicano più di notte rispetto ai controlli? "
+        "**Esito:** no, p = 0.0312, d = 0.54, 35 e 40 soggetti.",
+        guard,
+    )
+
+    assert check.forbidden_claims == []

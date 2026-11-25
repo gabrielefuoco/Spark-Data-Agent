@@ -17,18 +17,20 @@ from pydantic import BaseModel, Field
 
 from src.agent.guards import StatisticalGuardResult
 
-_NUM_TOKEN = r"([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
+_NUM_TOKEN = r"(?P<num>[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
+_METRIC_OP = r"(?P<op>(?:(?:is|was)\s+)?(?:<=|>=|≤|≥|<|>)|=|:|\bis\b|\bof\b|\bwas\b|\()"
+_INEQUALITY_OPS = frozenset({"<", "<=", "≤", ">", ">=", "≥"})
 
 _P_VALUE_RE = re.compile(
     rf"(?<![A-Za-z0-9_])(?:p[\s_-]*value|p)\b[*_`]*\)?\s*"
-    rf"(?:(?:=|:|\bis\b|\bof\b|\bwas\b)\s*(?:approx\.?\s*|approximately\s*|about\s*)?|\()\s*"
+    rf"{_METRIC_OP}\s*(?:approx\.?\s*|approximately\s*|about\s*)?"
     rf"[*_`]*{_NUM_TOKEN}",
     re.IGNORECASE,
 )
 
 _COHENS_D_RE = re.compile(
     rf"(?<![A-Za-z0-9_])(?:(?:effect[\s_-]*size[\s_-]*)?cohen['’]?s?[\s_-]*d|d)\b[*_`]*\)?\s*"
-    rf"(?:(?:=|:|\bis\b|\bof\b|\bwas\b)\s*(?:approx\.?\s*|approximately\s*|about\s*)?|\()\s*"
+    rf"{_METRIC_OP}\s*(?:approx\.?\s*|approximately\s*|about\s*)?"
     rf"[*_`]*{_NUM_TOKEN}",
     re.IGNORECASE,
 )
@@ -115,6 +117,12 @@ _FORBIDDEN_CLAIM_PATTERNS: tuple[re.Pattern[str], ...] = (
         r"\b(?:associat[aoei]|collegat[aoei]|correlat[aoei])\s+(?:con\s+la|alla)\s+depressione\b",
         re.IGNORECASE,
     ),
+    # Bare comparatives need no adverb: "i depressi postano più di notte" is an
+    # assertive claim without "significativamente". Matching the comparative
+    # rather than the cohort keeps the negation guard useful: "non postano più
+    # di notte" carries "non" in the prefix and is skipped.
+    re.compile(r"\bpi[uù]\s+(?:di\s+notte|spesso|frequentemente|sovente)\b", re.IGNORECASE),
+    re.compile(r"\bmaggior\s+(?:quota|percentuale|frequenza|incidenza)\b", re.IGNORECASE),
 )
 
 _NEGATION_OR_DISCLAIMER_RE = re.compile(
@@ -125,11 +133,26 @@ _NEGATION_OR_DISCLAIMER_RE = re.compile(
     r"non|nessun[ao]?|mai|senza|assenza\s+di|mancanza\s+di|"
     r"impossibile\s+(?:valutare|affermare|stabilire)|non\s+risulta(?:no)?|"
     r"non\s+indica(?:no)?|non\s+dimostra(?:no)?|non\s+conferma(?:no)?|"
-    r"non\s+significativ[aoei]|evitare\s+di)\b",
+    r"non\s+significativ[aoei]|evitare\s+di|"
+    # Hypothesis framing: the critic restates the question ("Domanda: i depressi
+    # pubblicano più di notte?") before answering. That is not a claim, and
+    # flagging it turned a correct answer into a fallback.
+    r"domanda|domande|chiede|chiedendo|verifica|verificare|ipotesi|questione|"
+    r"ask(?:s|ed|ing)?|hypothes[ie]s|whether)\b",
     re.IGNORECASE,
 )
 
 _CLAUSE_SPLIT_RE = re.compile(r"[.;!?\n]+")
+
+
+def _normalise_decimal_commas(text: str) -> str:
+    """Read Italian decimals ("0,5587") as the numbers they are.
+
+    The critic answers in the language of the question. In Italian it writes
+    decimal commas, every citation regex missed, and a correct answer was
+    rejected twice before the fallback replaced it.
+    """
+    return re.sub(r"(?<=\d),(?=\d)", ".", text)
 
 
 class CriticOutputCheck(BaseModel):
@@ -169,8 +192,51 @@ def _number_matches(quoted_raw: str, target: float) -> bool:
     return abs(quoted - target) <= tol
 
 
+def _inequality_matches(op: str, bound_raw: str, target: float) -> bool:
+    """Accept an inequality only when it holds for ``target`` and is tight (within 10x)."""
+    try:
+        bound = float(bound_raw)
+    except ValueError:
+        return False
+    if not math.isfinite(bound) or not math.isfinite(target):
+        return False
+
+    normalized = op.replace("≤", "<=").replace("≥", ">=")
+    if normalized == "<":
+        holds = target < bound
+    elif normalized == "<=":
+        holds = target <= bound
+    elif normalized == ">":
+        holds = target > bound
+    elif normalized == ">=":
+        holds = target >= bound
+    else:
+        return False
+    if not holds:
+        return False
+
+    if target == 0.0 and bound == 0.0:
+        return True
+    if target == 0.0 or bound == 0.0:
+        return False
+    if (target < 0) != (bound < 0):
+        return False
+
+    larger = max(abs(target), abs(bound))
+    smaller = min(abs(target), abs(bound))
+    return larger <= 10.0 * smaller * (1.0 + 1e-9)
+
+
 def _has_matching_metric(text: str, pattern: re.Pattern[str], target: float) -> bool:
-    return any(_number_matches(match.group(1), target) for match in pattern.finditer(text))
+    for match in pattern.finditer(text):
+        op = match.group("op").split()[-1]
+        raw_num = match.group("num")
+        if op in _INEQUALITY_OPS:
+            if _inequality_matches(op, raw_num, target):
+                return True
+        elif _number_matches(raw_num, target):
+            return True
+    return False
 
 
 def _has_sample_sizes(text: str, n_depressed: int, n_control: int) -> bool:
@@ -204,10 +270,13 @@ def validate_critic_output(
     """Validate that ``critique_text`` obeys statistical citation and claim rules.
 
     For ``assessed`` comparisons, checks three mandatory numeric citations against ``guard``:
-    - ``p_value``: explicit p-value assignment (e.g. ``p = 0.03``, ``p-value: 0.03``)
-      matching ``guard.p_value`` within its displayed rounding precision;
-      threshold-only inequalities such as ``p < 0.05`` do not satisfy this check.
-    - ``cohens_d``: explicit Cohen's d assignment matching ``guard.effect_size_cohens_d``.
+    - ``p_value``: explicit p-value citation (e.g. ``p = 0.03``, ``p-value: 0.03``)
+      matching ``guard.p_value`` within its displayed rounding precision, or a
+      true tight inequality within one order of magnitude (e.g. ``p < 0.001``
+      for ``p = 0.00059``, while ``p < 0.05`` for ``p = 0.0031`` is rejected).
+    - ``cohens_d``: explicit Cohen's d citation matching ``guard.effect_size_cohens_d``
+      or a true tight inequality within one order of magnitude (e.g. ``d > 0.5``
+      for ``d = 0.68``).
     - ``sample_sizes``: both ``guard.sample_size_depressed`` and
       ``guard.sample_size_control`` appearing as standalone integer counts.
 
@@ -218,7 +287,7 @@ def validate_critic_output(
     regex tripwire scans each clause for unnegated assertive phrasing about
     depression in English or Italian.
     """
-    text = critique_text or ""
+    text = _normalise_decimal_commas(critique_text or "")
 
     is_assessed = (
         guard.assessment_status == "assessed"
@@ -363,6 +432,22 @@ def format_inconclusive_critic_fallback(
     d_display = (
         "0.0000" if abs(guard.effect_size_cohens_d) < 1e-12 else f"{guard.effect_size_cohens_d:.6g}"
     )
+    if guard.is_significant and not guard.is_underpowered:
+        return (
+            f"Risultato statisticamente significativo per `{guard.metric_name}` "
+            f"(test `{guard.test_used}`, alpha = {guard.alpha:g}): l'interpretazione "
+            "narrativa è stata omessa perché la risposta generata dal modello non ha "
+            "soddisfatto i requisiti di citazione dopo il tentativo di correzione.\n"
+            f"- sample_size_depressed: {guard.sample_size_depressed}\n"
+            f"- sample_size_control: {guard.sample_size_control}\n"
+            f"- p_value = {guard.p_value:.6g}\n"
+            f"- Cohen's d = {d_display}\n"
+            f"- assessment_status: {guard.assessment_status}, "
+            f"is_significant: {guard.is_significant}, is_underpowered: {guard.is_underpowered}\n"
+            f"{extra_line}"
+            f"- Verifica fallita: {reason_summary}"
+        )
+
     return (
         f"Risultato non conclusivo per `{guard.metric_name}`: la soglia statistica o la "
         "verifica dei vincoli non è stata soddisfatta dopo il tentativo di correzione, "

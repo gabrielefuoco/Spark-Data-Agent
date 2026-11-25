@@ -154,3 +154,28 @@ def test_execute_safe_spark_sql_registers_existing_views_and_enforces_limit(
         )
     assert missing_exc.value.code == "TABLE_NOT_FOUND"
     assert missing_exc.value.to_dict()["code"] == "TABLE_NOT_FOUND"
+
+
+@pytest.mark.spark
+def test_views_are_registered_once_per_storage_root(spark, lakehouse_env) -> None:
+    """Registering is 9s of Parquet schema inference; the query it enables is 0.9s.
+
+    A second call with the same storage root must skip the re-read. Proven
+    behaviourally: with the files gone, a re-registration drops the view, while a
+    skipped one leaves it in place.
+    """
+    import shutil
+
+    settings, paths, _ = lakehouse_env
+    spark.createDataFrame(
+        [("s1", 0, 0.1)], "subject_id STRING, label INT, night_post_ratio DOUBLE"
+    ).write.mode("overwrite").parquet(str(paths.gold_user_longitudinal_features))
+
+    register_lakehouse_views(spark, settings=settings, paths=paths)
+    assert spark.catalog.tableExists("gold_user_longitudinal_features")
+
+    shutil.rmtree(str(paths.gold_user_longitudinal_features))
+    register_lakehouse_views(spark, settings=settings, paths=paths)
+
+    assert spark.catalog.tableExists("gold_user_longitudinal_features")
+    spark.catalog.dropTempView("gold_user_longitudinal_features")

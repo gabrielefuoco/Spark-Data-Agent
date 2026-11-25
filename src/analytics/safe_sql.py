@@ -29,6 +29,9 @@ _LAKEHOUSE_VIEW_ATTRS: tuple[str, ...] = (
 )
 LAKEHOUSE_VIEW_NAMES: frozenset[str] = frozenset(_LAKEHOUSE_VIEW_ATTRS)
 
+# SparkConf key recording which storage root the current temporary views belong to.
+_VIEWS_ROOT_KEY = "spark.dataagent.views_root"
+
 _ALLOWED_ROOT_TYPES = (exp.Select, exp.SetOperation, exp.Subquery)
 _FORBIDDEN_EXPRESSIONS = (
     exp.Drop,
@@ -72,11 +75,39 @@ def register_lakehouse_views(
     settings: Settings | None = None,
     paths: LakehousePaths | None = None,
 ) -> list[str]:
-    """Register existing Silver and Gold Parquet tables as Spark temporary views."""
+    """Register existing Silver and Gold Parquet tables as Spark temporary views.
+
+    Registration is skipped when this session already registered the same storage
+    root: reading a Parquet tree to infer its schema and list its files costs
+    ~2s per table (9s for the five lakehouse views), and the tool loop was paying
+    that on **every** call to run a query that takes 0.9s.
+
+    The marker is keyed on the resolved storage root, not just the view names, so
+    a test with its own `tmp_path` re-registers instead of querying another
+    fixture's data.
+
+    // ponytail: a view stays bound to the files it saw when registered. Rebuild
+    // Gold inside the same session and you must reopen the session; the ETL runs
+    // as a separate job, so this has not bitten yet.
+    """
     resolved = paths or LakehousePaths.from_settings(settings)
+    views = _lakehouse_view_paths(resolved)
+    storage_root = str(resolved.storage_root)
+
+    if spark.conf.get(_VIEWS_ROOT_KEY, None) == storage_root:
+        already_registered = True
+    else:
+        already_registered = False
+
     registered: list[str] = []
 
-    for view_name, table_path in _lakehouse_view_paths(resolved).items():
+    for view_name, table_path in views.items():
+        # Per view, not all-or-nothing: a lakehouse missing one Gold table must
+        # still skip re-reading the four that are there.
+        if already_registered and spark.catalog.tableExists(view_name):
+            registered.append(view_name)
+            continue
+
         if _is_local_uri(table_path):
             if not Path(table_path).exists():
                 spark.catalog.dropTempView(view_name)
@@ -92,6 +123,7 @@ def register_lakehouse_views(
             spark.catalog.dropTempView(view_name)
             continue
 
+    spark.conf.set(_VIEWS_ROOT_KEY, storage_root)
     return registered
 
 

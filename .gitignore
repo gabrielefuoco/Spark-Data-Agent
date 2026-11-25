@@ -5,6 +5,11 @@ chunk/
 ignora/
 data/
 /lakehouse/
+
+# Spark local mode droppings: a test run leaves these at the repo root.
+spark-warehouse/
+metastore_db/
+derby.log
 *.parquet
 
 # Python

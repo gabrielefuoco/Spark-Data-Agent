@@ -50,6 +50,9 @@ class DataAgentState(TypedDict):
     hitl_decision: str | None
     critic_system_prompt: str | None
     critic_critique: str | None
+    critic_call_count: int
+    critic_retry_count: int
+    critic_output_check_failed: dict[str, Any] | None
     final_response: str | None
     status: str
 
@@ -70,6 +73,9 @@ def make_initial_state(question: str) -> DataAgentState:
         hitl_decision=None,
         critic_system_prompt=None,
         critic_critique=None,
+        critic_call_count=0,
+        critic_retry_count=0,
+        critic_output_check_failed=None,
         final_response=None,
         status="running",
     )

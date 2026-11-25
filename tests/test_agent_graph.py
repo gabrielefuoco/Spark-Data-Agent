@@ -14,8 +14,9 @@ from langchain_core.language_models.fake_chat_models import (
 from langchain_core.messages import AIMessage, BaseMessage
 from langgraph.types import Command
 from src.agent.cost import estimate_job_cost
+from src.agent.critic_check import validate_critic_output
 from src.agent.graph import build_agent_graph, open_sqlite_checkpointer
-from src.agent.guards import CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS
+from src.agent.guards import CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS, StatisticalGuardResult
 from src.agent.state import make_initial_state
 from src.analytics.safe_sql import SafeSQLError
 from src.config import Settings
@@ -139,7 +140,15 @@ def test_happy_path_validates_executes_guards_and_wires_critic_prompt() -> None:
         ]
     )
     critic = RecordingFakeChatModel(
-        responses=[AIMessage(content="Significant difference observed (p < 0.001, d > 0.8).")]
+        responses=[
+            AIMessage(
+                content=(
+                    "Significant difference observed "
+                    "(sample_size_depressed=35, sample_size_control=35, "
+                    "p = 5.04483e-13, Cohen's d = 15.681)."
+                )
+            )
+        ]
     )
     executor_calls: list[str] = []
 
@@ -200,7 +209,14 @@ def test_underpowered_or_nonsignificant_guard_forbids_claims_in_critic_prompt() 
         ]
     )
     critic = RecordingFakeChatModel(
-        responses=[AIMessage(content="Sample is underpowered; no correlation claimed.")]
+        responses=[
+            AIMessage(
+                content=(
+                    "Sample is underpowered (depressed=5, control=5, "
+                    "p = 1.67857e-10, Cohen's d = 25.2982); no correlation claimed."
+                )
+            )
+        ]
     )
 
     def fake_executor(_query: str, _cfg: Settings) -> list[dict[str, Any]]:
@@ -248,7 +264,15 @@ def test_powered_nonsignificant_result_forbids_claims_in_critic_prompt() -> None
         ]
     )
     critic = RecordingFakeChatModel(
-        responses=[AIMessage(content="No statistically significant difference detected.")]
+        responses=[
+            AIMessage(
+                content=(
+                    "No statistically significant difference detected "
+                    "(sample_size_depressed=35, sample_size_control=35, "
+                    "p = 0.248336, Cohen's d = 0.0000)."
+                )
+            )
+        ]
     )
 
     def fake_executor(_query: str, _cfg: Settings) -> list[dict[str, Any]]:
@@ -301,7 +325,16 @@ def test_ast_validation_rejection_triggers_retry_without_touching_executor() -> 
             ),
         ]
     )
-    critic = RecordingFakeChatModel(responses=[AIMessage(content="Recovered after AST fix.")])
+    critic = RecordingFakeChatModel(
+        responses=[
+            AIMessage(
+                content=(
+                    "Recovered after AST fix "
+                    "(depressed=30, control=30, p = 2.41976e-11, Cohen's d = 15.6425)."
+                )
+            )
+        ]
+    )
     executor_calls: list[str] = []
 
     def fake_executor(query: str, _cfg: Settings) -> list[dict[str, Any]]:
@@ -410,7 +443,11 @@ def test_successful_retry_on_second_attempt_stops_loop() -> None:
             ),
         ]
     )
-    critic = RecordingFakeChatModel(responses=[AIMessage(content="Completed on retry.")])
+    completed_critique = (
+        "Completed on retry "
+        "(depressed=30, control=30, p = 2.41976e-11, Cohen's d = 15.6425)."
+    )
+    critic = RecordingFakeChatModel(responses=[AIMessage(content=completed_critique)])
     attempts: list[str] = []
 
     def flaky_executor(query: str, _cfg: Settings) -> Sequence[dict[str, Any]]:
@@ -430,7 +467,7 @@ def test_successful_retry_on_second_attempt_stops_loop() -> None:
     assert len(attempts) == 2
     assert result["retry_count"] == 1
     assert result["status"] == "completed"
-    assert result["final_response"] == "Completed on retry."
+    assert result["final_response"] == completed_critique
 
 
 def test_empty_result_triggers_retry_and_recovers() -> None:
@@ -464,7 +501,16 @@ def test_empty_result_triggers_retry_and_recovers() -> None:
             ),
         ]
     )
-    critic = RecordingFakeChatModel(responses=[AIMessage(content="Recovered after empty result.")])
+    critic = RecordingFakeChatModel(
+        responses=[
+            AIMessage(
+                content=(
+                    "Recovered after empty result "
+                    "(depressed=30, control=30, p = 2.41976e-11, Cohen's d = 15.6425)."
+                )
+            )
+        ]
+    )
     attempts: list[str] = []
 
     def executor_empty_then_valid(query: str, _cfg: Settings) -> list[dict[str, Any]]:
@@ -507,8 +553,12 @@ def test_hitl_interrupt_persists_across_sqlite_checkpointer_and_executes_on_appr
             )
         ]
     )
+    approved_critique = (
+        "Approved expensive query completed "
+        "(sample_size_depressed=0, sample_size_control=0, p = 1.0, Cohen's d = 0.0)."
+    )
     critic = FakeMessagesListChatModel(
-        responses=[AIMessage(content="Approved expensive query completed.")]
+        responses=[AIMessage(content=approved_critique)]
     )
     executor_calls: list[str] = []
 
@@ -551,7 +601,7 @@ def test_hitl_interrupt_persists_across_sqlite_checkpointer_and_executes_on_appr
     assert len(executor_calls) == 1
     assert resumed["hitl_decision"] == "approved"
     assert resumed["status"] == "completed"
-    assert resumed["final_response"] == "Approved expensive query completed."
+    assert resumed["final_response"] == approved_critique
 
 
 def test_hitl_refusal_never_executes_and_returns_cancelled_state(tmp_path: Path) -> None:
@@ -618,7 +668,14 @@ def test_missing_subject_id_column_records_cannot_assess_verdict_and_forbids_cla
         ]
     )
     critic = RecordingFakeChatModel(
-        responses=[AIMessage(content="Cannot assess statistical significance without subject_id.")]
+        responses=[
+            AIMessage(
+                content=(
+                    "Cannot assess statistical significance without subject_id "
+                    "(depressed=0, control=0, p = 1.0, Cohen's d = 0.0)."
+                )
+            )
+        ]
     )
 
     def fake_executor(_query: str, _cfg: Settings) -> list[dict[str, Any]]:
@@ -676,7 +733,14 @@ def test_pseudo_replicated_single_subject_rows_are_caught_as_underpowered_in_gra
         ]
     )
     critic = RecordingFakeChatModel(
-        responses=[AIMessage(content="Underpowered: depressed cohort has only 1 unique subject.")]
+        responses=[
+            AIMessage(
+                content=(
+                    "Underpowered: depressed cohort has only 1 unique subject "
+                    "(depressed=1, control=35, p = 1.0, Cohen's d = 0.0)."
+                )
+            )
+        ]
     )
 
     def fake_executor(_query: str, _cfg: Settings) -> list[dict[str, Any]]:
@@ -737,9 +801,11 @@ def test_topic_model_job_interrupts_at_hitl_and_executes_once_on_approval(
             )
         ]
     )
-    critic = RecordingFakeChatModel(
-        responses=[AIMessage(content="LDA topic recomputation completed after approval.")]
+    topic_critique = (
+        "LDA topic recomputation completed after approval "
+        "(cannot assess subject-level significance: depressed=0, control=0, p = 1.0, Cohen's d = 0.0)."
     )
+    critic = RecordingFakeChatModel(responses=[AIMessage(content=topic_critique)])
     sql_calls: list[str] = []
     job_calls: list[tuple[str, dict[str, Any]]] = []
 
@@ -807,7 +873,7 @@ def test_topic_model_job_interrupts_at_hitl_and_executes_once_on_approval(
     assert sql_calls == []
     assert resumed["hitl_decision"] == "approved"
     assert resumed["status"] == "completed"
-    assert resumed["final_response"] == "LDA topic recomputation completed after approval."
+    assert resumed["final_response"] == topic_critique
 
 
 def test_topic_model_job_hitl_rejection_never_executes(tmp_path: Path) -> None:
@@ -873,7 +939,14 @@ def test_circadian_features_job_dispatch_runs_offline_and_guards_subjects() -> N
         ]
     )
     critic = RecordingFakeChatModel(
-        responses=[AIMessage(content="Circadian job completed with significant cohort shift.")]
+        responses=[
+            AIMessage(
+                content=(
+                    "Circadian job completed with significant cohort shift "
+                    "(depressed=35, control=35, p = 5.04483e-13, Cohen's d = 15.681)."
+                )
+            )
+        ]
     )
     sql_calls: list[str] = []
     job_calls: list[tuple[str, dict[str, Any]]] = []
@@ -932,7 +1005,16 @@ def test_unknown_spark_job_triggers_retry_and_recovers() -> None:
             ),
         ]
     )
-    critic = RecordingFakeChatModel(responses=[AIMessage(content="Recovered to valid job.")])
+    critic = RecordingFakeChatModel(
+        responses=[
+            AIMessage(
+                content=(
+                    "Recovered to valid job "
+                    "(depressed=30, control=30, p = 2.41976e-11, Cohen's d = 15.6425)."
+                )
+            )
+        ]
+    )
     job_calls: list[str] = []
 
     def fake_job(job_name: str, _params: dict[str, Any], _cfg: Settings) -> list[dict[str, Any]]:
@@ -951,3 +1033,193 @@ def test_unknown_spark_job_triggers_retry_and_recovers() -> None:
     assert result["retry_count"] == 1
     assert result["status"] == "completed"
     assert "UNKNOWN_SPARK_JOB" in str(router.recorded_invocations[1][1].content)
+
+
+def _cohort_router_model(*, include_subject_id: bool = True) -> FakeMessagesListChatModel:
+    cols = "subject_id, label, night_post_ratio" if include_subject_id else "label, night_post_ratio"
+    return FakeMessagesListChatModel(
+        responses=[
+            AIMessage(
+                content=json.dumps(
+                    {
+                        "user_intent": "circadian_study",
+                        "answer_from_manifest": False,
+                        "sql_query": f"SELECT {cols} FROM gold_user_longitudinal_features",
+                        "metric_name": "night_post_ratio",
+                    }
+                )
+            )
+        ]
+    )
+
+
+def test_critic_compliant_first_response_makes_exactly_one_call() -> None:
+    settings = Settings(_env_file=None, min_subjects_per_class=30)
+    compliant = (
+        "Depressed cohort (35 subjects) vs control cohort (35 subjects) showed a statistically "
+        "significant difference (p = 5.04483e-13, Cohen's d = 15.681)."
+    )
+    critic = RecordingFakeChatModel(responses=[AIMessage(content=compliant)])
+
+    graph = build_agent_graph(
+        settings=settings,
+        router_model=_cohort_router_model(),
+        critic_model=critic,
+        sql_executor=lambda _q, _cfg: _cohort_rows(35),
+    )
+    result = graph.invoke(make_initial_state("Compare night posting ratio."))
+
+    assert len(critic.recorded_invocations) == 1
+    assert result["critic_call_count"] == 1
+    assert result["critic_retry_count"] == 0
+    assert result["critic_output_check_failed"] is None
+    assert result["final_response"] == compliant
+
+
+def test_critic_omitting_p_value_triggers_single_corrective_retry() -> None:
+    settings = Settings(_env_file=None, min_subjects_per_class=30, max_query_retries=0)
+    first_bad = "Significant difference observed (depressed=35, control=35, Cohen's d = 15.681)."
+    second_good = (
+        "Significant difference observed (depressed=35, control=35, "
+        "p = 5.04483e-13, Cohen's d = 15.681)."
+    )
+    critic = RecordingFakeChatModel(
+        responses=[AIMessage(content=first_bad), AIMessage(content=second_good)]
+    )
+
+    graph = build_agent_graph(
+        settings=settings,
+        router_model=_cohort_router_model(),
+        critic_model=critic,
+        sql_executor=lambda _q, _cfg: _cohort_rows(35),
+    )
+    result = graph.invoke(make_initial_state("Compare night posting ratio."))
+
+    assert len(critic.recorded_invocations) == 2
+    assert result["critic_call_count"] == 2
+    assert result["critic_retry_count"] == 1
+    assert result["retry_count"] == 0
+    assert result["critic_output_check_failed"] is None
+    assert result["final_response"] == second_good
+    correction_msg = str(critic.recorded_invocations[1][-1].content)
+    assert "p_value" in correction_msg
+
+
+def test_critic_never_complying_falls_back_to_deterministic_inconclusive_text() -> None:
+    settings = Settings(_env_file=None, min_subjects_per_class=30)
+    omits_d_1 = "Observed difference (depressed=35, control=35, p = 5.04483e-13)."
+    omits_d_2 = "Still omitting effect size (depressed=35, control=35, p = 5.04483e-13)."
+    critic = RecordingFakeChatModel(
+        responses=[
+            AIMessage(content=omits_d_1),
+            AIMessage(content=omits_d_2),
+            AIMessage(content="Third call must never happen."),
+        ]
+    )
+
+    graph = build_agent_graph(
+        settings=settings,
+        router_model=_cohort_router_model(),
+        critic_model=critic,
+        sql_executor=lambda _q, _cfg: _cohort_rows(35),
+    )
+    result = graph.invoke(make_initial_state("Compare night posting ratio."))
+
+    assert len(critic.recorded_invocations) == 2
+    assert result["critic_call_count"] == 2
+    assert result["critic_retry_count"] == 1
+    assert result["status"] == "completed"
+    failure = result["critic_output_check_failed"]
+    assert failure is not None
+    assert failure["failed"] is True
+    assert failure["retry_count"] == 1
+    assert "cohens_d" in failure["missing_items"]
+
+    final_text = result["final_response"]
+    assert "inconclusive" in final_text.lower()
+    assert "claim threshold was not met" in final_text.lower()
+    assert "35" in final_text
+    assert "5.04483e-13" in final_text
+    assert "15.681" in final_text
+    assert result["critic_critique"] == final_text
+
+    guard = StatisticalGuardResult.model_validate(result["statistical_validation"])
+    assert validate_critic_output(final_text, guard).passed is True
+
+
+def test_nonsignificant_underpowered_and_cannot_assess_never_ship_significance_claims() -> None:
+    settings = Settings(_env_file=None, min_subjects_per_class=30)
+    rogue_claim = (
+        "Depressed users post at night significantly more often "
+        "(sample_size_depressed=35, sample_size_control=35, p = 0.248336, Cohen's d = 0.0000)."
+    )
+
+    # 1. Powered non-significant: rogue claim on call 1, corrected on call 2.
+    compliant_ns = (
+        "No statistically significant difference was found "
+        "(sample_size_depressed=35, sample_size_control=35, p = 0.248336, Cohen's d = 0.0000)."
+    )
+    critic_ns = RecordingFakeChatModel(
+        responses=[AIMessage(content=rogue_claim), AIMessage(content=compliant_ns)]
+    )
+    res_ns = build_agent_graph(
+        settings=settings,
+        router_model=_cohort_router_model(),
+        critic_model=critic_ns,
+        sql_executor=lambda _q, _cfg: _cohort_rows(35, depressed_offset=-0.20),
+    ).invoke(make_initial_state("Compare night post ratio."))
+    guard_ns = StatisticalGuardResult.model_validate(res_ns["statistical_validation"])
+    assert guard_ns.is_significant is False
+    assert res_ns["critic_call_count"] == 2
+    assert res_ns["critic_output_check_failed"] is None
+    check_ns = validate_critic_output(res_ns["final_response"], guard_ns)
+    assert check_ns.passed is True
+    assert check_ns.forbidden_claims == []
+
+    # 2. Underpowered: rogue claim on both calls -> deterministic fallback without significance claim.
+    rogue_underpowered = (
+        "Depressed users post at night significantly more often "
+        "(depressed=5, control=5, p = 1.67857e-10, Cohen's d = 25.2982)."
+    )
+    critic_up = RecordingFakeChatModel(
+        responses=[AIMessage(content=rogue_underpowered), AIMessage(content=rogue_underpowered)]
+    )
+    res_up = build_agent_graph(
+        settings=settings,
+        router_model=_cohort_router_model(),
+        critic_model=critic_up,
+        sql_executor=lambda _q, _cfg: _cohort_rows(5, depressed_offset=0.6),
+    ).invoke(make_initial_state("Compare night post ratio."))
+    guard_up = StatisticalGuardResult.model_validate(res_up["statistical_validation"])
+    assert guard_up.is_underpowered is True
+    assert res_up["critic_call_count"] == 2
+    assert res_up["critic_output_check_failed"] is not None
+    assert res_up["critic_output_check_failed"]["forbidden_claims"]
+    check_up = validate_critic_output(res_up["final_response"], guard_up)
+    assert check_up.passed is True
+    assert check_up.forbidden_claims == []
+
+    # 3. cannot_assess: rogue claim on both calls -> deterministic fallback without significance claim.
+    rogue_ca = (
+        "There is a statistically significant difference between depressed and control users "
+        "(depressed=0, control=0, p = 1.0, Cohen's d = 0.0)."
+    )
+    critic_ca = RecordingFakeChatModel(
+        responses=[AIMessage(content=rogue_ca), AIMessage(content=rogue_ca)]
+    )
+    res_ca = build_agent_graph(
+        settings=settings,
+        router_model=_cohort_router_model(include_subject_id=False),
+        critic_model=critic_ca,
+        sql_executor=lambda _q, _cfg: [
+            {"label": 1, "night_post_ratio": 0.6},
+            {"label": 0, "night_post_ratio": 0.1},
+        ],
+    ).invoke(make_initial_state("Compare night post ratio."))
+    guard_ca = StatisticalGuardResult.model_validate(res_ca["statistical_validation"])
+    assert guard_ca.assessment_status == "cannot_assess"
+    assert res_ca["critic_call_count"] == 2
+    assert res_ca["critic_output_check_failed"] is not None
+    check_ca = validate_critic_output(res_ca["final_response"], guard_ca)
+    assert check_ca.passed is True
+    assert check_ca.forbidden_claims == []

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from src.agent.cost import estimate_ast_cost, estimate_sql_cost
+from src.agent.critic_check import CriticOutputCheck, validate_critic_output
 from src.agent.graph import (
     build_agent_graph,
     create_sqlite_checkpointer,
@@ -22,6 +23,7 @@ from src.agent.state import CostEstimate, DataAgentState, make_initial_state
 __all__ = [
     "CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS",
     "CostEstimate",
+    "CriticOutputCheck",
     "DataAgentState",
     "StatisticalComparisonInput",
     "StatisticalGuardResult",
@@ -36,4 +38,5 @@ __all__ = [
     "make_spark_sql_executor",
     "open_sqlite_checkpointer",
     "resolve_model_config",
+    "validate_critic_output",
 ]

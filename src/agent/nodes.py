@@ -18,6 +18,11 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
 from src.agent.cost import estimate_job_cost, estimate_sql_cost
+from src.agent.critic_check import (
+    format_critic_correction_prompt,
+    format_inconclusive_critic_fallback,
+    validate_critic_output,
+)
 from src.agent.guards import (
     StatisticalGuardResult,
     SubjectObservation,
@@ -841,16 +846,47 @@ def scientific_critic(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str
         guard_result=guard_result,
     )
 
-    response = deps.get_critic_model().invoke(
-        [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_prompt),
-        ]
-    )
+    critic_model = deps.get_critic_model()
+    base_messages: list[BaseMessage] = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt),
+    ]
+    response = critic_model.invoke(base_messages)
     critique_text = _message_text(response)
+    critic_calls = 1
+    critic_retries = 0
+    check = validate_critic_output(critique_text, guard_result)
+    check_failed: dict[str, Any] | None = None
+
+    if not check.passed:
+        correction_prompt = format_critic_correction_prompt(guard_result, check)
+        retry_response = critic_model.invoke(
+            [
+                *base_messages,
+                AIMessage(content=critique_text),
+                HumanMessage(content=correction_prompt),
+            ]
+        )
+        critic_calls += 1
+        critic_retries = 1
+        critique_text = _message_text(retry_response)
+        check = validate_critic_output(critique_text, guard_result)
+        if not check.passed:
+            critique_text = format_inconclusive_critic_fallback(guard_result, check)
+            check_failed = {
+                "failed": True,
+                "retry_count": critic_retries,
+                "critic_call_count": critic_calls,
+                "missing_items": list(check.missing_items),
+                "forbidden_claims": list(check.forbidden_claims),
+            }
+
     return {
         "critic_system_prompt": system_prompt,
         "critic_critique": critique_text,
+        "critic_call_count": critic_calls,
+        "critic_retry_count": critic_retries,
+        "critic_output_check_failed": check_failed,
         "final_response": critique_text,
         "status": "completed",
         "messages": [AIMessage(content=critique_text)],

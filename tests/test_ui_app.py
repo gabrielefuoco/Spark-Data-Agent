@@ -47,7 +47,14 @@ def _build_hitl_test_graph(executor_calls: list[str]) -> Any:
         ]
     )
     critic = FakeMessagesListChatModel(
-        responses=[AIMessage(content="Analisi completata dopo autorizzazione HITL.")]
+        responses=[
+            AIMessage(
+                content=(
+                    "Analisi completata dopo autorizzazione HITL. "
+                    "(depressed=0, control=0, p = 1.0, Cohen's d = 0.0)"
+                )
+            )
+        ]
     )
 
     def fake_executor(query: str, _cfg: Settings) -> list[dict[str, Any]]:

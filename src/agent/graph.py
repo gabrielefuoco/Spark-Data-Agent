@@ -8,6 +8,7 @@ import re
 import sqlite3
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -23,7 +24,11 @@ from langgraph.types import interrupt
 from pyspark.sql import SparkSession
 
 from src.agent.cost import estimate_sql_cost
-from src.agent.guards import StatisticalGuardResult, evaluate_statistical_guard
+from src.agent.guards import (
+    StatisticalGuardResult,
+    SubjectObservation,
+    evaluate_statistical_guard,
+)
 from src.agent.models import create_chat_model
 from src.agent.prompts import (
     ROUTER_SYSTEM_PROMPT,
@@ -197,29 +202,58 @@ def _as_finite_float(value: object) -> float | None:
     return number if math.isfinite(number) else None
 
 
+@dataclass(frozen=True)
+class _ExtractedGroupMetrics:
+    """Subject-attributed cohort observations extracted from SQL result rows."""
+
+    depressed_observations: list[SubjectObservation]
+    control_observations: list[SubjectObservation]
+    metric_name: str
+    has_subject_dimension: bool
+    raw_observation_count_depressed: int
+    raw_observation_count_control: int
+
+
+def _find_column_key(candidate_cols: Sequence[str], target_lower: str) -> str | None:
+    for col in candidate_cols:
+        if col.lower() == target_lower:
+            return col
+    return None
+
+
 def _extract_group_metrics(
     rows: list[dict[str, Any]],
     preferred_metric: str | None = None,
-) -> tuple[list[float], list[float], str]:
-    """Extract depressed (label=1) and control (label=0) series for the statistical guard."""
+    columns: Sequence[str] | None = None,
+) -> _ExtractedGroupMetrics:
+    """Extract subject-level depressed (label=1) and control (label=0) observations."""
     metric_label = preferred_metric or "metric"
-    if not rows:
-        return [], [], metric_label
-
-    has_label = any("label" in row for row in rows)
-    if not has_label:
-        return [], [], metric_label
-
-    candidate_cols: list[str] = []
+    candidate_cols: list[str] = list(columns or [])
     for row in rows:
         for key in row:
             if key not in candidate_cols:
                 candidate_cols.append(key)
 
+    subject_col = _find_column_key(candidate_cols, "subject_id")
+    label_col = _find_column_key(candidate_cols, "label")
+    has_subject_col = subject_col is not None
+
+    if not rows or label_col is None:
+        return _ExtractedGroupMetrics(
+            depressed_observations=[],
+            control_observations=[],
+            metric_name=metric_label,
+            has_subject_dimension=has_subject_col,
+            raw_observation_count_depressed=0,
+            raw_observation_count_control=0,
+        )
+
     metric_col: str | None = None
-    if preferred_metric and any(_as_finite_float(r.get(preferred_metric)) is not None for r in rows):
-        metric_col = preferred_metric
-    else:
+    if preferred_metric:
+        preferred_key = _find_column_key(candidate_cols, preferred_metric.lower())
+        if preferred_key and any(_as_finite_float(r.get(preferred_key)) is not None for r in rows):
+            metric_col = preferred_key
+    if metric_col is None:
         for col in candidate_cols:
             if col.lower() in _EXCLUDED_METRIC_COLUMNS:
                 continue
@@ -228,12 +262,22 @@ def _extract_group_metrics(
                 break
 
     if metric_col is None:
-        return [], [], metric_label
+        return _ExtractedGroupMetrics(
+            depressed_observations=[],
+            control_observations=[],
+            metric_name=metric_label,
+            has_subject_dimension=has_subject_col,
+            raw_observation_count_depressed=0,
+            raw_observation_count_control=0,
+        )
 
-    depressed: list[float] = []
-    control: list[float] = []
+    depressed: list[SubjectObservation] = []
+    control: list[SubjectObservation] = []
+    raw_dep_count = 0
+    raw_ctrl_count = 0
+
     for row in rows:
-        raw_label = row.get("label")
+        raw_label = row.get(label_col)
         val = _as_finite_float(row.get(metric_col))
         if raw_label is None or val is None:
             continue
@@ -241,12 +285,41 @@ def _extract_group_metrics(
             label_int = int(raw_label)
         except (TypeError, ValueError):
             continue
-        if label_int == 1:
-            depressed.append(val)
-        elif label_int == 0:
-            control.append(val)
+        if label_int not in (0, 1):
+            continue
 
-    return depressed, control, metric_col
+        if label_int == 1:
+            raw_dep_count += 1
+        else:
+            raw_ctrl_count += 1
+
+        if subject_col is None:
+            continue
+        raw_subject = row.get(subject_col)
+        if raw_subject is None:
+            continue
+        subject_id = str(raw_subject).strip()
+        if not subject_id:
+            continue
+
+        obs = SubjectObservation(subject_id=subject_id, value=val)
+        if label_int == 1:
+            depressed.append(obs)
+        else:
+            control.append(obs)
+
+    has_subject_dimension = has_subject_col and (
+        (raw_dep_count + raw_ctrl_count) == 0 or (len(depressed) + len(control)) > 0
+    )
+
+    return _ExtractedGroupMetrics(
+        depressed_observations=depressed,
+        control_observations=control,
+        metric_name=metric_col,
+        has_subject_dimension=has_subject_dimension,
+        raw_observation_count_depressed=raw_dep_count,
+        raw_observation_count_control=raw_ctrl_count,
+    )
 
 
 def _normalize_hitl_decision(decision: Any) -> bool:
@@ -511,19 +584,24 @@ def build_agent_graph(
     def statistical_guard(state: DataAgentState) -> dict[str, Any]:
         query_result = state.get("query_result") or {}
         rows = query_result.get("rows", [])
-        depressed_vals, control_vals, metric_name = _extract_group_metrics(
+        columns = query_result.get("columns", [])
+        extracted = _extract_group_metrics(
             rows,
             preferred_metric=state.get("analysis_metric"),
+            columns=columns,
         )
         guard_result = evaluate_statistical_guard(
-            depressed_vals,
-            control_vals,
+            extracted.depressed_observations,
+            extracted.control_observations,
             settings=cfg,
-            metric_name=metric_name,
+            metric_name=extracted.metric_name,
+            has_subject_dimension=extracted.has_subject_dimension,
+            raw_observation_count_depressed=extracted.raw_observation_count_depressed,
+            raw_observation_count_control=extracted.raw_observation_count_control,
         )
         return {
             "statistical_validation": guard_result.model_dump(mode="json"),
-            "analysis_metric": metric_name,
+            "analysis_metric": extracted.metric_name,
             "status": "running",
         }
 
@@ -533,7 +611,13 @@ def build_agent_graph(
         guard_result = (
             StatisticalGuardResult.model_validate(raw_guard)
             if raw_guard is not None
-            else evaluate_statistical_guard([], [], settings=cfg, metric_name="metric")
+            else evaluate_statistical_guard(
+                [],
+                [],
+                settings=cfg,
+                metric_name="metric",
+                has_subject_dimension=False,
+            )
         )
         system_prompt = build_critic_system_prompt(guard_result)
         user_prompt = build_critic_user_prompt(

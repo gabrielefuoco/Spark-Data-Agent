@@ -163,6 +163,10 @@ def test_happy_path_validates_executes_guards_and_wires_critic_prompt() -> None:
     assert result["sql_cost_estimate"]["triggers_hitl"] is False
     assert result["statistical_validation"]["sample_size_depressed"] == 35
     assert result["statistical_validation"]["sample_size_control"] == 35
+    assert result["statistical_validation"]["observation_count_depressed"] == 35
+    assert result["statistical_validation"]["observation_count_control"] == 35
+    assert result["statistical_validation"]["aggregation_method"] == "subject_mean"
+    assert result["statistical_validation"]["assessment_status"] == "assessed"
     assert result["statistical_validation"]["is_significant"] is True
     assert result["statistical_validation"]["is_underpowered"] is False
 
@@ -592,3 +596,113 @@ def test_hitl_refusal_never_executes_and_returns_cancelled_state(tmp_path: Path)
     assert cancelled["hitl_decision"] == "rejected"
     assert cancelled["status"] == "cancelled"
     assert "cancelled" in cancelled["final_response"].lower()
+
+
+def test_missing_subject_id_column_records_cannot_assess_verdict_and_forbids_claims() -> None:
+    settings = Settings(_env_file=None, min_subjects_per_class=30)
+    router = FakeMessagesListChatModel(
+        responses=[
+            AIMessage(
+                content=json.dumps(
+                    {
+                        "user_intent": "circadian_study",
+                        "answer_from_manifest": False,
+                        "sql_query": (
+                            "SELECT label, night_post_ratio FROM gold_user_longitudinal_features"
+                        ),
+                        "metric_name": "night_post_ratio",
+                    }
+                )
+            )
+        ]
+    )
+    critic = RecordingFakeChatModel(
+        responses=[AIMessage(content="Cannot assess statistical significance without subject_id.")]
+    )
+
+    def fake_executor(_query: str, _cfg: Settings) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for i in range(40):
+            rows.append({"label": 1, "night_post_ratio": 0.60 + (i % 5) * 0.02})
+            rows.append({"label": 0, "night_post_ratio": 0.10 + (i % 5) * 0.02})
+        return rows
+
+    graph = build_agent_graph(
+        settings=settings,
+        router_model=router,
+        critic_model=critic,
+        sql_executor=fake_executor,
+    )
+    result = graph.invoke(make_initial_state("Compare night post ratio by cohort."))
+
+    assert result["status"] == "completed"
+    guard = result["statistical_validation"]
+    assert guard["assessment_status"] == "cannot_assess"
+    assert guard["cannot_assess_reason"] is not None
+    assert "cannot assess: no subject dimension" in guard["cannot_assess_reason"].lower()
+    assert guard["statistical_confidence"] == "cannot_assess"
+    assert guard["is_significant"] is False
+    assert guard["sample_size_depressed"] == 0
+    assert guard["sample_size_control"] == 0
+    assert guard["observation_count_depressed"] == 40
+    assert guard["observation_count_control"] == 40
+    assert guard["aggregation_method"] == "none"
+
+    assert CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS in result["critic_system_prompt"]
+    assert "FORBIDDEN:" in result["critic_system_prompt"]
+    assert "cannot assess: no subject dimension" in result["critic_system_prompt"].lower()
+    critic_system_msg = critic.recorded_invocations[0][0].content
+    assert "cannot assess: no subject dimension" in critic_system_msg.lower()
+
+
+def test_pseudo_replicated_single_subject_rows_are_caught_as_underpowered_in_graph() -> None:
+    settings = Settings(_env_file=None, min_subjects_per_class=30)
+    router = FakeMessagesListChatModel(
+        responses=[
+            AIMessage(
+                content=json.dumps(
+                    {
+                        "user_intent": "circadian_study",
+                        "answer_from_manifest": False,
+                        "sql_query": (
+                            "SELECT subject_id, label, night_post_ratio "
+                            "FROM gold_user_longitudinal_features"
+                        ),
+                        "metric_name": "night_post_ratio",
+                    }
+                )
+            )
+        ]
+    )
+    critic = RecordingFakeChatModel(
+        responses=[AIMessage(content="Underpowered: depressed cohort has only 1 unique subject.")]
+    )
+
+    def fake_executor(_query: str, _cfg: Settings) -> list[dict[str, Any]]:
+        rows = [
+            {"subject_id": "dep_only", "label": 1, "night_post_ratio": 0.85 + (i % 4) * 0.02}
+            for i in range(40)
+        ]
+        rows.extend(
+            {"subject_id": f"ctrl_{i}", "label": 0, "night_post_ratio": 0.10 + (i % 5) * 0.02}
+            for i in range(35)
+        )
+        return rows
+
+    graph = build_agent_graph(
+        settings=settings,
+        router_model=router,
+        critic_model=critic,
+        sql_executor=fake_executor,
+    )
+    result = graph.invoke(make_initial_state("Compare night post ratio."))
+
+    guard = result["statistical_validation"]
+    assert guard["sample_size_depressed"] == 1
+    assert guard["observation_count_depressed"] == 40
+    assert guard["sample_size_control"] == 35
+    assert guard["observation_count_control"] == 35
+    assert guard["aggregation_method"] == "subject_mean"
+    assert guard["is_underpowered"] is True
+    assert guard["is_significant"] is False
+    assert "FORBIDDEN:" in result["critic_system_prompt"]

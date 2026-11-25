@@ -17,7 +17,11 @@ from langgraph.types import Command
 from pyspark.sql import SparkSession
 from src.agent.cost import estimate_job_cost, estimate_sql_cost
 from src.agent.critic_check import validate_critic_output
-from src.agent.graph import build_agent_graph, open_sqlite_checkpointer
+from src.agent.graph import (
+    build_agent_graph,
+    make_spark_sql_executor,
+    open_sqlite_checkpointer,
+)
 from src.agent.guards import CRITIC_STATISTICAL_GUARDRAIL_INSTRUCTIONS, StatisticalGuardResult
 from src.agent.state import make_initial_state
 from src.analytics.safe_sql import SafeSQLError
@@ -124,7 +128,9 @@ def test_manifest_only_question_never_invokes_sql_executor() -> None:
 
 
 def test_happy_path_validates_executes_guards_and_wires_critic_prompt() -> None:
-    settings = Settings(_env_file=None, min_subjects_per_class=30, sql_row_limit=100)
+    settings = Settings(
+        _env_file=None, min_subjects_per_class=30, sql_row_limit=100, sql_fetch_limit=200
+    )
     router = RecordingFakeChatModel(
         responses=[
             AIMessage(
@@ -172,7 +178,7 @@ def test_happy_path_validates_executes_guards_and_wires_critic_prompt() -> None:
     )
 
     assert len(executor_calls) == 1
-    assert "LIMIT 100" in executor_calls[0].upper()
+    assert "LIMIT 200" in executor_calls[0].upper()
     assert result["status"] == "completed"
     assert result["sql_cost_estimate"]["triggers_hitl"] is False
     assert result["statistical_validation"]["sample_size_depressed"] == 35
@@ -1253,3 +1259,155 @@ def test_cost_estimation_registers_lakehouse_views_before_explaining(
 
     assert estimate["method"] == "spark_explain"
     assert estimate["estimated_cost"] >= 0.0
+
+
+@pytest.mark.spark
+def test_full_cohort_819_subjects_analyzed_while_state_rows_capped_at_500(
+    spark: SparkSession,
+    lakehouse_env: tuple,
+) -> None:
+    """819 subjects must all reach the guard while state/context rows stay <= sql_row_limit."""
+    base_settings, paths, _ = lakehouse_env
+    settings = Settings(
+        _env_file=None,
+        spark_storage_uri=base_settings.spark_storage_uri,
+        min_subjects_per_class=30,
+        sql_row_limit=500,
+        sql_fetch_limit=50_000,
+    )
+
+    # 100 depressed (label=1) + 719 control (label=0) = 819 synthetic subjects,
+    # mimicking the asymmetric class balance of the real eRISK corpus.
+    synthetic_rows = [
+        (f"dep_{i:04d}", 1, 0.55 + (i % 7) * 0.02) for i in range(100)
+    ] + [
+        (f"ctrl_{i:04d}", 0, 0.15 + (i % 7) * 0.02) for i in range(719)
+    ]
+    spark.createDataFrame(
+        synthetic_rows,
+        "subject_id STRING, label INT, night_post_ratio DOUBLE",
+    ).write.mode("overwrite").parquet(str(paths.gold_user_longitudinal_features))
+
+    critic = RecordingFakeChatModel(
+        responses=[
+            AIMessage(
+                content=(
+                    "Full cohort comparison across depressed=100 and control=719 subjects "
+                    "(p = 5.84328e-60, Cohen's d = 9.96672)."
+                )
+            )
+        ]
+    )
+    sql_executor = make_spark_sql_executor(spark, settings=settings, paths=paths)
+    graph = build_agent_graph(
+        settings=settings,
+        router_model=_cohort_router_model(),
+        critic_model=critic,
+        sql_executor=sql_executor,
+        spark=spark,
+    )
+
+    result = graph.invoke(make_initial_state("Compare night_post_ratio across cohorts."))
+
+    assert result["status"] == "completed"
+    assert result["critic_call_count"] == 1
+    assert result["critic_output_check_failed"] is None
+    assert "LIMIT 50000" in result["generated_query"].upper()
+
+    guard = result["statistical_validation"]
+    assert guard["sample_size_depressed"] == 100
+    assert guard["sample_size_control"] == 719
+    assert guard["sample_size_depressed"] + guard["sample_size_control"] == 819
+
+    qr = result["query_result"]
+    assert qr["rows_returned"] == 819
+    assert qr["rows_shown"] == 500
+    assert len(qr["rows"]) == 500
+    assert qr["truncated"] is False
+    assert result["analysis_rows"] is None
+
+    critic_user_msg = str(critic.recorded_invocations[0][1].content)
+    assert '"rows_returned": 819' in critic_user_msg
+    assert '"rows_shown": 500' in critic_user_msg
+    assert '"truncated": false' in critic_user_msg
+
+
+@pytest.mark.spark
+def test_fetch_limit_cap_marks_truncated_and_demands_critic_disclosure(
+    spark: SparkSession,
+    lakehouse_env: tuple,
+) -> None:
+    """When query output hits sql_fetch_limit, truncated=True and critic prompt requires disclosure."""
+    base_settings, paths, _ = lakehouse_env
+    settings = Settings(
+        _env_file=None,
+        spark_storage_uri=base_settings.spark_storage_uri,
+        min_subjects_per_class=5,
+        sql_row_limit=500,
+        sql_fetch_limit=20,
+    )
+
+    synthetic_rows = [
+        (f"s_{i:03d}", i % 2, 0.2 + (i % 5) * 0.05) for i in range(60)
+    ]
+    spark.createDataFrame(
+        synthetic_rows,
+        "subject_id STRING, label INT, night_post_ratio DOUBLE",
+    ).write.mode("overwrite").parquet(str(paths.gold_user_longitudinal_features))
+
+    ordered_router = FakeMessagesListChatModel(
+        responses=[
+            AIMessage(
+                content=json.dumps(
+                    {
+                        "user_intent": "circadian_study",
+                        "answer_from_manifest": False,
+                        "sql_query": (
+                            "SELECT subject_id, label, night_post_ratio "
+                            "FROM gold_user_longitudinal_features ORDER BY subject_id"
+                        ),
+                        "metric_name": "night_post_ratio",
+                    }
+                )
+            )
+        ]
+    )
+    critic = RecordingFakeChatModel(
+        responses=[
+            AIMessage(
+                content=(
+                    "Capped sample analysis (truncated at 20 rows): "
+                    "depressed=10, control=10, p = 1.0, Cohen's d = 0.0."
+                )
+            )
+        ]
+    )
+    sql_executor = make_spark_sql_executor(spark, settings=settings, paths=paths)
+    graph = build_agent_graph(
+        settings=settings,
+        router_model=ordered_router,
+        critic_model=critic,
+        sql_executor=sql_executor,
+        spark=spark,
+    )
+
+    result = graph.invoke(make_initial_state("Compare night_post_ratio across cohorts."))
+
+    assert result["status"] == "completed"
+    assert result["critic_call_count"] == 1
+    assert result["critic_output_check_failed"] is None
+    assert "LIMIT 20" in result["generated_query"].upper()
+
+    qr = result["query_result"]
+    assert qr["rows_returned"] == 20
+    assert qr["rows_shown"] == 20
+    assert qr["truncated"] is True
+    assert result["statistical_validation"]["truncated"] is True
+
+    critic_sys_msg = str(critic.recorded_invocations[0][0].content)
+    assert "truncated=true" in critic_sys_msg.lower()
+    assert "capped" in critic_sys_msg.lower()
+    assert "sql_fetch_limit=20" in critic_sys_msg
+
+    critic_user_msg = str(critic.recorded_invocations[0][1].content)
+    assert '"truncated": true' in critic_user_msg

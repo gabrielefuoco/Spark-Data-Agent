@@ -54,10 +54,13 @@ class Settings(BaseSettings):
     aws_secret_access_key: SecretStr | None = None
     s3_endpoint_url: str | None = None
 
-    # ---- Agent behaviour ---------------------------------------------------    # Below this many subjects per class the guard marks the sample underpowered.
+    # ---- Agent behaviour ---------------------------------------------------
+    # Below this many subjects per class the guard marks the sample underpowered.
     min_subjects_per_class: int = 30
-    # Hard ceiling on rows an ad-hoc SQL query may return.
+    # Hard ceiling on rows shown to the LLM/critic and UI from an ad-hoc query.
     sql_row_limit: int = 500
+    # Hard ceiling on rows fetched into the driver for statistical analysis.
+    sql_fetch_limit: int = 50_000
     # Queries estimated above this cost stop at the human-in-the-loop gate.
     hitl_cost_threshold: float = 1.0
     max_query_retries: int = 2

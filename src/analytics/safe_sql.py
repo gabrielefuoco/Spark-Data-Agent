@@ -1,9 +1,10 @@
 """AST-validated Spark SQL execution for agent analytical queries.
 
 Validates every query with ``sqlglot`` before touching Spark: rejects DDL/DML
-and multi-statement payloads, enforces ``Settings.sql_row_limit`` (injecting or
-lowering ``LIMIT``), registers available Silver/Gold Parquet views, and raises
-a structured ``SafeSQLError`` with machine-readable error codes for retry loops.
+and multi-statement payloads, enforces ``Settings.sql_fetch_limit`` (injecting
+or lowering ``LIMIT``), registers available Silver/Gold Parquet views, and
+raises a structured ``SafeSQLError`` with machine-readable error codes for retry
+loops.
 """
 
 from __future__ import annotations
@@ -97,7 +98,7 @@ def register_lakehouse_views(
 def validate_and_rewrite_sql(
     query: str,
     *,
-    row_limit: int = 500,
+    row_limit: int = 50_000,
     allowed_tables: frozenset[str] | None = None,
 ) -> str:
     """Validate Spark SQL AST with sqlglot, enforce table allowlist and ``LIMIT <= row_limit``."""
@@ -223,10 +224,16 @@ def execute_safe_spark_sql(
     settings: Settings | None = None,
     paths: LakehousePaths | None = None,
     register_views: bool = True,
+    row_limit: int | None = None,
 ) -> DataFrame:
-    """Validate ``query`` via sqlglot, register existing views, and execute in Spark."""
+    """Validate ``query`` via sqlglot, register existing views, and execute in Spark.
+
+    Injects ``Settings.sql_fetch_limit`` unless an explicit ``row_limit`` override
+    is supplied by the caller.
+    """
     cfg = settings or get_settings()
-    safe_sql = validate_and_rewrite_sql(query, row_limit=cfg.sql_row_limit)
+    effective_limit = cfg.sql_fetch_limit if row_limit is None else row_limit
+    safe_sql = validate_and_rewrite_sql(query, row_limit=effective_limit)
 
     if register_views:
         register_lakehouse_views(spark, settings=cfg, paths=paths)

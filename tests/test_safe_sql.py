@@ -100,7 +100,8 @@ def test_execute_safe_spark_sql_registers_existing_views_and_enforces_limit(
     settings = Settings(
         _env_file=None,
         spark_storage_uri=str(tmp_path / "data"),
-        sql_row_limit=3,
+        sql_row_limit=2,
+        sql_fetch_limit=3,
     )
     paths = LakehousePaths.from_settings(settings)
 
@@ -114,6 +115,7 @@ def test_execute_safe_spark_sql_registers_existing_views_and_enforces_limit(
     registered = register_lakehouse_views(spark, settings=settings, paths=paths)
     assert registered == ["silver_posts"]
 
+    # Default ceiling comes from sql_fetch_limit (3), not sql_row_limit (2).
     result_df = execute_safe_spark_sql(
         "SELECT subject_id, label FROM silver_posts ORDER BY subject_id LIMIT 100",
         spark,
@@ -121,6 +123,16 @@ def test_execute_safe_spark_sql_registers_existing_views_and_enforces_limit(
         paths=paths,
     )
     assert result_df.count() == 3
+
+    # Explicit standalone row_limit override continues to cap tighter than sql_fetch_limit.
+    tight_df = execute_safe_spark_sql(
+        "SELECT subject_id, label FROM silver_posts ORDER BY subject_id",
+        spark,
+        settings=settings,
+        paths=paths,
+        row_limit=1,
+    )
+    assert tight_df.count() == 1
 
     # CTE referencing an allowlisted lakehouse view passes validation and executes.
     cte_df = execute_safe_spark_sql(

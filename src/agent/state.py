@@ -43,6 +43,7 @@ class DataAgentState(TypedDict):
     analysis_metric: str | None
     sql_cost_estimate: dict[str, Any] | None
     query_result: dict[str, Any] | None
+    analysis_rows: list[dict[str, Any]] | None
     statistical_validation: dict[str, Any] | None
     retry_count: int
     last_error: dict[str, Any] | None
@@ -66,6 +67,7 @@ def make_initial_state(question: str) -> DataAgentState:
         analysis_metric=None,
         sql_cost_estimate=None,
         query_result=None,
+        analysis_rows=None,
         statistical_validation=None,
         retry_count=0,
         last_error=None,

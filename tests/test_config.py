@@ -46,14 +46,17 @@ def test_guard_thresholds_are_explicit() -> None:
 
     assert settings.min_subjects_per_class == 30
     assert settings.sql_row_limit == 500
+    assert settings.sql_fetch_limit == 50_000
     assert settings.max_query_retries == 2
 
 
 def test_settings_are_cached(monkeypatch) -> None:
     get_settings.cache_clear()
     monkeypatch.setenv("SQL_ROW_LIMIT", "42")
+    monkeypatch.setenv("SQL_FETCH_LIMIT", "1234")
 
     assert get_settings().sql_row_limit == 42
+    assert get_settings().sql_fetch_limit == 1234
     assert get_settings() is get_settings()
 
     get_settings.cache_clear()

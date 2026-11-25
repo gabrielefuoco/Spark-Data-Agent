@@ -108,10 +108,13 @@ def make_spark_sql_executor(
             {str(k): _to_json_value(v) for k, v in row.asDict(recursive=True).items()}
             for row in raw_rows
         ]
+        rows_returned = len(rows)
         return {
             "columns": list(df.columns),
             "rows": rows,
-            "row_count": len(rows),
+            "row_count": rows_returned,
+            "rows_returned": rows_returned,
+            "truncated": rows_returned >= resolved_settings.sql_fetch_limit,
         }
 
     return _execute
@@ -170,7 +173,7 @@ def make_spark_job_executor(
                 session_gap_seconds=int(
                     params.get("session_gap_seconds", DEFAULT_SESSION_GAP_SECONDS)
                 ),
-            ).limit(resolved_settings.sql_row_limit)
+            ).limit(resolved_settings.sql_fetch_limit)
         else:
             combined = silver_df.select(
                 "label",
@@ -195,17 +198,22 @@ def make_spark_job_executor(
                     "Topic model job requires 'label' column on silver_posts.",
                     query=encode_spark_job(job_name, params),
                 )
-            result_df = topic_result.cohort_lexical_matrix.limit(resolved_settings.sql_row_limit)
+            result_df = topic_result.cohort_lexical_matrix.limit(
+                resolved_settings.sql_fetch_limit
+            )
 
         raw_rows = result_df.collect()
         rows = [
             {str(k): _to_json_value(v) for k, v in row.asDict(recursive=True).items()}
             for row in raw_rows
         ]
+        rows_returned = len(rows)
         return {
             "columns": list(result_df.columns),
             "rows": rows,
-            "row_count": len(rows),
+            "row_count": rows_returned,
+            "rows_returned": rows_returned,
+            "truncated": rows_returned >= resolved_settings.sql_fetch_limit,
         }
 
     return _execute_job
@@ -347,13 +355,26 @@ def _normalize_query_result(raw: dict[str, Any] | list[dict[str, Any]]) -> dict[
     if isinstance(raw, list):
         rows = [{str(k): _to_json_value(v) for k, v in row.items()} for row in raw]
         columns = list(rows[0].keys()) if rows else []
-        return {"columns": columns, "rows": rows, "row_count": len(rows)}
+        return {
+            "columns": columns,
+            "rows": rows,
+            "row_count": len(rows),
+            "rows_returned": len(rows),
+            "truncated": False,
+        }
 
     if isinstance(raw, dict):
         rows_raw = raw.get("rows", [])
         rows = [{str(k): _to_json_value(v) for k, v in row.items()} for row in rows_raw]
         columns = list(raw.get("columns") or (rows[0].keys() if rows else []))
-        return {"columns": columns, "rows": rows, "row_count": len(rows)}
+        rows_returned = int(raw.get("rows_returned", len(rows)))
+        return {
+            "columns": columns,
+            "rows": rows,
+            "row_count": rows_returned,
+            "rows_returned": rows_returned,
+            "truncated": bool(raw.get("truncated", False)),
+        }
 
     raise TypeError(f"Unexpected SQL executor return type: {type(raw).__name__}")
 
@@ -509,20 +530,33 @@ def _run_execution(
     *,
     query: str,
     empty_message: str,
+    settings: Settings,
 ) -> dict[str, Any]:
-    """Normalize executor results and convert empty/error outcomes to state updates."""
+    """Normalize executor results, slice display rows, and track fetch truncation."""
     try:
         normalized = _normalize_query_result(execute_fn())
     except SafeSQLError as exc:
         return {
             "last_error": exc.to_dict(),
             "query_result": None,
+            "analysis_rows": None,
             "status": "running",
         }
 
-    if normalized["row_count"] == 0:
+    all_rows = normalized["rows"]
+    rows_returned = int(normalized.get("rows_returned", len(all_rows)))
+    if rows_returned == 0:
+        empty_payload = {
+            "columns": normalized["columns"],
+            "rows": [],
+            "row_count": 0,
+            "rows_returned": 0,
+            "rows_shown": 0,
+            "truncated": False,
+        }
         return {
-            "query_result": normalized,
+            "query_result": empty_payload,
+            "analysis_rows": None,
             "last_error": {
                 "code": "EMPTY_RESULT",
                 "message": empty_message,
@@ -531,8 +565,21 @@ def _run_execution(
             "status": "running",
         }
 
+    shown_rows = all_rows[: settings.sql_row_limit]
+    rows_shown = len(shown_rows)
+    truncated = bool(normalized.get("truncated")) or (rows_returned >= settings.sql_fetch_limit)
+    display_payload = {
+        "columns": normalized["columns"],
+        "rows": shown_rows,
+        "row_count": rows_returned,
+        "rows_returned": rows_returned,
+        "rows_shown": rows_shown,
+        "truncated": truncated,
+    }
     return {
-        "query_result": normalized,
+        "query_result": display_payload,
+        # Preserve full fetched rows only until statistical_guard consumes them.
+        "analysis_rows": all_rows if rows_returned > rows_shown else None,
         "last_error": None,
         "status": "running",
     }
@@ -693,7 +740,7 @@ def ast_validator_and_cost(state: DataAgentState, deps: AgentRuntimeDeps) -> dic
         }
 
     try:
-        safe_sql = validate_and_rewrite_sql(raw_query, row_limit=deps.settings.sql_row_limit)
+        safe_sql = validate_and_rewrite_sql(raw_query, row_limit=deps.settings.sql_fetch_limit)
         cost_info = deps.estimate_cost(safe_sql)
     except SafeSQLError as exc:
         return {
@@ -749,6 +796,7 @@ def execute_sql(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str, Any]
             "Query executed successfully but returned 0 rows unexpectedly. "
             "Verify filter predicates (label is 0 or 1) and table selection."
         ),
+        settings=deps.settings,
     )
 
 
@@ -764,6 +812,7 @@ def execute_job(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str, Any]
                 "query": raw_query,
             },
             "query_result": None,
+            "analysis_rows": None,
             "status": "running",
         }
     job_name, job_params = job_spec
@@ -772,6 +821,7 @@ def execute_job(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str, Any]
         lambda: executor(job_name, job_params, deps.settings),
         query=raw_query,
         empty_message=f"Spark job {job_name!r} executed successfully but returned 0 rows.",
+        settings=deps.settings,
     )
 
 
@@ -791,9 +841,10 @@ def query_rewriter(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str, A
 
 
 def statistical_guard(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str, Any]:
-    """Run deterministic cohort significance and power checks on query results."""
+    """Run deterministic cohort significance and power checks on all fetched rows."""
     query_result = state.get("query_result") or {}
-    rows = query_result.get("rows", [])
+    analysis_rows = state.get("analysis_rows")
+    rows = analysis_rows if analysis_rows is not None else query_result.get("rows", [])
     columns = query_result.get("columns", [])
     extracted = _extract_group_metrics(
         rows,
@@ -809,9 +860,16 @@ def statistical_guard(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str
         raw_observation_count_depressed=extracted.raw_observation_count_depressed,
         raw_observation_count_control=extracted.raw_observation_count_control,
     )
+    validation_payload = guard_result.model_dump(mode="json")
+    validation_payload["rows_returned"] = int(query_result.get("rows_returned", len(rows)))
+    validation_payload["rows_shown"] = int(
+        query_result.get("rows_shown", len(query_result.get("rows", [])))
+    )
+    validation_payload["truncated"] = bool(query_result.get("truncated", False))
     return {
-        "statistical_validation": guard_result.model_dump(mode="json"),
+        "statistical_validation": validation_payload,
         "analysis_metric": extracted.metric_name,
+        "analysis_rows": None,
         "status": "running",
     }
 
@@ -831,7 +889,15 @@ def scientific_critic(state: DataAgentState, deps: AgentRuntimeDeps) -> dict[str
             has_subject_dimension=False,
         )
     )
-    system_prompt = build_critic_system_prompt(guard_result)
+    query_result = state.get("query_result") or {}
+    truncated = bool(query_result.get("truncated", False))
+    rows_returned = query_result.get("rows_returned")
+    system_prompt = build_critic_system_prompt(
+        guard_result,
+        truncated=truncated,
+        rows_returned=rows_returned if isinstance(rows_returned, int) else None,
+        sql_fetch_limit=deps.settings.sql_fetch_limit,
+    )
     user_prompt = build_critic_user_prompt(
         question,
         query=state.get("generated_query"),

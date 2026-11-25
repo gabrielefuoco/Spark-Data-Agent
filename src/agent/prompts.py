@@ -75,15 +75,39 @@ def build_planner_user_prompt(
     )
 
 
-def build_critic_system_prompt(guard_result: StatisticalGuardResult) -> str:
+def build_critic_system_prompt(
+    guard_result: StatisticalGuardResult,
+    *,
+    truncated: bool = False,
+    rows_returned: int | None = None,
+    sql_fetch_limit: int | None = None,
+) -> str:
     """Build the scientific critic system prompt embedding mandatory guardrails."""
     guard_instructions = format_critic_guard_instructions(guard_result)
+    truncation_note = ""
+    if truncated:
+        limit_detail = (
+            f" (`sql_fetch_limit={sql_fetch_limit}`)"
+            if sql_fetch_limit is not None
+            else " (`sql_fetch_limit`)"
+        )
+        fetched_detail = (
+            f" with {rows_returned} rows returned" if rows_returned is not None else ""
+        )
+        truncation_note = (
+            "\n\nMANDATORY CAPPED-SAMPLE DISCLOSURE (`truncated=true`):\n"
+            f"The query result reached the fetch ceiling{limit_detail}{fetched_detail}. "
+            "Your narrative MUST explicitly state that the statistical analysis was performed on "
+            "a capped/truncated sample rather than the full population, and note that findings "
+            "may reflect partition/order selection bias."
+        )
     return (
         "You are the Scientific Interpreter & Critic for the eRISK computational linguistics lakehouse.\n"
         "Label 1 represents the depressed cohort and label 0 represents the control cohort.\n"
         "Never make clinical diagnoses; keep interpretations strictly statistical and population-level, "
         "noting dataset limitations and that correlation does not imply causation.\n\n"
         f"{guard_instructions}"
+        f"{truncation_note}"
     )
 
 
@@ -96,14 +120,21 @@ def build_critic_user_prompt(
     guard_result: StatisticalGuardResult,
 ) -> str:
     """Format executed SQL evidence and guard statistics for the critic model."""
-    rows = (query_result or {}).get("rows", [])
+    qr = query_result or {}
+    rows = qr.get("rows", [])
+    rows_returned = qr.get("rows_returned", qr.get("row_count", len(rows)))
+    rows_shown = qr.get("rows_shown", len(rows))
+    truncated = bool(qr.get("truncated", False))
     preview_rows = rows[:20]
     payload = {
         "question": question,
         "executed_sql": query,
         "cost_estimate": cost_estimate,
-        "row_count": (query_result or {}).get("row_count", len(rows)),
-        "columns": (query_result or {}).get("columns", []),
+        "row_count": qr.get("row_count", rows_returned),
+        "rows_returned": rows_returned,
+        "rows_shown": rows_shown,
+        "truncated": truncated,
+        "columns": qr.get("columns", []),
         "sample_rows": preview_rows,
         "statistical_validation": guard_result.model_dump(mode="json"),
     }

@@ -4,15 +4,17 @@
 
 Spark Data Agent is an interactive platform for the analysis of large-scale longitudinal textual data — the Reddit **eRISK** dataset for early depression detection — exposed through a conversational interface. A researcher asks a question in natural language; an agent selects or writes an analytical query; Spark executes it; the result comes back with its statistical significance attached.
 
-## Current state (what the code does today)
+## Previous implementation (removed)
 
-The repository holds the original academic implementation: seven Python modules, about 1,300 lines, in Italian, now under `legacy/` — preserved intact as the reference for the rewrite, never imported by `src/`.
+Before the rewrite the repository held the original academic implementation: seven Python modules, about 1,300 lines, in Italian. It was **deleted** once the rewrite was complete; it survives only in history, at commit `e2976dc` (for example `git show e2976dc:legacy/spark_utils.py`). Nothing under `src/` ever imported it, and the ADRs keep citing it in the past tense because it is the *before* state they argue against.
 
-- **Pipeline**: a preprocessing script turns the raw XML/TSV into flat Parquet files in `processed_data/`; there is no layered lakehouse and no lineage.
-- **Analytics**: a set of PySpark functions wrapped as agent tools in `spark_utils.py` and `tools.py`, executed through a `SparkDataManager` that owns the session.
-- **Agent**: LlamaIndex `AgentWorkflow` over **Gemini 2.5 Flash** — a request comes in, one tool is called, one answer goes out. No control loop, no self-correction, no cost gate.
+What it did:
+
+- **Pipeline**: a preprocessing script turned the raw XML/TSV into flat Parquet files in `processed_data/`; no layered lakehouse, no lineage.
+- **Analytics**: PySpark functions wrapped as agent tools in `spark_utils.py` and `tools.py`, executed through a `SparkDataManager` that owned the session.
+- **Agent**: LlamaIndex `AgentWorkflow` over **Gemini 2.5 Flash** — a request came in, one tool was called, one answer went out. No control loop, no self-correction, no cost gate.
 - **UI**: Streamlit.
-- **Known defects**, all of them addressed by the revamp and none of them hidden: four blocking `.count()` calls at startup, `groupBy("subject_id").agg(collect_list("text"))` (an OOM waiting for a large enough dataset), indiscriminate `.persist()`, unpartitioned writes, `from pyspark.sql.functions import *` shadowing Python built-ins, phantom dependencies, and API keys read by hand from `src/api.env`.
+- **Known defects**, every one of them addressed by the rewrite: four blocking `.count()` calls at startup, `groupBy("subject_id").agg(collect_list("text"))` (an OOM waiting for a large enough dataset), indiscriminate `.persist()`, unpartitioned writes, `from pyspark.sql.functions import *` shadowing Python built-ins, phantom dependencies, and API keys read by hand from `src/api.env`.
 
 ## Target architecture
 

@@ -6,11 +6,11 @@ Accepted
 
 ## Context
 
-The legacy eRISK analytics pipeline (`legacy/preprocess.py`, `legacy/spark_utils.py`) dumped raw XML/TSV inputs into flat, unpartitioned Parquet files and collapsed every user's writing history into a single row via `groupBy("subject_id").agg(collect_list("text"))` and `concat_ws`. That design created four compounding problems:
+The previous eRISK analytics pipeline (deleted in the rewrite; it lives in history at `e2976dc`, see `git show e2976dc:legacy/spark_utils.py`) dumped raw XML/TSV inputs into flat, unpartitioned Parquet files and collapsed every user's writing history into a single row via `groupBy("subject_id").agg(collect_list("text"))` and `concat_ws`. That design created four compounding problems:
 
 1. **Driver/executor OOM time-bomb**: collecting unbounded post histories per subject into array/string blobs produces extreme data skew and breaks JVM memory limits as corpus size grows.
 2. **Silent data loss**: malformed dates, blank texts, or orphan subjects without ground-truth labels were dropped or coerced without audit trails.
-3. **Expensive startup and ad-hoc queries**: `legacy/data_manager.py` ran four blocking `.count()` actions at startup and indiscriminately `.persist()`ed tables without partitioning.
+3. **Expensive startup and ad-hoc queries**: the previous `SparkDataManager` (`git show e2976dc:legacy/data_manager.py`) ran four blocking `.count()` actions at startup and indiscriminately `.persist()`ed tables without partitioning.
 4. **No storage abstraction**: output paths were hardcoded to local directories with no S3A connector path.
 
 ## Decision

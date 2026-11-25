@@ -3,7 +3,6 @@
 .git
 .gitignore
 .scratch
-legacy
 
 processed_data
 chunk

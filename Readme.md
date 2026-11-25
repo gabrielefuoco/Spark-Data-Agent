@@ -1,64 +1,97 @@
 # Spark Data Agent
 
-## About The Project
+Conversational analytics over the **eRISK** corpus: longitudinal Reddit posts by people labelled depressed (`label=1`) and controls (`label=0`), analysed with Apache Spark and exposed through an agent that has to show its statistics before it is allowed to draw a conclusion.
 
-Spark Data Agent is an interactive platform designed for the analysis of large volumes of textual data, specifically online posts, to identify and study linguistic patterns associated with depression. The project leverages Big Data and Artificial Intelligence technologies to make complex data analysis accessible through an intuitive conversational interface.
+The interesting part is not the chat window. It is that a question in natural language becomes **SQL validated against an AST**, runs against a **partitioned lakehouse**, comes back with a **p-value and an effect size**, and stops to ask a human before anything expensive runs.
 
-The core of the platform is built on three technological pillars:
-* **Apache Spark**: For efficient, distributed processing of large datasets.
-* **Conversational AI**: An advanced agent orchestrated by LlamaIndex and powered by the Gemini 2.5 Flash Large Language Model, allowing users to ask questions in natural language.
-* **Web Interface**: A user-friendly and reactive web application built with Streamlit.
+## Architecture
 
-This system empowers researchers and analysts, who may not have programming expertise, to perform complex lexical, frequency, temporal, and behavioral analyses in real-time.
+```
+ Streamlit UI  ──  LangGraph StateGraph  ──  PySpark Medallion Lakehouse
+                        │                          Bronze  raw XML/TSV + lineage
+                        │                          Silver  atomic posts, partitioned
+                        │                          Gold    precomputed features + manifest
+                        ├── sqlglot AST validator + cost estimator
+                        ├── HITL gate (interrupt + SqliteSaver checkpointer)
+                        ├── safe SQL executor (SELECT only, LIMIT ≤ 500)
+                        ├── statistical guard (Welch / Mann-Whitney + Cohen's d)
+                        └── self-correcting rewriter (≤ 2 retries)
+```
 
-## Key Objectives
+**Stack**: Spark 3.5.1 · JDK 17 · Python 3.11 · LangGraph 1.2 · Streamlit · Plotly · Pandera · sqlglot · MinIO (S3-compatible API) · Docker Compose.
 
-The project was guided by four primary goals:
-1.  **Robust Data Pipeline**: Develop an automated process to transform raw XML data into the highly optimized Parquet format to ensure high-performance interactive analysis.
-2.  **Advanced Analysis Toolkit**: Implement a suite of statistical and linguistic analysis functions using PySpark, each encapsulated as a standalone "tool".
-3.  **Conversational AI Agent**: Integrate an LLM to understand user queries, select the appropriate PySpark analysis tool, execute it with the correct parameters, and interpret the results.
-4.  **Intuitive Web Interface**: Create a web application using Streamlit that allows users to interact with the AI agent via a chat interface and view results in clear formats like tables and graphs.
+## Quickstart
 
-## Architecture Overview
+Docker Desktop must be running. Everything — tests, Spark jobs, the UI — executes inside the dev container: there is one Python (3.11) and one JDK (17) to keep green.
 
-The system architecture is designed to be modular and scalable, ensuring a logical data flow from the raw source to the end-user.
+```bash
+docker compose up -d                       # dev container + MinIO (bucket `lakehouse`)
+docker compose run --rm --no-deps dev python -m pytest
+docker compose run --rm --no-deps dev python -m ruff check .
+docker compose run --rm --no-deps dev mypy
+docker compose exec dev bash               # a shell inside, Spark included
+```
 
-**Conceptual Flow:**
-1.  **Offline Pre-processing**: Raw data (XML files and a `truth.txt` file for classification) is processed by a Python script (`preprocess.py`). This script cleans, structures, and enriches the data, saving it in the optimized Parquet format.
-2.  **User Interaction**: The user interacts with the Streamlit web application.
-3.  **AI Agent**: User requests are interpreted by the AI agent, which is orchestrated by LlamaIndex and powered by Gemini. The agent selects the appropriate PySpark tool based on the user's query.
-4.  **Data Processing**: A central `SparkDataManager` class manages the Apache Spark session and data loading. It loads the Parquet data into Spark DataFrames for analysis.
-5.  **Execution & Response**: The selected PySpark function is executed by Spark on the data. The results are returned to the agent, which then formats and presents them to the user in a clear and interpretable way.
+The UI, once a model backend is configured (see *Honest scope*):
 
-## Core Technologies
+```bash
+docker compose exec dev python -m streamlit run src/ui/app.py --server.address 0.0.0.0
+# http://localhost:8501
+```
 
-* **Backend and Data Processing**: **Apache Spark** (via PySpark) is used for its ability to efficiently handle terabyte-scale datasets through distributed, in-memory processing.
-* **Artificial Intelligence**: **LlamaIndex** orchestrates the agent's logic, transforming PySpark analysis functions into `FunctionTool` objects that the LLM can use. The **Gemini 2.5 Flash** LLM understands user intent and selects the appropriate tools.
-* **Frontend**: **Streamlit** was chosen for its ability to rapidly create interactive web interfaces for data science applications.
+## The data is not in this repository
 
-## Analysis Capabilities
+The eRISK corpus is real posts written by real people about their own depression. It is **never** committed: `processed_data/`, `chunk/` and `ignora/` are gitignored, and any fixture that ships with the repository is synthetic or aggregated.
 
-The platform offers a range of analytical tools available to the AI agent:
+Two ways to get something to run against:
 
-* **Verbosity Analysis**: Compares the length of posts and titles between different user groups (e.g., depressed vs. control) to identify behavioral indicators.
-* **Lexical and Frequency Analysis**: Identifies and compares the most frequently used words by each group to uncover differences in vocabulary. The process involves tokenization, normalization, and stopword removal.
-* **Temporal Analysis**: Explores posting patterns over time, such as activity by hour of the day or day of the week, using Spark's temporal functions.
-* **Behavioral Analysis**: Quantifies user posting behavior, including the total number of posts and the frequency of contributions.
-* **Keyword Search**: Allows researchers to perform targeted thematic analyses by filtering posts containing specific terms (e.g., "anxiety," "loneliness") using regular expressions in Spark.
+```bash
+# A deterministic synthetic corpus, shaped exactly like the real one (~100 subjects, ~5k posts)
+docker compose run --rm --no-deps dev python scripts/generate_dev_sample.py --seed 42
 
-## The Conversational Agent
+# Or place the real corpus at the repo root (chunk/chunk1..10/*.xml, risk-golden-truth-test.txt);
+# the container mounts it read-only at /workspace and nothing copies it into an image.
+```
 
-The AI agent's behavior is governed by a detailed system prompt that ensures every interaction is methodical, transparent, and scientifically rigorous. Key aspects of its design include:
+## Repository layout
 
-* **Defined Persona**: Acts as an expert AI assistant specialized in text data analysis with Apache Spark for depression studies.
-* **Mandatory Workflow**: Follows a strict sequence for each request: presents an action plan, verifies data status, declares the tool and parameters it will use, and requests confirmation for complex analyses.
-* **Structured Responses**: Outputs are formatted in Markdown, including an executive summary, the action plan, raw results, an interpretation, and a critical analysis of limitations (e.g., "correlation does not imply causation").
+```
+src/
+  config.py            Settings: one place that reads the environment
+  spark.py             SparkSession builder (AQE on) + ZSTD parquet writer
+  lakehouse/           bronze, silver (quarantine), gold, manifest, storage (S3A), validation
+  analytics/           window features, Spark ML topic pipeline, safe SQL engine
+  agent/               LangGraph state, prompts, cost model, guards, graph
+  ui/                  Streamlit + Plotly
+scripts/               synthetic corpus generator
+tests/                 69 tests, Spark included, no network required
+docs/adr/              three architecture decision records
+.scratch/              the plan: map + seven tickets, in Italian
+```
 
-## Future Work
+## Design decisions worth reading
 
-The project lays the groundwork for several future enhancements:
+- [`docs/adr/0001`](docs/adr/0001-medallion-lakehouse-vs-flat-parquet.md) — why Bronze/Silver/Gold with a dead-letter quarantine instead of flat aggregated Parquet.
+- [`docs/adr/0002`](docs/adr/0002-langgraph-cyclical-stategraph-vs-llamaindex.md) — why a deterministic StateGraph with an explicit cost gate instead of an agentic workflow that just passes messages through.
+- [`docs/adr/0003`](docs/adr/0003-openrouter-multi-model-routing.md) — cheap routing model vs reasoning critic, and why the backend is dual.
+- [`CONTEXT.md`](CONTEXT.md) — the domain vocabulary the code is written against.
 
-* **Advanced NLP Analysis**: Integrate more sophisticated techniques like Topic Modeling (LDA) and Sentiment Analysis.
-* **Interactive Visualizations**: Enhance the interface with dynamic and complex charts generated by the agent using libraries like Plotly or Altair.
-* **Real-Time Data Pipeline**: Evolve the system to a streaming architecture using Spark Streaming or Kafka to analyze data as it is generated.
-* **User-Specific Customization**: Allow researchers to upload their own datasets and labels to use the platform for their specific research needs.
+Three behaviours are deliberate and easy to mistake for bugs:
+
+1. **No `.count()` at startup.** Global statistics come from `gold_dataset_manifest.json`, written once by the ETL.
+2. **Nothing is dropped silently.** Every Bronze row ends in Silver *or* in `silver/quarantine/` with an explicit `_rejection_reason`; a test asserts the counts add up.
+3. **The critic is constrained, not trusted.** Below 30 unique subjects per class the guard forces `is_significant=False` regardless of the p-value, and the prompt forbids claiming a clinical signal without quoting sample size, p-value and Cohen's *d*.
+
+## Honest scope
+
+This is a portfolio project, and the point of it is to be accurate about what it does:
+
+- **Storage**: writes go to a **local MinIO** instance through the S3-compatible API (`s3a://lakehouse/`). Real AWS S3 is supported by configuration and has **never been exercised**. No claim of a run on AWS is made anywhere in this repository.
+- **LLM backend**: dual by design — local Ollama for development, OpenRouter for remote. In the state this was built in, **no model was pulled and no remote key was set**: the entire test suite runs offline against fake chat models, and the agent graph is exercised with an injected SQL executor. Wiring a live model is a configuration step, not a code change.
+- **Clinical claims**: the corpus supports exploratory analysis, not diagnosis. The statistical guard exists to stop the agent from dressing up noise as a finding.
+
+## Status
+
+All seven tickets of the plan in [`.scratch/spark-data-agent-revamp/map.md`](.scratch/spark-data-agent-revamp/map.md) are closed: Docker dev environment, project hygiene and settings, medallion lakehouse, advanced PySpark analytics, data quality and statistical guard, LangGraph orchestration with HITL, and the S3/MinIO connector with the ADRs.
+
+`69 passed`, `ruff` clean, `mypy` clean (`Success: no issues found in 24 source files`).

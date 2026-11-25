@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-The legacy implementation hardcoded Gemini 2.5 Flash with credentials loaded manually from `src/api.env`. Hardcoding a single remote commercial model creates two problems:
+The previous implementation (deleted in the rewrite; `git show e2976dc:legacy/Agente.py`) hardcoded Gemini 2.5 Flash with credentials loaded manually from `src/api.env`. Hardcoding a single remote commercial model creates two problems:
 
 1. **Development friction and cost**: Every local test, prompt tweak, or interactive UI session burns paid API tokens and fails offline.
 2. **Role mismatch**: Intent classification and SQL generation need fast, cheap, deterministic JSON output (`temperature=0.0`), whereas scientific critique over statistical guard outputs benefits from stronger reasoning models—yet forcing a heavy reasoning model on every routing retry wastes latency and budget.

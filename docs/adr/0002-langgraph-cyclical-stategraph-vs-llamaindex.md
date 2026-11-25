@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-The legacy agent (`legacy/agent_handler.py`) used LlamaIndex `AgentWorkflow` as a thin pass-through over a single LLM: one prompt went in, one tool ran, and an unverified answer came out. It lacked:
+The previous agent (deleted in the rewrite; `git show e2976dc:legacy/agent_handler.py`) used LlamaIndex `AgentWorkflow` as a thin pass-through over a single LLM: one prompt went in, one tool ran, and an unverified answer came out. It lacked:
 
 - **SQL injection / safety guarantees**: LLM-generated queries were not AST-checked or row-bounded before reaching Spark.
 - **Self-correction**: Spark analysis errors or empty results terminated in raw tracebacks instead of structured retries.

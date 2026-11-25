@@ -1,4 +1,4 @@
-"""Spark tests for AQE config, broadcast join helper, and post window features."""
+"""Spark tests for AQE config and post window features."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from src.analytics.features import (
     compute_post_window_features,
     summarize_user_longitudinal_features,
 )
-from src.spark import broadcast_join
 
 _POSTS_SCHEMA = StructType(
     [
@@ -27,26 +26,10 @@ _POSTS_SCHEMA = StructType(
 
 
 @pytest.mark.spark
-def test_spark_session_has_aqe_enabled_and_broadcast_join_works(spark: SparkSession) -> None:
+def test_spark_session_has_aqe_enabled(spark: SparkSession) -> None:
     assert spark.conf.get("spark.sql.adaptive.enabled") == "true"
     assert spark.conf.get("spark.sql.adaptive.coalescePartitions.enabled") == "true"
     assert spark.conf.get("spark.sql.adaptive.skewJoin.enabled") == "true"
-
-    posts = spark.createDataFrame(
-        [("s1", "hello"), ("s2", "world")],
-        schema="subject_id STRING, text STRING",
-    )
-    subjects = spark.createDataFrame(
-        [("s1", 1), ("s2", 0)],
-        schema="subject_id STRING, label INT",
-    )
-
-    joined = broadcast_join(posts, subjects, on="subject_id", how="inner")
-    plan_text = joined._jdf.queryExecution().logical().toString()
-    assert "ResolvedHint" in plan_text or "Broadcast" in plan_text
-
-    rows = {r["subject_id"]: r["label"] for r in joined.collect()}
-    assert rows == {"s1": 1, "s2": 0}
 
 
 @pytest.mark.spark

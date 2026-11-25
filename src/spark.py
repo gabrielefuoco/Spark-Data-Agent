@@ -11,7 +11,6 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql import functions as F
 
 from src.config import Settings, get_settings
 from src.lakehouse.storage import apply_s3a_config
@@ -41,22 +40,6 @@ def build_spark_session(
     apply_s3a_config(spark, cfg)
     spark.sparkContext.setLogLevel("ERROR")
     return spark
-
-
-def broadcast_join(
-    posts_df: DataFrame,
-    subjects_df: DataFrame,
-    *,
-    on: str | Sequence[str] = "subject_id",
-    how: str = "inner",
-) -> DataFrame:
-    """Join a large posts DataFrame with a small subjects/labels DataFrame via broadcast.
-
-    Broadcasting the small dimension table avoids shuffling the full posts
-    partition set across executors when attaching subject-level labels or metadata.
-    """
-    join_on: str | list[str] = on if isinstance(on, str) else list(on)
-    return posts_df.join(F.broadcast(subjects_df), on=join_on, how=how)
 
 
 def stop(spark: SparkSession | None) -> None:

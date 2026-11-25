@@ -134,7 +134,7 @@ def build_cohort_lexical_matrix(
     min_df: float = 2.0,
     max_df: float = 0.95,
     vocab_size: int = 5000,
-    top_n_ngrams: int | None = None,
+    top_n_ngrams: int | None = 100,
     top_n_terms: int = 10,
     seed: int = 42,
 ) -> DataFrame:
@@ -182,7 +182,7 @@ def build_gold(
     lda_k: int = 8,
     lda_max_iter: int = 20,
     min_df: float = 2.0,
-    top_n_ngrams: int | None = None,
+    top_n_ngrams: int | None = 100,
     top_n_terms: int = 10,
 ) -> tuple[DataFrame, DataFrame, DatasetManifest]:
     """Materialize all Gold tables and the static dataset manifest with storage volumes."""

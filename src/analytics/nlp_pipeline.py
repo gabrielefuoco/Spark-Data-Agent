@@ -231,7 +231,7 @@ def build_cohort_ngram_tfidf_matrix(
     min_df: float = 2.0,
     max_df: float = 0.95,
     vocab_size: int = 5000,
-    top_n_ngrams: int | None = None,
+    top_n_ngrams: int | None = 100,
 ) -> DataFrame:
     """Compute per-cohort unigram/bigram counts, relative frequencies, and TF-IDF weights."""
     bigram_cv = next(s for s in model.stages if isinstance(s, CountVectorizerModel))
@@ -335,7 +335,7 @@ def fit_topic_model(
     max_df: float = 0.95,
     vocab_size: int = 5000,
     top_n_terms: int = 10,
-    top_n_ngrams: int | None = None,
+    top_n_ngrams: int | None = 100,
     include_ngram_tfidf: bool = False,
     seed: int = 42,
 ) -> TopicModelResult:
